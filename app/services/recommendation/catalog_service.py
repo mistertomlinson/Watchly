@@ -308,6 +308,14 @@ class CatalogService:
 
     async def _resolve_auth(self, bundle: StremioBundle, credentials: dict, token: str) -> str:
         auth_key = credentials.get("authKey")
+
+        # Trakt accounts use a Trakt access token stored as authKey.
+        # Skip Stremio session validation entirely for these accounts.
+        if credentials.get("auth_provider") == "trakt":
+            if not auth_key:
+                raise HTTPException(status_code=401, detail="Trakt session expired. Please reconfigure.")
+            return auth_key
+
         email = credentials.get("email")
         password = credentials.get("password")
 

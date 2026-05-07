@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from fastapi import HTTPException
@@ -18,6 +19,17 @@ from app.utils.catalog import cache_profile_and_watched_sets, sort_catalogs
 
 class ManifestService:
     """Service for generating Stremio manifest files."""
+
+    def __init__(self):
+        # Per-token locks to prevent concurrent manifest builds
+        self._build_locks: dict[str, asyncio.Lock] = {}
+        # In-memory cache: token → manifest dict (supplements Redis cache)
+        self._cache: dict[str, dict] = {}
+
+    def _get_lock(self, token: str) -> asyncio.Lock:
+        if token not in self._build_locks:
+            self._build_locks[token] = asyncio.Lock()
+        return self._build_locks[token]
 
     @staticmethod
     def get_base_manifest() -> dict[str, Any]:
@@ -113,6 +125,32 @@ class ManifestService:
 
         return library_items
 
+    async def cache_library_and_profiles_from_items(
+        self, library_items: dict, user_settings: UserSettings, token: str
+    ) -> None:
+        """
+        Cache library items and build profiles from an already-fetched library dict.
+        Used by Trakt (and any future non-Stremio provider) where library data is
+        obtained outside of the Stremio bundle.
+        """
+        await user_cache.set_library_items(token, library_items)
+        logger.debug(f"[{redact_token(token)}] Cached library items (provider-agnostic)")
+
+        language = user_settings.language
+        tmdb_key = resolve_tmdb_api_key(user_settings)
+        integration_service = ProfileIntegration(language=language, tmdb_api_key=tmdb_key)
+
+        for content_type in ["movie", "series"]:
+            try:
+                profile, watched_tmdb, watched_imdb = await integration_service.build_profile_from_library(
+                    library_items, content_type
+                )
+                await user_cache.set_profile_and_watched_sets(token, content_type, profile, watched_tmdb, watched_imdb)
+                logger.debug(f"[{redact_token(token)}] Cached profile for {content_type}")
+            except Exception as e:
+                logger.warning(f"[{redact_token(token)}] Failed to cache profile for {content_type}: {e}")
+
+
     async def _ensure_library_and_profiles_cached(
         self, bundle: StremioBundle, auth_key: str, user_settings: UserSettings, token: str
     ) -> dict[str, Any]:
@@ -163,21 +201,57 @@ class ManifestService:
 
         return sort_catalogs(catalogs, user_settings)
 
+    async def _build_dynamic_catalogs_trakt(
+        self, creds: dict, user_settings: UserSettings | None, token: str
+    ) -> list[dict[str, Any]]:
+        """Build dynamic catalogs for a Trakt-backed account."""
+        from app.core.config import settings as app_settings
+        from app.services.trakt.service import TraktBundle
+
+        # Use cached library if available
+        library_items = await user_cache.get_library_items(token)
+        if not library_items:
+            access_token = creds.get("authKey")  # stored as authKey after encryption/decryption
+            if not access_token or not app_settings.TRAKT_CLIENT_ID or not app_settings.TRAKT_CLIENT_SECRET:
+                logger.warning(f"[{redact_token(token)}] Trakt credentials missing, cannot fetch library")
+                return []
+            redirect_uri = f"{app_settings.HOST_NAME}/tokens/trakt/callback"
+            trakt_bundle = TraktBundle(
+                client_id=app_settings.TRAKT_CLIENT_ID,
+                client_secret=app_settings.TRAKT_CLIENT_SECRET,
+                redirect_uri=redirect_uri,
+                access_token=access_token,
+            )
+            try:
+                library_items = await trakt_bundle.library.get_library_items()
+                await user_cache.set_library_items(token, library_items)
+            finally:
+                await trakt_bundle.close()
+
+        if not library_items:
+            return []
+
+        tmdb_key = resolve_tmdb_api_key(user_settings)
+        dynamic_catalog_service = DynamicCatalogService(
+            language=user_settings.language if user_settings else "en-US",
+            tmdb_api_key=tmdb_key,
+        )
+        return await dynamic_catalog_service.get_dynamic_catalogs(library_items, user_settings, token=token)
+
     async def get_manifest_for_token(self, token: str) -> dict[str, Any]:
         """
         Generate manifest for a given token.
 
-        Args:
-            token: User token
-
-        Returns:
-            Complete manifest dictionary
-
-        Raises:
-            HTTPException: If token is invalid or credentials are missing
+        Returns cached manifest immediately if available. Only one build
+        runs at a time per token — concurrent requests wait for the first
+        build to complete then return its cached result.
         """
         if not token:
             raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
+
+        # Return in-memory cached manifest immediately if available
+        if token in self._cache:
+            return self._cache[token]
 
         # Load user credentials and settings
         creds = await token_store.get_user_data(token)
@@ -192,36 +266,55 @@ class ManifestService:
             logger.error(f"[{redact_token(token)}] Error loading user data from token store: {e}")
             raise HTTPException(status_code=401, detail="Invalid token session. Please reconfigure.")
 
-        base_manifest = self.get_base_manifest()
+        # Acquire per-token lock so concurrent requests don't each trigger
+        # a full build (including slow Gemini LLM calls)
+        async with self._get_lock(token):
+            # Re-check cache after acquiring lock — another request may have
+            # completed the build while we were waiting
+            if token in self._cache:
+                return self._cache[token]
 
-        bundle = StremioBundle()
-        fetched_catalogs = []
-        try:
-            # Resolve auth key
-            auth_key = await self._resolve_auth_key(bundle, creds, token)
+            base_manifest = self.get_base_manifest()
 
-            if auth_key:
-                fetched_catalogs = await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
-        except Exception as e:
-            logger.exception(f"[{redact_token(token)}] Dynamic catalog build failed: {e}")
             fetched_catalogs = []
-        finally:
-            await bundle.close()
+            try:
+                if creds.get("auth_provider") == "trakt":
+                    fetched_catalogs = await self._build_dynamic_catalogs_trakt(creds, user_settings, token)
+                else:
+                    bundle = StremioBundle()
+                    try:
+                        auth_key = await self._resolve_auth_key(bundle, creds, token)
+                        if auth_key:
+                            fetched_catalogs = await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
+                    finally:
+                        await bundle.close()
+            except Exception as e:
+                logger.exception(f"[{redact_token(token)}] Dynamic catalog build failed: {e}")
+                fetched_catalogs = []
 
-        # Combine base catalogs with fetched catalogs
-        all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
+            # Combine base catalogs with fetched catalogs
+            all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
 
-        # Translate catalogs
-        language = user_settings.language if user_settings else None
-        translated_catalogs = await self._translate_catalogs(all_catalogs, language)
+            # Translate catalogs
+            language = user_settings.language if user_settings else None
+            translated_catalogs = await self._translate_catalogs(all_catalogs, language)
 
-        # Sort catalogs
-        sorted_catalogs = self._sort_catalogs(translated_catalogs, user_settings)
+            # Sort catalogs
+            sorted_catalogs = self._sort_catalogs(translated_catalogs, user_settings)
 
-        if sorted_catalogs:
-            base_manifest["catalogs"] = sorted_catalogs
+            if sorted_catalogs:
+                base_manifest["catalogs"] = sorted_catalogs
 
-        return base_manifest
+            # Cache in memory so subsequent requests return instantly
+            self._cache[token] = base_manifest
+            logger.debug(f"[{redact_token(token)}] Manifest cached in memory")
+
+            return base_manifest
+
+    def invalidate_manifest_cache(self, token: str) -> None:
+        """Clear cached manifest for a token so it regenerates on next request."""
+        self._cache.pop(token, None)
+        logger.debug(f"[{redact_token(token)}] Manifest cache invalidated")
 
 
 manifest_service = ManifestService()
