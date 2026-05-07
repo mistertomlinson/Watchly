@@ -1,4 +1,3 @@
-import asyncio
 from typing import Any
 
 from fastapi import HTTPException
@@ -19,17 +18,6 @@ from app.utils.catalog import cache_profile_and_watched_sets, sort_catalogs
 
 class ManifestService:
     """Service for generating Stremio manifest files."""
-
-    def __init__(self):
-        # Per-token locks to prevent concurrent manifest builds
-        self._build_locks: dict[str, asyncio.Lock] = {}
-        # In-memory cache: token → manifest dict (supplements Redis cache)
-        self._cache: dict[str, dict] = {}
-
-    def _get_lock(self, token: str) -> asyncio.Lock:
-        if token not in self._build_locks:
-            self._build_locks[token] = asyncio.Lock()
-        return self._build_locks[token]
 
     @staticmethod
     def get_base_manifest() -> dict[str, Any]:
@@ -242,16 +230,11 @@ class ManifestService:
         """
         Generate manifest for a given token.
 
-        Returns cached manifest immediately if available. Only one build
-        runs at a time per token — concurrent requests wait for the first
-        build to complete then return its cached result.
+        Every call generates a fresh manifest so catalog names rotate
+        naturally on each cold launch.
         """
         if not token:
             raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
-
-        # Return in-memory cached manifest immediately if available
-        if token in self._cache:
-            return self._cache[token]
 
         # Load user credentials and settings
         creds = await token_store.get_user_data(token)
@@ -266,55 +249,38 @@ class ManifestService:
             logger.error(f"[{redact_token(token)}] Error loading user data from token store: {e}")
             raise HTTPException(status_code=401, detail="Invalid token session. Please reconfigure.")
 
-        # Acquire per-token lock so concurrent requests don't each trigger
-        # a full build (including slow Gemini LLM calls)
-        async with self._get_lock(token):
-            # Re-check cache after acquiring lock — another request may have
-            # completed the build while we were waiting
-            if token in self._cache:
-                return self._cache[token]
+        base_manifest = self.get_base_manifest()
 
-            base_manifest = self.get_base_manifest()
-
+        fetched_catalogs = []
+        try:
+            if creds.get("auth_provider") == "trakt":
+                fetched_catalogs = await self._build_dynamic_catalogs_trakt(creds, user_settings, token)
+            else:
+                bundle = StremioBundle()
+                try:
+                    auth_key = await self._resolve_auth_key(bundle, creds, token)
+                    if auth_key:
+                        fetched_catalogs = await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
+                finally:
+                    await bundle.close()
+        except Exception as e:
+            logger.exception(f"[{redact_token(token)}] Dynamic catalog build failed: {e}")
             fetched_catalogs = []
-            try:
-                if creds.get("auth_provider") == "trakt":
-                    fetched_catalogs = await self._build_dynamic_catalogs_trakt(creds, user_settings, token)
-                else:
-                    bundle = StremioBundle()
-                    try:
-                        auth_key = await self._resolve_auth_key(bundle, creds, token)
-                        if auth_key:
-                            fetched_catalogs = await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
-                    finally:
-                        await bundle.close()
-            except Exception as e:
-                logger.exception(f"[{redact_token(token)}] Dynamic catalog build failed: {e}")
-                fetched_catalogs = []
 
-            # Combine base catalogs with fetched catalogs
-            all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
+        # Combine base catalogs with fetched catalogs
+        all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
 
-            # Translate catalogs
-            language = user_settings.language if user_settings else None
-            translated_catalogs = await self._translate_catalogs(all_catalogs, language)
+        # Translate catalogs
+        language = user_settings.language if user_settings else None
+        translated_catalogs = await self._translate_catalogs(all_catalogs, language)
 
-            # Sort catalogs
-            sorted_catalogs = self._sort_catalogs(translated_catalogs, user_settings)
+        # Sort catalogs
+        sorted_catalogs = self._sort_catalogs(translated_catalogs, user_settings)
 
-            if sorted_catalogs:
-                base_manifest["catalogs"] = sorted_catalogs
+        if sorted_catalogs:
+            base_manifest["catalogs"] = sorted_catalogs
 
-            # Cache in memory so subsequent requests return instantly
-            self._cache[token] = base_manifest
-            logger.debug(f"[{redact_token(token)}] Manifest cached in memory")
-
-            return base_manifest
-
-    def invalidate_manifest_cache(self, token: str) -> None:
-        """Clear cached manifest for a token so it regenerates on next request."""
-        self._cache.pop(token, None)
-        logger.debug(f"[{redact_token(token)}] Manifest cache invalidated")
+        return base_manifest
 
 
 manifest_service = ManifestService()
