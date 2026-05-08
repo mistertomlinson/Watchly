@@ -24,6 +24,7 @@ from app.services.recommendation.utils import (
     resolve_tmdb_id,
 )
 from app.services.scoring import ScoringService
+from app.services.gemini import gemini_service
 from app.services.simkl import simkl_service
 from app.services.tmdb.service import TMDBService
 
@@ -47,7 +48,9 @@ class TopPicksService:
         library_items: dict[str, list[dict[str, Any]]],
         watched_tmdb: set[int],
         watched_imdb: set[str],
-        limit: int = DEFAULT_CATALOG_LIMIT,
+        limit: int = 50,
+        gemini_api_key: str | None = None,
+        library_items_raw: dict | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get top picks with diversity caps.
@@ -102,48 +105,65 @@ class TopPicksService:
             if item.get("id"):
                 all_candidates[item["id"]] = item
 
-        # 2. Fetch discover with profile features
-        discover_candidates = await self._fetch_discover_with_profile(profile, content_type, mtype)
-        # filter by user settings
-        discover_candidates = filter_items_by_settings(discover_candidates, self.user_settings)
-        for item in discover_candidates:
-            if item.get("id"):
-                all_candidates[item["id"]] = item
+        # 2. Fetch with Gemini if API key available, otherwise fall back to discover
+        logger.info(f"Top picks Gemini check: api_key={bool(gemini_api_key)} library={bool(library_items_raw)} summary={bool(profile.interest_summary if profile else None)}")
+        gemini_ids = set()
+        use_gemini = gemini_api_key and library_items_raw and profile.interest_summary
+        if use_gemini:
+            gemini_candidates = await self._fetch_gemini_recommendations(
+                profile, content_type, library_items_raw, gemini_api_key, limit
+            )
+            for item in gemini_candidates:
+                if item.get("id"):
+                    item["_gemini_pick"] = True
+                    all_candidates[item["id"]] = item
+                    gemini_ids.add(item["id"])
+            logger.info(f"Gemini returned {len(gemini_candidates)} candidates for top picks")
+
+        # Only use discover as fallback if Gemini failed or unavailable
+        if not use_gemini or len(gemini_ids) < limit // 2:
+            logger.info(f"Falling back to discover (gemini_ids={len(gemini_ids)})")
+            discover_candidates = await self._fetch_discover_with_profile(profile, content_type, mtype)
+            discover_candidates = filter_items_by_settings(discover_candidates, self.user_settings)
+            for item in discover_candidates:
+                if item.get("id"):
+                    all_candidates[item["id"]] = item
 
         # Filter out watched items
         filtered_candidates = [item for item in all_candidates.values() if item.get("id") not in watched_tmdb]
 
         logger.info(f"Found {len(filtered_candidates)} candidates after filtering out watched items and user settings")
 
-        #  Score all candidates with profile
-        scored_candidates = []
-        rotation_seed = RecommendationScoring.generate_rotation_seed()  # Daily rotation for fresh recommendations
-        for item in filtered_candidates:
-            try:
-                final_score = RecommendationScoring.calculate_final_score(
-                    item=item,
-                    profile=profile,
-                    scorer=self.scorer,
-                    mtype=mtype,
-                    rotation_seed=rotation_seed,
-                )
-                scored_candidates.append((final_score, item))
-            except Exception as e:
-                logger.debug(f"Failed to score item {item.get('id')}: {e}")
-                continue
+        rotation_seed = RecommendationScoring.generate_rotation_seed()
+        scored_candidates = []  # initialize for any downstream references
 
-        # Sort by score
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-        logger.info(f"Scored {len(scored_candidates)} candidates.")
-
-        # Apply diversity caps
-        result = self._apply_diversity_caps(scored_candidates, len(scored_candidates), mtype)
-        logger.info(f"After diversity caps: {len(result)} items")
-
-        # Limit before enrichment to avoid timeout (only enrich 3x what we need)
-        result = result[: limit * 3]
-        logger.info(f"After diversity caps and pre-enrichment limit: {len(result)} items")
+        # If Gemini succeeded, skip scoring/diversity caps — trust Gemini directly
+        if gemini_ids and len(gemini_ids) >= limit // 2:
+            result = [i for i in filtered_candidates if i.get("_gemini_pick")]
+            logger.info(f"Using {len(result)} Gemini picks directly, skipping scoring/diversity caps")
+        else:
+            # Fall back to full scoring pipeline
+            scored_candidates = []
+            for item in filtered_candidates:
+                try:
+                    final_score = RecommendationScoring.calculate_final_score(
+                        item=item,
+                        profile=profile,
+                        scorer=self.scorer,
+                        mtype=mtype,
+                        rotation_seed=rotation_seed,
+                    )
+                    scored_candidates.append((final_score, item))
+                except Exception as e:
+                    logger.debug(f"Failed to score item {item.get('id')}: {e}")
+                    continue
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            logger.info(f"Scored {len(scored_candidates)} candidates.")
+            result_capped = self._apply_diversity_caps(scored_candidates, len(scored_candidates), mtype)
+            logger.info(f"After diversity caps: {len(result_capped)} items")
+            result = [i for i in result_capped]
+            result = result[: limit * 3]
+            logger.info(f"After pre-enrichment limit: {len(result)} items")
 
         # Enrich metadata
         enriched = await RecommendationMetadata.fetch_batch(
@@ -295,6 +315,127 @@ class TopPicksService:
         params = apply_discover_filters(params, self.user_settings)
 
         tasks.append(self.tmdb_service.get_discover(mtype, **params))
+
+
+    async def _fetch_gemini_recommendations(
+        self,
+        profile: TasteProfile,
+        content_type: str,
+        library_items: dict,
+        gemini_api_key: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Use Gemini to pick specific titles based on watch history and taste profile.
+        Mirrors AI Search approach: pass history + preferences directly to LLM.
+        """
+        try:
+            mtype = content_type_to_mtype(content_type)
+
+            # Build watch history context
+            loved = [i for i in library_items.get("loved", []) if i.get("type") == content_type]
+            liked = [i for i in library_items.get("liked", []) if i.get("type") == content_type]
+            watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
+
+            # Sort watched by last watched date
+            watched.sort(key=lambda x: x.get("state", {}).get("lastWatched", ""), reverse=True)
+
+            # Build loved/liked section
+            loved_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in (loved + liked)[:20]]
+            watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
+
+            # Top genres from profile
+            top_genres = profile.get_top_genres(limit=6)
+            genre_lines = [f"- Genre ID {gid} (score: {score:.2f})" for gid, score in top_genres]
+
+            # Top directors and cast
+            top_directors = profile.get_top_directors(limit=5)
+            top_cast = profile.get_top_cast(limit=5)
+            director_lines = [f"- Person ID {did} (score: {score:.2f})" for did, score in top_directors]
+            cast_lines = [f"- Person ID {cid} (score: {score:.2f})" for cid, score in top_cast]
+
+            interest_summary = profile.interest_summary or ""
+
+            prompt = f"""You are an expert {content_type} recommendation engine.
+
+User Interest Summary: {interest_summary}
+
+Content they LOVED or LIKED (highest priority signals):
+{chr(10).join(loved_lines) if loved_lines else "None recorded"}
+
+Recently watched:
+{chr(10).join(watched_lines) if watched_lines else "None recorded"}
+
+TASK: Recommend exactly {limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
+- Strongly reflect their taste profile and interest summary
+- Include both well-known titles and hidden gems they likely haven't seen
+- Prioritize quality and relevance over popularity
+- DO NOT recommend anything from their watched/loved/liked lists above. This is critical — every title you recommend must be one they have NOT seen
+- Lean toward their strongest preferences but include some variety
+
+RESPONSE FORMAT (one per line, no other text):
+{content_type}|Title|Year
+
+EXAMPLE:
+{content_type}|Blade Runner 2049|2017
+{content_type}|Annihilation|2018"""
+
+            response = await gemini_service.generate_flash_content_async(
+                prompt=prompt,
+                system_instruction=f"You are a personalized {content_type} recommendation expert. Return ONLY the pipe-separated list, no explanations.",
+                api_key=gemini_api_key,
+            )
+
+            if not response:
+                return []
+
+            # Parse response and resolve to TMDB IDs
+            candidates = []
+            lines = [l.strip() for l in response.strip().split("\n") if l.strip() and "|" in l]
+
+            resolve_tasks = []
+            parsed = []
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    _, name, year = parts[0].strip(), parts[1].strip(), parts[2].strip()[:4]
+                    parsed.append((name, year))
+                    resolve_tasks.append(self._resolve_title_to_tmdb(name, year, mtype))
+
+            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, dict) and result.get("id"):
+                    candidates.append(result)
+
+            logger.info(f"Gemini top picks: resolved {len(candidates)}/{len(parsed)} titles")
+            logger.info(f"Gemini picks: {[c.get("title") or c.get("name") for c in candidates]}")
+            return candidates
+
+        except Exception as e:
+            logger.warning(f"Gemini top picks failed, falling back to discover: {e}")
+            return []
+
+    async def _resolve_title_to_tmdb(self, name: str, year: str, mtype: str) -> dict | None:
+        """Resolve a title+year to a TMDB item dict via TMDB search API."""
+        try:
+            search_type = "tv" if mtype == "tv" else "movie"
+            params = {"query": name, "page": 1}
+            if year:
+                if search_type == "movie":
+                    params["primary_release_year"] = year
+                else:
+                    params["first_air_date_year"] = year
+            results = await self.tmdb_service.client.get(f"/search/{search_type}", params=params)
+            items = results.get("results", [])
+            if not items:
+                # Try without year constraint
+                params2 = {"query": name, "page": 1}
+                results2 = await self.tmdb_service.client.get(f"/search/{search_type}", params=params2)
+                items = results2.get("results", [])
+            return items[0] if items else None
+        except Exception as e:
+            logger.debug(f"Failed to resolve title {name}: {e}")
+            return None
 
     async def _fetch_discover_with_profile(
         self, profile: TasteProfile, content_type: str, mtype: str

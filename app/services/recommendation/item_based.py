@@ -1,3 +1,4 @@
+from app.services.gemini import gemini_service
 import asyncio
 from typing import Any
 
@@ -33,6 +34,8 @@ class ItemBasedService:
         watched_imdb: set[str] | None = None,
         limit: int = 20,
         whitelist: set[int] | None = None,
+        gemini_api_key: str | None = None,
+        library_items: dict | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get recommendations for a specific item.
@@ -54,6 +57,16 @@ class ItemBasedService:
         Returns:
             List of recommended items
         """
+        # Try Gemini-based recommendations first if API key available
+        if gemini_api_key and library_items:
+            gemini_results = await self._fetch_gemini_item_recommendations(
+                item_id, content_type, library_items, gemini_api_key, limit
+            )
+            if len(gemini_results) >= limit // 2:
+                logger.info(f"Using Gemini recommendations for {item_id}: {len(gemini_results)} results")
+                return gemini_results
+            logger.info(f"Gemini returned only {len(gemini_results)} for {item_id}, falling back to TMDB")
+
         # Resolve TMDB ID
         tmdb_id = await resolve_tmdb_id(item_id, self.tmdb_service)
         if not tmdb_id:
@@ -86,6 +99,100 @@ class ItemBasedService:
         final = filter_watched_by_imdb(enriched, watched_imdb or set())
 
         return final
+
+    async def _fetch_gemini_item_recommendations(
+        self,
+        item_id: str,
+        content_type: str,
+        library_items: dict,
+        gemini_api_key: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Use Gemini to recommend titles similar to a seed item."""
+        try:
+            # Resolve seed item title from TMDB
+            tmdb_id = await resolve_tmdb_id(item_id, self.tmdb_service)
+            if not tmdb_id:
+                return []
+            mtype = content_type_to_mtype(content_type)
+            details = await self.tmdb_service.client.get(
+                f"/{mtype}/{tmdb_id}", params={"language": "en-US"}
+            )
+            seed_title = details.get("title") or details.get("name", item_id)
+            seed_year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
+
+            # Build watched list
+            watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
+            watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
+
+            prompt = f"""You are a {content_type} recommendation expert.
+
+The user just watched: {seed_title} ({seed_year})
+
+Their watch history (DO NOT recommend these):
+{chr(10).join(watched_lines) if watched_lines else "None recorded"}
+
+TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, or style.
+- Focus on similarity to the seed title
+- Avoid anything in their watch history above
+- Include both well-known and obscure titles
+
+RESPONSE FORMAT (one per line, no other text):
+{content_type}|Title|Year"""
+
+            response = await gemini_service.generate_flash_content_async(
+                prompt=prompt,
+                system_instruction=f"You are a {content_type} recommendation expert. Return ONLY the pipe-separated list.",
+                api_key=gemini_api_key,
+            )
+
+            if not response:
+                return []
+
+            candidates = []
+            lines = [l.strip() for l in response.strip().splitlines() if l.strip() and "|" in l]
+            resolve_tasks = []
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    name, year = parts[1].strip(), parts[2].strip()[:4]
+                    resolve_tasks.append(self._resolve_title(name, year, mtype))
+
+            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, dict) and result.get("id"):
+                    candidates.append(result)
+
+            # Enrich with IMDB IDs and full metadata
+            enriched = await RecommendationMetadata.fetch_batch(
+                self.tmdb_service, candidates, content_type, user_settings=self.user_settings
+            )
+            logger.info(f"Gemini item recs for {seed_title}: {len(enriched)} enriched")
+            return enriched
+
+        except Exception as e:
+            logger.warning(f"Gemini item recommendations failed for {item_id}: {e}")
+            return []
+
+    async def _resolve_title(self, name: str, year: str, mtype: str) -> dict | None:
+        """Resolve title+year to TMDB item."""
+        try:
+            search_type = "tv" if mtype == "tv" else "movie"
+            params = {"query": name, "page": 1}
+            if year:
+                key = "first_air_date_year" if search_type == "tv" else "primary_release_year"
+                params[key] = year
+            results = await self.tmdb_service.client.get(f"/search/{search_type}", params=params)
+            items = results.get("results", [])
+            if not items:
+                results2 = await self.tmdb_service.client.get(f"/search/{search_type}", params={"query": name, "page": 1})
+                items = results2.get("results", [])
+            if items:
+                items[0]["media_type"] = search_type
+                return items[0]
+            return None
+        except Exception:
+            return None
 
     async def _fetch_candidates_from_simkl(self, imdb_id: str, mtype: str):
         # check if user_settings has simkl api key or not

@@ -70,7 +70,7 @@ def _clean_meta(meta: dict) -> dict | None:
             # Keep original value if it cannot be parsed
             pass
 
-    imdb_id = cleaned.get("id", "")
+    imdb_id = str(cleaned.get("id", ""))
     # if id does not start with tt, return None
     if not imdb_id.startswith("tt"):
         return None
@@ -413,6 +413,7 @@ class CatalogService:
 
             item_service: ItemBasedService = services["item"]
 
+            gemini_key = getattr(user_settings, "gemini_api_key", None) if user_settings else None
             recommendations = await item_service.get_recommendations_for_item(
                 item_id=item_id,
                 content_type=content_type,
@@ -420,6 +421,8 @@ class CatalogService:
                 watched_imdb=watched_imdb,
                 limit=limit,
                 whitelist=whitelist,
+                gemini_api_key=gemini_key,
+                library_items=library_items,
             )
             logger.info(f"Found {len(recommendations)} recommendations for item {item_id}")
 
@@ -460,6 +463,7 @@ class CatalogService:
             if profile:
                 top_picks_service: TopPicksService = services["top_picks"]
 
+                gemini_key = getattr(user_settings, 'gemini_api_key', None) if user_settings else None
                 recommendations = await top_picks_service.get_top_picks(
                     profile=profile,
                     content_type=content_type,
@@ -467,6 +471,8 @@ class CatalogService:
                     watched_tmdb=watched_tmdb,
                     watched_imdb=watched_imdb,
                     limit=limit,
+                    gemini_api_key=gemini_key,
+                    library_items_raw=library_items,
                 )
             else:
                 logger.info(f"No profile for top picks, showing trending {content_type}")
