@@ -17,7 +17,7 @@ _STATIC_TRANSLATIONS: dict[tuple[str, str], str] = {
     ("fr", "Top Picks for You"): "Sélectionnés pour vous",
     ("fr", "More Like"): "Titres similaires à",
     ("fr", "More like"): "Titres similaires à",
-    ("fr", "Because you watched"): "Parce que vous avez regardé",
+    ("fr", "Because You Watched"): "Parce que vous avez regardé",
     ("fr", "Genre & Keyword Catalogs"): "Genres et mots-clés",
     ("fr", "From your favourite Creators"): "De vos créateurs préférés",
     ("fr", "Based on what you loved"): "D'après vos coups de cœur",

@@ -139,8 +139,7 @@ Genres: {seed_genres}
 
 Their watch history (DO NOT recommend these):
 {chr(10).join(watched_lines) if watched_lines else "None recorded"}
-TASK: Recommend exactly {limit} {content_label}s similar to "{seed_title}". Match the genre exactly — if it is a Documentary, only recommend documentaries.
-TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, recommend documentaries. If it is a fiction film, recommend fiction films. Match the genre closely.
+TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, only recommend documentaries. If it is a horror film, recommend horror films. Match the genre closely.
 - Focus on similarity to the seed title
 - Avoid anything in their watch history above
 - Include both well-known and obscure titles

@@ -234,7 +234,7 @@ class DynamicCatalogService:
             await self._add_item_based_rows(catalogs, library_items, mtype, loved_cfg, watched_cfg)
 
         # 4. Add watchly.rec catalog
-        catalogs.extend(get_catalogs_from_config(user_settings, "watchly.rec", "Top Picks for You", True, True))
+        catalogs.extend(get_catalogs_from_config(user_settings, "watchly.rec", "Top Picks for You", True, True, movie_name="Top Movies for You", series_name="Top Series for You"))
 
         # 5. Add watchly.creators catalog
         catalogs.extend(
@@ -336,7 +336,7 @@ class DynamicCatalogService:
             last_watched = random.choice(watched[:5]) if watched else None
 
             if last_watched:
-                label = watched_config.name if watched_config.name else "Because you watched"
+                label = watched_config.name if watched_config.name else "Because You Watched"
                 watched_config_display_at_home = getattr(watched_config, "display_at_home", True)
                 catalogs.append(
                     self.build_catalog_entry(last_watched, label, "watchly.watched", watched_config_display_at_home)

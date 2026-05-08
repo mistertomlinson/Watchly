@@ -170,7 +170,7 @@ class ManifestService:
 
     async def _translate_catalogs(self, catalogs: list[dict[str, Any]], language: str | None) -> list[dict[str, Any]]:
         """Translate catalog names to target language."""
-        if not language:
+        if not language or language.startswith("en"):
             return catalogs
 
         translated_catalogs = []

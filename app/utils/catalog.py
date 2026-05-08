@@ -13,6 +13,8 @@ def get_catalogs_from_config(
     default_name: str,
     default_movie: bool,
     default_series: bool,
+    movie_name: str | None = None,
+    series_name: str | None = None,
 ):
     catalogs = []
     config = next((c for c in user_settings.catalogs if c.id == cat_id), None)
@@ -26,9 +28,9 @@ def get_catalogs_from_config(
         extra = DISCOVER_ONLY_EXTRA if not display_at_home else []
 
         if enabled_movie:
-            catalogs.append({"type": "movie", "id": cat_id, "name": name, "extra": extra})
+            catalogs.append({"type": "movie", "id": cat_id, "name": movie_name or name, "extra": extra})
         if enabled_series:
-            catalogs.append({"type": "series", "id": cat_id, "name": name, "extra": extra})
+            catalogs.append({"type": "series", "id": cat_id, "name": series_name or name, "extra": extra})
     return catalogs
 
 

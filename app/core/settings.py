@@ -94,7 +94,7 @@ def get_default_settings() -> UserSettings:
             ),
             CatalogConfig(
                 id="watchly.watched",
-                name="Because you watched",
+                name="Because You Watched",
                 enabled=True,
                 enabled_movie=True,
                 enabled_series=True,

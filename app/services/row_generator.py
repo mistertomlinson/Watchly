@@ -608,7 +608,7 @@ class RowGeneratorService:
                 " relevant).\n3. RISING STAR — Discovery: suggest themes they might not have explored yet but"
                 " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords +"
                 " country; openness to new content here.\n\nRules:\n- Genres: use ONLY these TMDB Genre IDs:"
-                f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 code (e.g. US, KR, JP)"
+                f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
                 " or null when relevant.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
                 " of strings), country (string or null).\n- Output a JSON array of 3 objects."
             )
@@ -631,6 +631,10 @@ class RowGeneratorService:
             final_rows = []
             profile_kw_map = {name.lower(): kid for kid, name in features.keyword_names.items()}
 
+            # Track used anchor genres/keywords across rows to prevent overlapping discover pools
+            used_anchor_genres: set[int] = set()
+            used_anchor_keywords: set[int] = set()
+
             for item in data:
                 if isinstance(item, dict):
                     title = item.get("title", "Recommended")
@@ -645,13 +649,20 @@ class RowGeneratorService:
 
                 builder = RowBuilder(features)
 
+                # Only add genres not already anchored in previous rows
+                row_anchor_genres = []
                 for gid in genre_ids:
-                    if int(gid) in current_genre_map:
-                        builder.add_axis(AXIS_GENRE, int(gid), AxisRole.ANCHOR)
+                    gid = int(gid)
+                    if gid in current_genre_map and gid not in used_anchor_genres:
+                        builder.add_axis(AXIS_GENRE, gid, AxisRole.ANCHOR)
+                        row_anchor_genres.append(gid)
+                    elif gid in current_genre_map:
+                        # Demote repeated anchor genres to FLAVOR
+                        builder.add_axis(AXIS_GENRE, gid, AxisRole.FLAVOR)
 
                 for kw_name in kw_names:
                     kid = await self._resolve_keyword_to_id(kw_name, profile_kw_map)
-                    if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST:
+                    if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST and kid not in used_anchor_keywords:
                         builder.add_axis(AXIS_KEYWORD, kid, AxisRole.FLAVOR)
 
                 if country:
@@ -661,6 +672,10 @@ class RowGeneratorService:
                 if row_comp and row_comp.axes:
                     row_id = build_row_id(row_comp.axes)
                     final_rows.append(RowDefinition(title=title, id=row_id, axes=row_comp.axes))
+                    used_anchor_genres.update(row_anchor_genres)
+                    used_anchor_keywords.update(
+                        a.value for a in row_comp.axes if a.name == AXIS_KEYWORD
+                    )
 
             return final_rows if final_rows else None
 

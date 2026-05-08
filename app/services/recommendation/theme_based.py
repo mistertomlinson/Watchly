@@ -104,10 +104,20 @@ class ThemeBasedService:
         if len(candidates) < limit * 2:
             fetch_tasks = []
 
-            # For EACH axis in anchors, flavors, AND fallbacks
+            # Fire individual queries for all axes, but for flavor genre axes
+            # force anchor genres as required filters so results stay on-theme
+            anchor_genre_ids = [v for k, v in anchors.items() if k == "genre"]
+            anchor_genres_str = "|".join(str(g) for g in anchor_genre_ids) if anchor_genre_ids else None
+
             for axis_name, axis_value in all_constraints.items():
                 # Build params for this single axis
                 params = self._axes_to_params({axis_name: axis_value}, content_type)
+
+                # For flavor/fallback genre queries, pin anchor genres so the pool stays distinct
+                if axis_name == "genre" and axis_value not in anchor_genre_ids and anchor_genres_str:
+                    # Require at least one anchor genre alongside this flavor genre
+                    existing = params.get("with_genres", "")
+                    params["with_genres"] = f"{anchor_genres_str}|{existing}" if existing else anchor_genres_str
 
                 # ALWAYS add mandatory filters (country/era) if they exist and are not the current axis
                 for filter_name, filter_value in mandatory_filters.items():
@@ -192,7 +202,16 @@ class ThemeBasedService:
         enriched = await RecommendationMetadata.fetch_batch(
             self.tmdb_service, unique_results, content_type, user_settings=self.user_settings
         )
-        return filter_watched_by_imdb(enriched, watched_imdb)[:limit]
+        final = filter_watched_by_imdb(enriched, watched_imdb)[:limit]
+
+        # Register returned TMDB IDs into the cross-catalog exclusion set if provided
+        if hasattr(self, '_cross_catalog_seen'):
+            for item in final:
+                tid = item.get("_tmdb_id")
+                if tid:
+                    self._cross_catalog_seen.add(tid)
+
+        return final
 
     def _parse_theme_id(self, theme_id: str) -> tuple[dict, dict, dict]:
         """Parse role-based ID: watchly.theme.a:g123.f:k456.b:y1990"""
@@ -243,7 +262,10 @@ class ThemeBasedService:
         if "keyword" in axes:
             params["with_keywords"] = axes["keyword"].replace("-", "|")
         if "country" in axes:
-            params["with_origin_country"] = axes["country"]
+            # Normalize common incorrect codes to ISO 3166-1 alpha-2
+            country_code_fixes = {"UK": "GB", "EN": "GB"}
+            country_val = axes["country"]
+            params["with_origin_country"] = country_code_fixes.get(country_val, country_val)
         if "era" in axes:
             try:
                 # Value can be single year or range
