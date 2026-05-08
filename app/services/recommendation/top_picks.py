@@ -327,20 +327,27 @@ class TopPicksService:
         candidates = []
         tasks = []
 
-        # Discover with genres
+        # Discover with genres — run individual queries per genre weighted by score
+        # Higher scored genres get more pages so they dominate the candidate pool
         if top_genres:
-            genre_ids = [g[0] for g in top_genres]
-            self._add_discover_task(
-                tasks,
-                mtype,
-                without_genres,
-                with_genres="|".join(str(g) for g in genre_ids),
-                page=1,
-            )
+            max_score = top_genres[0][1] if top_genres else 1.0
+            for genre_id, score in top_genres[:5]:
+                # Allocate 1-3 pages proportional to score relative to top genre
+                ratio = score / max_score if max_score > 0 else 0
+                pages = 3 if ratio >= 0.8 else 2 if ratio >= 0.5 else 1
+                for page in range(1, pages + 1):
+                    self._add_discover_task(
+                        tasks,
+                        mtype,
+                        without_genres,
+                        with_genres=str(genre_id),
+                        page=page,
+                    )
 
         # Discover with keywords
         if top_keywords:
-            keyword_ids = [k[0] for k in top_keywords]
+            from app.services.row_generator import GENERIC_KEYWORD_BLACKLIST
+            keyword_ids = [k[0] for k in top_keywords if k[0] not in GENERIC_KEYWORD_BLACKLIST]
             for page in range(1, 3):  # 2 pages
                 self._add_discover_task(
                     tasks,

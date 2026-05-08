@@ -260,6 +260,17 @@ class RowBuilder:
         return None
 
 
+GENERIC_KEYWORD_BLACKLIST = {
+    239797,  # complex
+    197582,  # mysterious
+    9717,    # based on novel
+    818,     # based on true story
+    4344,    # philosophical
+    2964,    # future
+    663,     # suspense
+    11162,   # miniseries (format descriptor, not content)
+}
+
 class RowGeneratorService:
     """Generates dynamic, personalized row definitions from a User Taste Profile."""
 
@@ -640,7 +651,7 @@ class RowGeneratorService:
 
                 for kw_name in kw_names:
                     kid = await self._resolve_keyword_to_id(kw_name, profile_kw_map)
-                    if kid is not None:
+                    if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST:
                         builder.add_axis(AXIS_KEYWORD, kid, AxisRole.FLAVOR)
 
                 if country:
