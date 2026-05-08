@@ -5,6 +5,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.config import settings
 from app.core.constants import CATALOG_KEY, LIBRARY_ITEMS_KEY, PROFILE_KEY, WATCHED_SETS_KEY
 from app.core.security import redact_token
 from app.models.taste_profile import TasteProfile
@@ -390,6 +391,39 @@ class UserCacheService:
         }
         await redis_service.set(key, json.dumps(wrapped_data), ttl)
         logger.debug(f"[{redact_token(token)}...] Cached catalog for {type}/{id}")
+
+    async def get_manifest(self, token: str) -> dict | None:
+        """Return cached manifest if still within the manifest cache TTL."""
+        key = f"watchly:manifest:{token}"
+        try:
+            data = await redis_service.get(key)
+            if data:
+                wrapped = json.loads(data)
+                age = int(time.time()) - wrapped.get("created_at", 0)
+                if age < settings.MANIFEST_CACHE_TTL_SECONDS:
+                    return wrapped["manifest"]
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to get cached manifest: {e}")
+        return None
+
+    async def set_manifest(self, token: str, manifest: dict) -> None:
+        """Cache the manifest for MANIFEST_CACHE_TTL_SECONDS."""
+        key = f"watchly:manifest:{token}"
+        try:
+            wrapped = {"manifest": manifest, "created_at": int(time.time())}
+            await redis_service.set(key, json.dumps(wrapped), settings.MANIFEST_CACHE_TTL_SECONDS)
+            logger.debug(f"[{redact_token(token)}...] Cached manifest (TTL: {settings.MANIFEST_CACHE_TTL_SECONDS}s)")
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to cache manifest: {e}")
+
+    async def invalidate_manifest(self, token: str) -> None:
+        """Invalidate cached manifest so it regenerates on next request."""
+        key = f"watchly:manifest:{token}"
+        try:
+            await redis_service.delete(key)
+            logger.debug(f"[{redact_token(token)}...] Invalidated manifest cache")
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to invalidate manifest: {e}")
 
     async def invalidate_catalog(self, token: str, type: str, id: str) -> None:
         """

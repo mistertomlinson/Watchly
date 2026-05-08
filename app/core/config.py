@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     ANNOUNCEMENT_HTML: str = ""
     AUTO_UPDATE_CATALOGS: bool = True
     CATALOG_REFRESH_INTERVAL_SECONDS: int = 86400  # 24 hours
+    MANIFEST_CACHE_TTL_SECONDS: int = 43200  # 12 hours — controls how often catalog names/seeds rotate
     APP_ENV: Literal["development", "production", "vercel"] = "production"
     HOST_NAME: str = "https://1ccea4301587-watchly.baby-beamup.club"
 

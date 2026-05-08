@@ -230,11 +230,17 @@ class ManifestService:
         """
         Generate manifest for a given token.
 
-        Every call generates a fresh manifest so catalog names rotate
-        naturally on each cold launch.
+        Returns cached manifest if within MANIFEST_CACHE_TTL_SECONDS.
+        After expiry, regenerates with fresh seed items for catalog rotation.
         """
         if not token:
             raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
+
+        # Return cached manifest if still fresh
+        cached = await user_cache.get_manifest(token)
+        if cached:
+            logger.debug(f"[{redact_token(token)}] Returning cached manifest")
+            return cached
 
         # Load user credentials and settings
         creds = await token_store.get_user_data(token)
@@ -279,6 +285,9 @@ class ManifestService:
 
         if sorted_catalogs:
             base_manifest["catalogs"] = sorted_catalogs
+
+        # Cache manifest in Redis for MANIFEST_CACHE_TTL_SECONDS
+        await user_cache.set_manifest(token, base_manifest)
 
         return base_manifest
 

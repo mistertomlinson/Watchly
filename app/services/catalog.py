@@ -315,7 +315,7 @@ class DynamicCatalogService:
             loved.sort(key=self._parse_item_last_watched, reverse=True)
 
             # gather random last loved from last 3 items
-            last_loved = random.choice(loved[:3]) if loved else None
+            last_loved = random.choice(loved[:5]) if loved else None
             if last_loved:
                 label = loved_config.name if loved_config.name else "More like"
                 loved_config_display_at_home = getattr(loved_config, "display_at_home", True)
@@ -333,7 +333,7 @@ class DynamicCatalogService:
                 watched = [i for i in watched if i.get("_id") != last_loved.get("_id")]
 
             # gather random last watched from last 3 items
-            last_watched = random.choice(watched[:3]) if watched else None
+            last_watched = random.choice(watched[:5]) if watched else None
 
             if last_watched:
                 label = watched_config.name if watched_config.name else "Because you watched"

@@ -69,8 +69,6 @@ class ItemBasedService:
         tasks = [self._fetch_candidates_from_simkl(item_id, mtype), self._fetch_candidates(tmdb_id, mtype)]
         simkl_candidates, candidates = await asyncio.gather(*tasks)
 
-        # Apply global settings filter (years, popularity)
-        candidates = filter_items_by_settings(candidates, self.user_settings)
 
         # extend candidates always include simkl candidates
         candidates = simkl_candidates + candidates
