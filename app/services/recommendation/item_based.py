@@ -120,19 +120,27 @@ class ItemBasedService:
             )
             seed_title = details.get("title") or details.get("name", item_id)
             seed_year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
-
-            # Build watched list
+            seed_overview = (details.get("overview") or "")[:400]
+            genre_ids = details.get("genre_ids", [])
+            from app.services.tmdb.genre import movie_genres, series_genres
+            genre_map = movie_genres if mtype == "movie" else series_genres
+            seed_genres = ", ".join([genre_map.get(gid, "") for gid in genre_ids if genre_map.get(gid)])
             watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
             watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
 
-            prompt = f"""You are a {content_type} recommendation expert.
+            content_label = seed_genres if seed_genres else content_type
+            prompt = f"""You are a {content_label} recommendation expert.
 
 The user just watched: {seed_title} ({seed_year})
 
+About this title: {seed_overview}
+Genres: {seed_genres}
+
+
 Their watch history (DO NOT recommend these):
 {chr(10).join(watched_lines) if watched_lines else "None recorded"}
-
-TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, or style.
+TASK: Recommend exactly {limit} {content_label}s similar to "{seed_title}". Match the genre exactly — if it is a Documentary, only recommend documentaries.
+TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, recommend documentaries. If it is a fiction film, recommend fiction films. Match the genre closely.
 - Focus on similarity to the seed title
 - Avoid anything in their watch history above
 - Include both well-known and obscure titles
@@ -142,7 +150,7 @@ RESPONSE FORMAT (one per line, no other text):
 
             response = await gemini_service.generate_flash_content_async(
                 prompt=prompt,
-                system_instruction=f"You are a {content_type} recommendation expert. Return ONLY the pipe-separated list.",
+                system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
                 api_key=gemini_api_key,
             )
 
@@ -157,8 +165,12 @@ RESPONSE FORMAT (one per line, no other text):
                 if len(parts) >= 3:
                     name, year = parts[1].strip(), parts[2].strip()[:4]
                     resolve_tasks.append(self._resolve_title(name, year, mtype))
+                elif len(parts) == 2:
+                    name, year = parts[0].strip(), parts[1].strip()[:4]
+                    resolve_tasks.append(self._resolve_title(name, year, mtype))
 
             results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+            logger.info(f"Gemini raw lines for {seed_title}: {lines[:5]}")
             for result in results:
                 if isinstance(result, dict) and result.get("id"):
                     candidates.append(result)
