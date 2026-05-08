@@ -67,8 +67,7 @@ class ThemeBasedService:
             mandatory_filters["country"] = all_constraints["country"]
         if "era" in all_constraints:
             mandatory_filters["era"] = all_constraints["era"]
-        if "keyword" in all_constraints:
-            mandatory_filters["keyword"] = all_constraints["keyword"]
+
 
         logger.info(f"Theme discovery for {theme_id}: anchors={anchors}, flavors={flavors}, fallbacks={fallbacks}")
 
@@ -123,7 +122,7 @@ class ThemeBasedService:
                     if without:
                         params["without_genres"] = "|".join(str(g) for g in without)
 
-                fetch_tasks.append(self._fetch_discover_candidates(content_type, params, pages=[1, 2]))
+                fetch_tasks.append(self._fetch_discover_candidates(content_type, params, pages=[1, 2, 3, 4]))
 
             # Execute Phase 2
             results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
