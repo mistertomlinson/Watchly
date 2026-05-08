@@ -121,7 +121,11 @@ class ItemBasedService:
             seed_title = details.get("title") or details.get("name", item_id)
             seed_year = (details.get("release_date") or details.get("first_air_date") or "")[:4]
             seed_overview = (details.get("overview") or "")[:400]
-            genre_ids = details.get("genre_ids", [])
+            # Detail endpoint returns 'genres' as objects, not 'genre_ids'
+            genres_list = details.get("genres") or []
+            genre_ids = [g["id"] for g in genres_list if isinstance(g, dict) and g.get("id")]
+            if not genre_ids:
+                genre_ids = details.get("genre_ids") or []
             from app.services.tmdb.genre import movie_genres, series_genres
             genre_map = movie_genres if mtype == "movie" else series_genres
             seed_genres = ", ".join([genre_map.get(gid, "") for gid in genre_ids if genre_map.get(gid)])
