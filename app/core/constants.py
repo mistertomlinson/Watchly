@@ -27,9 +27,8 @@ DISCOVERY_SETTINGS: dict = {
         "vote_count.gte": 500,
     },
     "balanced": {
-        "popularity.lte": 30,
-        "vote_average.gte": 6.7,
-        "vote_count.gte": 250,
+        "vote_average.gte": 6.0,
+        "vote_count.gte": 50,
     },
     "gems": {
         "popularity.lte": 15,

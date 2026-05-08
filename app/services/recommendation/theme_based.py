@@ -67,6 +67,8 @@ class ThemeBasedService:
             mandatory_filters["country"] = all_constraints["country"]
         if "era" in all_constraints:
             mandatory_filters["era"] = all_constraints["era"]
+        if "keyword" in all_constraints:
+            mandatory_filters["keyword"] = all_constraints["keyword"]
 
         logger.info(f"Theme discovery for {theme_id}: anchors={anchors}, flavors={flavors}, fallbacks={fallbacks}")
 
