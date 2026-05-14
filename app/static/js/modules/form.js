@@ -634,7 +634,19 @@ function initializeSuccessActions() {
             e.stopPropagation();
             const urlText = document.getElementById('addonUrl').textContent;
             try {
-                await navigator.clipboard.writeText(urlText);
+                try {
+                    await navigator.clipboard.writeText(urlText);
+                } catch (e) {
+                    const ta = document.createElement('textarea');
+                    ta.value = urlText;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
                 const originalText = copyBtn.innerHTML;
                 copyBtn.innerHTML = 'Copied!';
                 setTimeout(() => { copyBtn.innerHTML = originalText; }, 2000);
