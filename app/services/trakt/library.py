@@ -51,12 +51,44 @@ class TraktLibraryService:
                     seen_ids.add(item["_id"])
                     watched.append(item)
 
-            logger.info(f"[Trakt] library: {len(watched)} watched items ({len(movies)} movies, {len(shows)} shows)")
+            # Fetch ratings to populate loved/liked
+            movie_ratings, show_ratings = await asyncio.gather(
+                self._get_ratings("movies"),
+                self._get_ratings("shows"),
+            )
+
+            loved: list[dict[str, Any]] = []
+            liked: list[dict[str, Any]] = []
+            rated_ids: set[str] = set()
+
+            for raw in movie_ratings + show_ratings:
+                rating = raw.get("rating", 0)
+                media = raw.get("movie") or raw.get("show", {})
+                ids = media.get("ids", {})
+                canonical_id = self._get_id(ids)
+                if not canonical_id or canonical_id in rated_ids:
+                    continue
+                rated_ids.add(canonical_id)
+                item = {
+                    "_id": canonical_id,
+                    "type": "movie" if "movie" in raw else "series",
+                    "name": media.get("title", ""),
+                    "year": media.get("year"),
+                    "_is_loved": rating == 10,
+                    "_is_liked": rating == 8,
+                    "_source": "trakt",
+                }
+                if rating == 10:
+                    loved.append(item)
+                elif rating == 8:
+                    liked.append(item)
+
+            logger.info(f"[Trakt] library: {len(watched)} watched, {len(loved)} loved (10/10), {len(liked)} liked (8/10)")
 
             return {
                 "watched": watched,
-                "loved": [],
-                "liked": [],
+                "loved": loved,
+                "liked": liked,
                 "added": [],
                 "removed": [],
             }
@@ -67,6 +99,17 @@ class TraktLibraryService:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    async def _get_ratings(self, media_type: str) -> list[dict[str, Any]]:
+        """Fetch user ratings - 10/10 = loved (5 stars), 8/10 = liked (4 stars)."""
+        try:
+            data = await self.client.get(f"/users/me/ratings/{media_type}")
+            if isinstance(data, list):
+                return data
+            return []
+        except Exception as e:
+            logger.warning(f"[Trakt] Failed to fetch {media_type} ratings: {e}")
+            return []
 
     async def _get_history(self, media_type: str) -> list[dict[str, Any]]:
         """
