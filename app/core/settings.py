@@ -60,8 +60,8 @@ CATALOG_DESCRIPTIONS = {
         "Recommends items from your top 5 favorite directors and top 5 favorite actors.(Favourite = Most"
         " watched items)"
     ),
-    "watchly.all.loved": "Recommendations based on all your loved items",
-    "watchly.liked.all": "Recommendations based on all your liked items",
+    "watchly.all.loved": "Recommendations Based on All Your Loved Items",
+    "watchly.liked.all": "Recommendations Based on All Your Liked Items",
     "watchly.theme": (
         "Dynamic catalogs based on your favorite genres, keyword, countries and many more.Just like netflix."
         " Example: American Horror, Based on Novel or Book etc. This will show atmost 4 catalogs each for"
@@ -121,7 +121,7 @@ def get_default_settings() -> UserSettings:
             ),
             CatalogConfig(
                 id="watchly.all.loved",
-                name="Based on what you loved",
+                name="Based on What You Loved",
                 enabled=False,
                 enabled_movie=True,
                 enabled_series=True,
@@ -130,7 +130,7 @@ def get_default_settings() -> UserSettings:
             ),
             CatalogConfig(
                 id="watchly.liked.all",
-                name="Based on what you liked",
+                name="Based on What You Liked",
                 enabled=False,
                 enabled_movie=True,
                 enabled_series=True,
