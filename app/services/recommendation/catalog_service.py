@@ -211,6 +211,20 @@ class CatalogService:
                     auth_key,
                 )
 
+            # Generate interest summary if missing (needed for Gemini top picks)
+            if profile and not profile.interest_summary and user_settings:
+                gemini_key = getattr(user_settings, 'gemini_api_key', None)
+                if gemini_key and token:
+                    try:
+                        from app.services.interest_summary import interest_summary_service
+                        summary = await interest_summary_service.generate_summary(profile, gemini_key)
+                        if summary:
+                            profile.interest_summary = summary
+                            await user_cache.set_profile(token, content_type, profile)
+                            logger.info(f"Generated missing interest summary for {content_type}")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate interest summary on demand: {e}")
+
             whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
 
             # Route to appropriate recommendation service
