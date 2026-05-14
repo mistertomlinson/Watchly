@@ -20,6 +20,7 @@ from app.services.recommendation.theme_based import ThemeBasedService
 from app.services.recommendation.top_picks import TopPicksService
 from app.services.recommendation.utils import pad_to_min
 from app.services.stremio.service import StremioBundle
+from app.services.trakt.service import TraktBundle
 from app.services.tmdb.service import get_tmdb_service
 from app.services.token_store import token_store
 from app.services.user_cache import user_cache
@@ -180,8 +181,18 @@ class CatalogService:
                 logger.debug(f"[{redact_token(token)}...] Using cached library items")
             else:
                 # Fetch library if not cached
-                logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Stremio")
-                library_items = await bundle.library.get_library_items(auth_key)
+                if credentials.get("auth_provider") == "trakt":
+                    logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Trakt")
+                    trakt_bundle = TraktBundle(
+                        client_id=settings.TRAKT_CLIENT_ID,
+                        client_secret=settings.TRAKT_CLIENT_SECRET,
+                        redirect_uri=f"{settings.HOST_NAME}/tokens/trakt/callback",
+                        access_token=auth_key,
+                    )
+                    library_items = await trakt_bundle.library.get_library_items()
+                else:
+                    logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Stremio")
+                    library_items = await bundle.library.get_library_items(auth_key)
                 # Cache it for future use
                 await user_cache.set_library_items(token, library_items)
 
