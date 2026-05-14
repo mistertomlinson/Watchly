@@ -113,6 +113,7 @@ class TopPicksService:
             gemini_candidates = await self._fetch_gemini_recommendations(
                 profile, content_type, library_items_raw, gemini_api_key, limit
             )
+            gemini_candidates = filter_items_by_settings(gemini_candidates, self.user_settings)
             for item in gemini_candidates:
                 if item.get("id"):
                     item["_gemini_pick"] = True
