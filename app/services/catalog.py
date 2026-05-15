@@ -243,7 +243,7 @@ class DynamicCatalogService:
 
         # 6. Add watchly.all.loved catalog
         catalogs.extend(
-            get_catalogs_from_config(user_settings, "watchly.all.loved", "Based on What You Loved", True, True)
+            get_catalogs_from_config(user_settings, "watchly.all.loved", "Based on What You Loved", True, True, movie_name="Based on Movies You Loved", series_name="Based on Series You Loved")
         )
 
         # 7. Add watchly.liked.all catalog
