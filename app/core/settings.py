@@ -112,7 +112,7 @@ def get_default_settings() -> UserSettings:
             ),
             CatalogConfig(
                 id="watchly.creators",
-                name="From your favourite Creators",
+                name="From Your Favorite Creators",
                 enabled=False,
                 enabled_movie=True,
                 enabled_series=True,

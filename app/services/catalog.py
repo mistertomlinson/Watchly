@@ -238,7 +238,7 @@ class DynamicCatalogService:
 
         # 5. Add watchly.creators catalog
         catalogs.extend(
-            get_catalogs_from_config(user_settings, "watchly.creators", "From your favourite Creators", False, False)
+            get_catalogs_from_config(user_settings, "watchly.creators", "From Your Favorite Creators", False, False)
         )
 
         # 6. Add watchly.all.loved catalog

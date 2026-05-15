@@ -11,7 +11,7 @@ from loguru import logger
 # French: short UI labels are ambiguous for MT (e.g. "More like" → wrong parsing of "like").
 _STATIC_TRANSLATIONS: dict[tuple[str, str], str] = {
     ("de", "Top Picks for You"): "Top Picks für dich",
-    ("de", "From your favourite Creators"): "Von deinen Lieblingsschöpfern",
+    ("de", "From Your Favorite Creators"): "Von deinen Lieblingsschöpfern",
     ("de", "Based on What You Loved"): "Basierend auf dem, was du geliebt hast",
     ("de", "Based on What You Liked"): "Basierend auf dem, was du gemocht hast",
     ("fr", "Top Picks for You"): "Sélectionnés pour vous",
@@ -19,7 +19,7 @@ _STATIC_TRANSLATIONS: dict[tuple[str, str], str] = {
     ("fr", "More like"): "Titres similaires à",
     ("fr", "Because You Watched"): "Parce que vous avez regardé",
     ("fr", "Genre & Keyword Catalogs"): "Genres et mots-clés",
-    ("fr", "From your favourite Creators"): "De vos créateurs préférés",
+    ("fr", "From Your Favorite Creators"): "De vos créateurs préférés",
     ("fr", "Based on What You Loved"): "D'après vos coups de cœur",
     ("fr", "Based on What You Liked"): "D'après ce que vous avez aimé",
 }
