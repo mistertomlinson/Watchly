@@ -59,6 +59,7 @@ class TraktLibraryService:
 
             loved: list[dict[str, Any]] = []
             liked: list[dict[str, Any]] = []
+            disliked: list[dict[str, Any]] = []
             rated_ids: set[str] = set()
 
             for raw in movie_ratings + show_ratings:
@@ -76,6 +77,7 @@ class TraktLibraryService:
                     "year": media.get("year"),
                     "_is_loved": rating == 10,
                     "_is_liked": rating == 8,
+                    "_is_disliked": rating == 2,
                     "_source": "trakt",
                     "_mtime": raw.get("rated_at", ""),
                     "temp": False,
@@ -90,19 +92,22 @@ class TraktLibraryService:
                     loved.append(item)
                 elif rating == 8:
                     liked.append(item)
+                elif rating == 2:
+                    disliked.append(item)
 
-            logger.info(f"[Trakt] library: {len(watched)} watched, {len(loved)} loved (10/10), {len(liked)} liked (8/10)")
+            logger.info(f"[Trakt] library: {len(watched)} watched, {len(loved)} loved (10/10), {len(liked)} liked (8/10), {len(disliked)} disliked (2/10)")
 
             return {
                 "watched": watched,
                 "loved": loved,
                 "liked": liked,
+                "disliked": disliked,
                 "added": [],
                 "removed": [],
             }
         except Exception as e:
             logger.exception(f"[Trakt] Failed to get library items: {e}")
-            return {"watched": [], "loved": [], "liked": [], "added": [], "removed": []}
+            return {"watched": [], "loved": [], "liked": [], "disliked": [], "added": [], "removed": []}
 
     # ------------------------------------------------------------------
     # Private helpers

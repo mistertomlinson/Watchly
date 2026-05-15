@@ -49,24 +49,35 @@ class ProfileIntegration:
             stremio_service, library_items, auth_key
         )
 
-        # Convert library items to ScoredItems
+        # Build disliked ID set — these are excluded from profile scoring
+        disliked_ids = {
+            it.get("_id") for it in library_items.get("disliked", [])
+            if it.get("_id") and it.get("type") == content_type
+        }
+        if disliked_ids:
+            logger.info(f"[Profile] Excluding {len(disliked_ids)} disliked {content_type} items from taste profile")
+
+        # Convert library items to ScoredItems (excluding disliked)
         all_items = (
             library_items.get("loved", [])
             + library_items.get("liked", [])
             + library_items.get("watched", [])
             + library_items.get("added", [])
         )
-        typed_items = [it for it in all_items if it.get("type") == content_type]
+        typed_items = [
+            it for it in all_items
+            if it.get("type") == content_type and it.get("_id") not in disliked_ids
+        ]
 
         if not typed_items:
             return None, watched_tmdb, watched_imdb
 
         # Sample items using SmartSampler (it expects raw library items dict)
         library_items_dict = {
-            "loved": [it for it in library_items.get("loved", []) if it.get("type") == content_type],
-            "liked": [it for it in library_items.get("liked", []) if it.get("type") == content_type],
-            "watched": [it for it in library_items.get("watched", []) if it.get("type") == content_type],
-            "added": [it for it in library_items.get("added", []) if it.get("type") == content_type],
+            "loved": [it for it in library_items.get("loved", []) if it.get("type") == content_type and it.get("_id") not in disliked_ids],
+            "liked": [it for it in library_items.get("liked", []) if it.get("type") == content_type and it.get("_id") not in disliked_ids],
+            "watched": [it for it in library_items.get("watched", []) if it.get("type") == content_type and it.get("_id") not in disliked_ids],
+            "added": [it for it in library_items.get("added", []) if it.get("type") == content_type and it.get("_id") not in disliked_ids],
         }
         sampled = self.sampler.sample_items(library_items_dict, content_type)
 
@@ -101,14 +112,25 @@ class ProfileIntegration:
             stremio_service, library_items, auth_key
         )
 
-        # Convert library items to ScoredItems for change detection
+        # Build disliked ID set — these are excluded from profile scoring
+        disliked_ids = {
+            it.get("_id") for it in library_items.get("disliked", [])
+            if it.get("_id") and it.get("type") == content_type
+        }
+        if disliked_ids:
+            logger.info(f"[Profile] Excluding {len(disliked_ids)} disliked {content_type} items from taste profile")
+
+        # Convert library items to ScoredItems for change detection (excluding disliked)
         all_items = (
             library_items.get("loved", [])
             + library_items.get("liked", [])
             + library_items.get("watched", [])
             + library_items.get("added", [])
         )
-        typed_items = [it for it in all_items if it.get("type") == content_type]
+        typed_items = [
+            it for it in all_items
+            if it.get("type") == content_type and it.get("_id") not in disliked_ids
+        ]
 
         if not typed_items:
             return None, watched_tmdb, watched_imdb
@@ -157,21 +179,25 @@ class ProfileIntegration:
                             it
                             for it in library_items.get("loved", [])
                             if it.get("type") == content_type and (it.get("_id") or it.get("id")) in new_item_ids
+                            and it.get("_id") not in disliked_ids
                         ],
                         "liked": [
                             it
                             for it in library_items.get("liked", [])
                             if it.get("type") == content_type and (it.get("_id") or it.get("id")) in new_item_ids
+                            and it.get("_id") not in disliked_ids
                         ],
                         "watched": [
                             it
                             for it in library_items.get("watched", [])
                             if it.get("type") == content_type and (it.get("_id") or it.get("id")) in new_item_ids
+                            and it.get("_id") not in disliked_ids
                         ],
                         "added": [
                             it
                             for it in library_items.get("added", [])
                             if it.get("type") == content_type and (it.get("_id") or it.get("id")) in new_item_ids
+                            and it.get("_id") not in disliked_ids
                         ],
                     }
 
