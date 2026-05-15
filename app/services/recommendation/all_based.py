@@ -153,7 +153,10 @@ class AllBasedService:
             # Apply global settings filter (years, popularity)
             tmdb_candidates = filter_items_by_settings(tmdb_candidates, self.user_settings)
 
-        candidates = simkl_candidates + tmdb_candidates
+        if gemini_candidates:
+            candidates = list(all_candidates.values())
+        else:
+            candidates = simkl_candidates + tmdb_candidates
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
