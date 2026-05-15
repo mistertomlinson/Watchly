@@ -261,4 +261,14 @@ class AllBasedService:
         except Exception as e:
             logger.debug(f"Error fetching recommendations for {tmdb_id}: {e}")
 
+        # Also fetch similar items — often higher quality than recommendations
+        try:
+            similar = await self.tmdb_service.client.get(f"/{mtype}/{tmdb_id}/similar", params={"page": 1})
+            for item in similar.get("results", []):
+                candidate_id = item.get("id")
+                if candidate_id:
+                    combined[candidate_id] = item
+        except Exception as e:
+            logger.debug(f"Error fetching similar for {tmdb_id}: {e}")
+
         return list(combined.values())
