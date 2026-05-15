@@ -77,6 +77,14 @@ class TraktLibraryService:
                     "_is_loved": rating == 10,
                     "_is_liked": rating == 8,
                     "_source": "trakt",
+                    "_mtime": raw.get("rated_at", ""),
+                    "temp": False,
+                    "removed": False,
+                    "state": {
+                        "timesWatched": 1,
+                        "flaggedWatched": 1,
+                        "lastWatched": raw.get("rated_at", ""),
+                    },
                 }
                 if rating == 10:
                     loved.append(item)
