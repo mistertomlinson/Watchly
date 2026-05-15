@@ -42,6 +42,7 @@ class AllBasedService:
         limit: int = 20,
         item_type: str = "loved",  # "loved" or "liked"
         profile: TasteProfile | None = None,
+        gemini_api_key: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Get recommendations based on all loved or liked items.
@@ -104,8 +105,25 @@ class AllBasedService:
             else:
                 logger.info("Simkl returned no results, falling back to TMDB")
 
-        # Fall back to TMDB if no Simkl key or Simkl returned nothing
-        if not simkl_candidates:
+        # Try Gemini first if available — much better quality than TMDB recommendations
+        gemini_candidates = []
+        if gemini_api_key and profile and top_items:
+            try:
+                gemini_candidates = await self._fetch_gemini_candidates(
+                    top_items, content_type, profile, gemini_api_key, limit
+                )
+                if gemini_candidates:
+                    logger.info(f"Gemini returned {len(gemini_candidates)} candidates for {item_type} items")
+                    for candidate in gemini_candidates:
+                        candidate_id = candidate.get("id")
+                        if candidate_id:
+                            all_candidates[candidate_id] = candidate
+            except Exception as e:
+                logger.warning(f"Gemini fetch failed for all_based, falling back to TMDB: {e}")
+                gemini_candidates = []
+
+        # Fall back to TMDB if no Simkl key, Simkl returned nothing, and Gemini also failed
+        if not simkl_candidates and not gemini_candidates:
             all_candidates = {}
             tasks = []
             logger.info(f"Fetching TMDB recommendations for {len(top_items)} top items")
@@ -189,6 +207,27 @@ class AllBasedService:
 
         # Return top N
         return final
+
+    async def _fetch_gemini_candidates(
+        self,
+        top_items: list[dict[str, Any]],
+        content_type: str,
+        profile: TasteProfile,
+        gemini_api_key: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Use Gemini to recommend titles based on all loved/liked items."""
+        import asyncio
+        from app.services.recommendation.top_picks import TopPicksService
+        # Reuse the top_picks Gemini infrastructure
+        top_picks = TopPicksService(self.tmdb_service, self.user_settings)
+        mtype = content_type_to_mtype(content_type)
+        # Build a synthetic library_items_raw from the loved items
+        library_items_raw = {"watched": top_items, "loved": top_items, "liked": [], "added": [], "removed": []}
+        candidates = await top_picks._fetch_gemini_recommendations(
+            profile, content_type, library_items_raw, gemini_api_key, limit
+        )
+        return candidates
 
     async def _fetch_simkl_candidates(self, top_items: list[dict[str, Any]], mtype: str) -> list[dict[str, Any]]:
         """

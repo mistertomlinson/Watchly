@@ -508,6 +508,7 @@ class CatalogService:
         elif catalog_id in ("watchly.all.loved", "watchly.liked.all"):
             item_type = "loved" if catalog_id == "watchly.all.loved" else "liked"
             all_based_service: AllBasedService = services["all_based"]
+            gemini_key = getattr(user_settings, 'gemini_api_key', None) if user_settings else None
             recommendations = await all_based_service.get_recommendations_from_all_items(
                 library_items=library_items,
                 content_type=content_type,
@@ -517,6 +518,7 @@ class CatalogService:
                 limit=limit,
                 item_type=item_type,
                 profile=profile,
+                gemini_api_key=gemini_key,
             )
             logger.info(f"Found {len(recommendations)} recommendations based on all {item_type} items")
 
