@@ -242,7 +242,7 @@ class TokenStore:
                 pass
         return data
 
-    @alru_cache(maxsize=2000, ttl=43200)
+    @alru_cache(maxsize=2000, ttl=21600)
     async def _get_user_data_cached(self, token: str) -> dict[str, Any] | None:
         logger.debug(f"[REDIS] Cache miss. Fetching data from redis for {token}")
         key = self._format_key(token)
