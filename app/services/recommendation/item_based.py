@@ -135,6 +135,11 @@ class ItemBasedService:
             watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
             watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
 
+            year_min = getattr(self.user_settings, "year_min", None)
+            year_max = getattr(self.user_settings, "year_max", None)
+            year_constraint = ""
+            if year_min and year_max:
+                year_constraint = f"\n- ONLY recommend titles released between {year_min} and {year_max}. Do not suggest anything outside this range."
             content_label = seed_genres if seed_genres else content_type
             prompt = f"""You are a {content_label} recommendation expert.
 
@@ -149,7 +154,7 @@ Their watch history (DO NOT recommend these):
 TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, only recommend documentaries. If it is a horror film, recommend horror films. Match the genre closely.
 - Focus on similarity to the seed title
 - Avoid anything in their watch history above
-- Include both well-known and obscure titles
+- Include both well-known and obscure titles{year_constraint}
 
 RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""
