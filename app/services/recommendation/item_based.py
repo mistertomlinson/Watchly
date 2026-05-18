@@ -98,6 +98,9 @@ class ItemBasedService:
         # Final filter (remove watched by IMDB ID)
         final = filter_watched_by_imdb(enriched, watched_imdb or set())
 
+        # Apply year and popularity filters from user settings
+        final = filter_items_by_settings(final, self.user_settings)
+
         return final
 
     async def _fetch_gemini_item_recommendations(
