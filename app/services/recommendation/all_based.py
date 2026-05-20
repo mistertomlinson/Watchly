@@ -110,7 +110,7 @@ class AllBasedService:
         if gemini_api_key and profile and top_items:
             try:
                 gemini_candidates = await self._fetch_gemini_candidates(
-                    top_items, content_type, profile, gemini_api_key, limit
+                    top_items, content_type, profile, gemini_api_key, min(limit * 3, 60)
                 )
                 if gemini_candidates:
                     logger.info(f"Gemini returned {len(gemini_candidates)} candidates for {item_type} items")
@@ -154,7 +154,8 @@ class AllBasedService:
             tmdb_candidates = filter_items_by_settings(tmdb_candidates, self.user_settings)
 
         if gemini_candidates:
-            candidates = list(all_candidates.values())
+            # Use Gemini candidates directly and apply year/settings filter
+            candidates = filter_items_by_settings(gemini_candidates, self.user_settings)
         else:
             candidates = simkl_candidates + tmdb_candidates
 
