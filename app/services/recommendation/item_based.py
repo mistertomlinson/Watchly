@@ -159,6 +159,9 @@ TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title
 RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""
 
+            # Request extra results to compensate for post-filtering losses
+            gemini_limit = min(limit * 2, 60)
+            prompt = prompt.replace(f"Recommend exactly {limit} {content_type}s", f"Recommend exactly {gemini_limit} {content_type}s")
             response = await gemini_service.generate_flash_content_async(
                 prompt=prompt,
                 system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
@@ -191,6 +194,10 @@ RESPONSE FORMAT (one per line, no other text):
                 self.tmdb_service, candidates, content_type, user_settings=self.user_settings
             )
             logger.info(f"Gemini item recs for {seed_title}: {len(enriched)} enriched")
+            # Hard post-filter to enforce year constraints — Gemini doesn't always
+            # respect the year constraint in the prompt alone.
+            enriched = filter_items_by_settings(enriched, self.user_settings)
+            logger.info(f"Gemini item recs for {seed_title}: {len(enriched)} after year filter")
             return enriched
 
         except Exception as e:
