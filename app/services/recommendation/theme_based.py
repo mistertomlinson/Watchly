@@ -432,7 +432,7 @@ class ThemeBasedService:
         """
         existing = existing_ids or set()
         # First filter by genres (includes watched_tmdb check)
-        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, None, watched_imdb=watched_imdb)
+        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, None)
         # Then deduplicate
         result = []
         for item in filtered:

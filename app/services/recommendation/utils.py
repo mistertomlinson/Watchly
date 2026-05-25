@@ -67,7 +67,6 @@ def filter_by_genres(
     watched_tmdb: set[int],
     whitelist: set[int] | None = None,
     excluded_ids: list[int] | None = None,
-    watched_imdb: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Filter items by genre whitelist and excluded genres.
@@ -85,14 +84,9 @@ def filter_by_genres(
     excluded_ids = excluded_ids or []
     filtered = []
 
-    watched_imdb = watched_imdb or set()
     for item in items:
         item_id = item.get("id")
         if not item_id or item_id in watched_tmdb:
-            continue
-        # Also filter by IMDB ID — critical for Trakt users where watched_tmdb is empty
-        imdb_id = item.get("imdb_id") or item.get("external_ids", {}).get("imdb_id")
-        if imdb_id and imdb_id in watched_imdb:
             continue
 
         genre_ids = item.get("genre_ids", [])

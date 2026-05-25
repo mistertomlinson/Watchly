@@ -1,11 +1,7 @@
-import asyncio
 from typing import Any
 
 from app.core.base_client import BaseClient
 from app.core.version import __version__
-
-# Global semaphore shared across all TMDBClient instances to prevent 429s
-_TMDB_GLOBAL_SEMAPHORE = asyncio.Semaphore(50)
 
 
 class TMDBClient(BaseClient):
@@ -32,5 +28,4 @@ class TMDBClient(BaseClient):
         params["api_key"] = self.api_key
         params["language"] = self.language
         kwargs["params"] = params
-        async with _TMDB_GLOBAL_SEMAPHORE:
-            return await super()._request(method, url, **kwargs)
+        return await super()._request(method, url, **kwargs)

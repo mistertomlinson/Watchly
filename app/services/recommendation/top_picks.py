@@ -139,7 +139,7 @@ class TopPicksService:
         scored_candidates = []  # initialize for any downstream references
 
         # If Gemini succeeded, skip scoring/diversity caps — trust Gemini directly
-        if gemini_ids and len(gemini_ids) >= limit:
+        if gemini_ids and len(gemini_ids) >= limit // 2:
             result = [i for i in filtered_candidates if i.get("_gemini_pick")]
             logger.info(f"Using {len(result)} Gemini picks directly, skipping scoring/diversity caps")
         else:
@@ -357,7 +357,6 @@ class TopPicksService:
 
             interest_summary = profile.interest_summary or ""
 
-            gemini_request_limit = limit * 3
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}
@@ -368,7 +367,7 @@ Content they LOVED or LIKED (highest priority signals):
 Recently watched:
 {chr(10).join(watched_lines) if watched_lines else "None recorded"}
 
-TASK: Recommend exactly {gemini_request_limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
+TASK: Recommend exactly {limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
 - Strongly reflect their taste profile and interest summary
 - Include both well-known titles and hidden gems they likely haven't seen
 - Prioritize quality and relevance over popularity
@@ -404,13 +403,7 @@ EXAMPLE:
                     parsed.append((name, year))
                     resolve_tasks.append(self._resolve_title_to_tmdb(name, year, mtype))
 
-            semaphore = asyncio.Semaphore(10)
-            async def resolve_with_semaphore(name, year, mtype):
-                async with semaphore:
-                    return await self._resolve_title_to_tmdb(name, year, mtype)
-
-            throttled_tasks = [resolve_with_semaphore(name, year, mtype) for name, year in parsed]
-            results = await asyncio.gather(*throttled_tasks, return_exceptions=True)
+            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, dict) and result.get("id"):
                     candidates.append(result)

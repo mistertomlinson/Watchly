@@ -88,7 +88,7 @@ class ItemBasedService:
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
-        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, excluded_ids, watched_imdb=watched_imdb or set())
+        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, excluded_ids)
 
         # Enrich metadata
         enriched = await RecommendationMetadata.fetch_batch(
