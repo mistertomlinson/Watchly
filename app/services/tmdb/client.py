@@ -5,7 +5,7 @@ from app.core.base_client import BaseClient
 from app.core.version import __version__
 
 # Global semaphore shared across all TMDBClient instances to prevent 429s
-_TMDB_GLOBAL_SEMAPHORE = asyncio.Semaphore(20)
+_TMDB_GLOBAL_SEMAPHORE = asyncio.Semaphore(50)
 
 
 class TMDBClient(BaseClient):
