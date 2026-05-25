@@ -404,7 +404,13 @@ EXAMPLE:
                     parsed.append((name, year))
                     resolve_tasks.append(self._resolve_title_to_tmdb(name, year, mtype))
 
-            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+            semaphore = asyncio.Semaphore(10)
+            async def resolve_with_semaphore(name, year, mtype):
+                async with semaphore:
+                    return await self._resolve_title_to_tmdb(name, year, mtype)
+
+            throttled_tasks = [resolve_with_semaphore(name, year, mtype) for name, year in parsed]
+            results = await asyncio.gather(*throttled_tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, dict) and result.get("id"):
                     candidates.append(result)
