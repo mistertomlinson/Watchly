@@ -88,7 +88,7 @@ class ItemBasedService:
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
-        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, excluded_ids)
+        filtered = filter_by_genres(candidates, watched_tmdb, whitelist, excluded_ids, watched_imdb=watched_imdb or set())
 
         # Enrich metadata
         enriched = await RecommendationMetadata.fetch_batch(
@@ -160,7 +160,7 @@ RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""
 
             # Request extra results to compensate for post-filtering losses
-            gemini_limit = min(limit * 2, 60)
+            gemini_limit = min(limit * 4, 120)
             prompt = prompt.replace(f"Recommend exactly {limit} {content_type}s", f"Recommend exactly {gemini_limit} {content_type}s")
             response = await gemini_service.generate_flash_content_async(
                 prompt=prompt,

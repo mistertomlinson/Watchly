@@ -139,7 +139,7 @@ class TopPicksService:
         scored_candidates = []  # initialize for any downstream references
 
         # If Gemini succeeded, skip scoring/diversity caps — trust Gemini directly
-        if gemini_ids and len(gemini_ids) >= limit // 2:
+        if gemini_ids and len(gemini_ids) >= limit:
             result = [i for i in filtered_candidates if i.get("_gemini_pick")]
             logger.info(f"Using {len(result)} Gemini picks directly, skipping scoring/diversity caps")
         else:
@@ -357,6 +357,7 @@ class TopPicksService:
 
             interest_summary = profile.interest_summary or ""
 
+            gemini_request_limit = limit * 4
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}
@@ -367,7 +368,7 @@ Content they LOVED or LIKED (highest priority signals):
 Recently watched:
 {chr(10).join(watched_lines) if watched_lines else "None recorded"}
 
-TASK: Recommend exactly {limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
+TASK: Recommend exactly {gemini_request_limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
 - Strongly reflect their taste profile and interest summary
 - Include both well-known titles and hidden gems they likely haven't seen
 - Prioritize quality and relevance over popularity
