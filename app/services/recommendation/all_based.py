@@ -110,7 +110,7 @@ class AllBasedService:
         if gemini_api_key and profile and top_items:
             try:
                 gemini_candidates = await self._fetch_gemini_candidates(
-                    top_items, content_type, profile, gemini_api_key, min(limit * 4, 120)
+                    top_items, content_type, profile, gemini_api_key, min(limit * 3, 60)
                 )
                 if gemini_candidates:
                     logger.info(f"Gemini returned {len(gemini_candidates)} candidates for {item_type} items")

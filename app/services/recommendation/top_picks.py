@@ -357,7 +357,7 @@ class TopPicksService:
 
             interest_summary = profile.interest_summary or ""
 
-            gemini_request_limit = limit * 4
+            gemini_request_limit = limit * 3
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}

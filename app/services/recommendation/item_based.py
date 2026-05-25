@@ -160,7 +160,7 @@ RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""
 
             # Request extra results to compensate for post-filtering losses
-            gemini_limit = min(limit * 4, 120)
+            gemini_limit = min(limit * 2, 60)
             prompt = prompt.replace(f"Recommend exactly {limit} {content_type}s", f"Recommend exactly {gemini_limit} {content_type}s")
             response = await gemini_service.generate_flash_content_async(
                 prompt=prompt,
