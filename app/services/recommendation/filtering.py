@@ -38,9 +38,11 @@ class RecommendationFiltering:
         stremio_service: Any,
         library_data: dict | None = None,
         auth_key: str | None = None,
+        content_type: str | None = None,
     ) -> tuple[set[str], set[int]]:
         """
         Fetch library items and build exclusion sets for watched/loved content.
+        Optionally filter by content_type (movie/series) to avoid cross-contamination.
         """
         if library_data is None:
             if not auth_key:
@@ -55,6 +57,13 @@ class RecommendationFiltering:
             + library_data.get("removed", [])
             + library_data.get("liked", [])
         )
+
+        # Filter by content_type if specified to prevent cross-contamination
+        if content_type:
+            if content_type in ("series", "tv"):
+                all_items = [item for item in all_items if item.get("type") in ("series", "tv")]
+            else:
+                all_items = [item for item in all_items if item.get("type") == content_type]
 
         imdb_ids = set()
         tmdb_ids = set()

@@ -46,7 +46,7 @@ class ProfileIntegration:
         """
         # Get watched sets
         watched_imdb, watched_tmdb = await RecommendationFiltering.get_exclusion_sets(
-            stremio_service, library_items, auth_key
+            stremio_service, library_items, auth_key, content_type
         )
 
         # Build disliked ID set — these are excluded from profile scoring
@@ -109,7 +109,7 @@ class ProfileIntegration:
         """
         # Get watched sets
         watched_imdb, watched_tmdb = await RecommendationFiltering.get_exclusion_sets(
-            stremio_service, library_items, auth_key
+            stremio_service, library_items, auth_key, content_type
         )
 
         # Build disliked ID set — these are excluded from profile scoring
