@@ -265,9 +265,9 @@ async function fetchStremioIdentity(authKey) {
     if (simklApiKeyInput) {
         payload.simkl_api_key = simklApiKeyInput.value.trim();
     }
-    const geminiApiKeyInput = document.getElementById("geminiApiKey");
+    const geminiApiKeyInput = document.getElementById("openrouterApiKey");
     if (geminiApiKeyInput) {
-        payload.gemini_api_key = geminiApiKeyInput.value.trim();
+        payload.openrouter_api_key = geminiApiKeyInput.value.trim();
     }
     const res = await fetch('/tokens/stremio-identity', {
         method: 'POST',
@@ -332,8 +332,8 @@ async function fetchStremioIdentity(authKey) {
             const simklApiKeyInput = document.getElementById('simklApiKey');
             if (s.simkl_api_key && simklApiKeyInput) simklApiKeyInput.value = s.simkl_api_key;
 
-            const geminiApiKeyInput = document.getElementById('geminiApiKey');
-            if (s.gemini_api_key && geminiApiKeyInput) geminiApiKeyInput.value = s.gemini_api_key;
+            const geminiApiKeyInput = document.getElementById('openrouterApiKey');
+            if (s.openrouter_api_key && geminiApiKeyInput) geminiApiKeyInput.value = s.openrouter_api_key;
 
             // Genres (Checked = Excluded)
             document.querySelectorAll('input[name="movie-genre"]').forEach(cb => cb.checked = false);

@@ -259,8 +259,8 @@ function populateSettings(s) {
     const simklApiKeyInput = document.getElementById('simklApiKey');
     if (s.simkl_api_key && simklApiKeyInput) simklApiKeyInput.value = s.simkl_api_key;
 
-    const geminiApiKeyInput = document.getElementById('geminiApiKey');
-    if (s.gemini_api_key && geminiApiKeyInput) geminiApiKeyInput.value = s.gemini_api_key;
+    const geminiApiKeyInput = document.getElementById('openrouterApiKey');
+    if (s.openrouter_api_key && geminiApiKeyInput) geminiApiKeyInput.value = s.openrouter_api_key;
 
     // Genres
     document.querySelectorAll('input[name="movie-genre"]').forEach(cb => cb.checked = false);

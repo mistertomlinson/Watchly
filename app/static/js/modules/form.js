@@ -35,7 +35,7 @@ export function initializeForm(domElements, catalogState) {
     initializePosterRatingProvider();
     initializeTmdb();
     initializeSimkl();
-    initializeGemini();
+    initializeOpenRouter();
     initializeYearSlider();
 }
 
@@ -61,7 +61,7 @@ async function initializeFormSubmission() {
         const excludedSeriesGenres = Array.from(document.querySelectorAll('input[name="series-genre"]:checked')).map(cb => cb.value);
         const tmdbApiKey = document.getElementById("tmdbApiKey")?.value.trim() || "";
         const simklApiKey = document.getElementById("simklApiKey")?.value.trim() || "";
-        const geminiApiKey = document.getElementById("geminiApiKey")?.value.trim() || "";
+        const geminiApiKey = document.getElementById("openrouterApiKey")?.value.trim() || "";
 
         const catalogsToSend = [];
         const catalogs = getCatalogs ? getCatalogs() : [];
@@ -166,7 +166,7 @@ async function initializeFormSubmission() {
                     poster_rating: posterRating,
                     tmdb_api_key: tmdbApiKey || undefined,
                     simkl_api_key: simklApiKey,
-                    gemini_api_key: geminiApiKey,
+                    openrouter_api_key: geminiApiKey,
                     excluded_movie_genres: excludedMovieGenres,
                     excluded_series_genres: excludedSeriesGenres
                 };
@@ -186,7 +186,7 @@ async function initializeFormSubmission() {
                     poster_rating: posterRating,
                     tmdb_api_key: tmdbApiKey || undefined,
                     simkl_api_key: simklApiKey,
-                    gemini_api_key: geminiApiKey,
+                    openrouter_api_key: geminiApiKey,
                     excluded_movie_genres: excludedMovieGenres,
                     excluded_series_genres: excludedSeriesGenres
                 };
@@ -526,13 +526,13 @@ function initializeSimkl() {
 }
 
 // Gemini AI Integration
-function initializeGemini() {
-    const apiKeyInput = document.getElementById("geminiApiKey");
-    const validateBtn = document.getElementById("geminiApiKeyValidate");
-    const toggleBtn = document.getElementById("geminiApiKeyToggle");
-    const eyeIcon = document.getElementById("geminiApiKeyEye");
-    const eyeOffIcon = document.getElementById("geminiApiKeyEyeOff");
-    const validationMessage = document.getElementById("geminiValidationMessage");
+function initializeOpenRouter() {
+    const apiKeyInput = document.getElementById("openrouterApiKey");
+    const validateBtn = document.getElementById("openrouterApiKeyValidate");
+    const toggleBtn = document.getElementById("openrouterApiKeyToggle");
+    const eyeIcon = document.getElementById("openrouterApiKeyEye");
+    const eyeOffIcon = document.getElementById("openrouterApiKeyEyeOff");
+    const validationMessage = document.getElementById("openrouterValidationMessage");
 
     if (!apiKeyInput || !validateBtn || !validationMessage) return;
 
@@ -547,7 +547,7 @@ function initializeGemini() {
     }
 
     // Validation function
-    async function validateGeminiKey() {
+    async function validateOpenRouterKey() {
         const apiKey = apiKeyInput.value.trim();
 
         if (!apiKey) {

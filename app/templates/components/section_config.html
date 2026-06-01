@@ -346,9 +346,9 @@
     </div>
     <div class="border-t border-white/10"></div>
 
-    <!-- Gemini AI Integration -->
+    <!-- OpenRouter AI Integration -->
     <div class="space-y-4">
-        <label class="block text-sm font-medium text-slate-400 uppercase tracking-wider">Gemini AI
+        <label class="block text-sm font-medium text-slate-400 uppercase tracking-wider">OpenRouter AI
             (Optional)</label>
         <div class="space-y-4">
             <div class="relative">
@@ -359,20 +359,20 @@
                         </path>
                     </svg>
                 </div>
-                <input type="password" id="geminiApiKey"
+                <input type="password" id="openrouterApiKey"
                     class="w-full bg-neutral-900 border border-slate-700 rounded-xl pl-11 pr-32 sm:pr-24 py-3.5 text-white placeholder-slate-500 focus:ring-2 focus:ring-white/20 focus:border-white/30 outline-none transition-all font-mono text-sm"
-                    placeholder="Paste your Gemini API key here">
+                    placeholder="Paste your OpenRouter API key here">
                 <!-- Eye toggle button -->
                 <div class="absolute inset-y-0 right-12">
-                    <button type="button" id="geminiApiKeyToggle"
+                    <button type="button" id="openrouterApiKeyToggle"
                         class="flex items-center px-3 h-full text-slate-400 hover:text-white transition-colors">
-                        <svg id="geminiApiKeyEye" class="w-5 h-5" fill="none" stroke="currentColor"
+                        <svg id="openrouterApiKeyEye" class="w-5 h-5" fill="none" stroke="currentColor"
                             viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                 d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"></path>
                             <circle cx="12" cy="12" r="3"></circle>
                         </svg>
-                        <svg id="geminiApiKeyEyeOff" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
+                        <svg id="openrouterApiKeyEyeOff" class="w-5 h-5 hidden" fill="none" stroke="currentColor"
                             viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                                 d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.77 21.77 0 0 1 5.06-6.17M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a21.8 21.8 0 0 1-3.22 4.31">
@@ -386,7 +386,7 @@
                 </div>
                 <!-- Validate button -->
                 <div class="tooltip-wrapper tooltip-right absolute inset-y-0 right-0">
-                    <button type="button" id="geminiApiKeyValidate"
+                    <button type="button" id="openrouterApiKeyValidate"
                         class="flex items-center px-4 h-full text-slate-400 hover:text-white hover:bg-white/5 transition-colors border-l border-slate-700 rounded-r-xl">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -394,18 +394,18 @@
                         </svg>
                     </button>
                     <span class="custom-tooltip"
-                        data-tooltip-text="Validate key - Click to verify your Gemini key is valid">Validate key -
-                        Click to verify your Gemini key is valid</span>
+                        data-tooltip-text="Validate key - Click to verify your OpenRouter key is valid">Validate key -
+                        Click to verify your OpenRouter key is valid</span>
                 </div>
             </div>
             <!-- Validation message -->
-            <div id="geminiValidationMessage" class="mt-2 text-xs hidden"></div>
+            <div id="openrouterValidationMessage" class="mt-2 text-xs hidden"></div>
 
             <div class="text-xs text-slate-500">
-                <p>Enter your Gemini API key to unlock AI-powered features: personalized interest profiles and
+                <p>Enter your OpenRouter API key to unlock AI-powered features: personalized interest profiles and
                     smarter theme-based catalogs. Get your free API key from
-                    <a href="https://aistudio.google.com/apikey" target="_blank"
-                        class="text-slate-300 hover:text-white underline">Google AI Studio</a>.
+                    <a href="https://openrouter.ai/keys" target="_blank"
+                        class="text-slate-300 hover:text-white underline">OpenRouter</a>.
                 </p>
             </div>
         </div>

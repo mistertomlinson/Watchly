@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException
-from google import genai
+import httpx
 from loguru import logger
 
 from app.api.models.validation import BaseValidationInput, BaseValidationResponse, PosterRatingValidationInput
@@ -11,14 +11,20 @@ router = APIRouter(tags=["Validation"])
 
 
 @router.post("/gemini/validation")
-async def validate_gemini_api_key(data: BaseValidationInput) -> BaseValidationResponse:
+async def validate_openrouter_api_key(data: BaseValidationInput) -> BaseValidationResponse:
     try:
-        client = genai.Client(api_key=data.api_key.strip())
-        await client.aio.models.list()
-        return BaseValidationResponse(valid=True, message="Gemini API key is valid")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://openrouter.ai/api/v1/models",
+                headers={"Authorization": f"Bearer {data.api_key.strip()}"},
+            )
+            if response.status_code == 200:
+                return BaseValidationResponse(valid=True, message="OpenRouter API key is valid")
+            else:
+                return BaseValidationResponse(valid=False, message="Invalid OpenRouter API key")
     except Exception as e:
-        logger.debug(f"Gemini API key validation failed: {e}")
-        return BaseValidationResponse(valid=False, message="Invalid Gemini API key")
+        logger.debug(f"OpenRouter API key validation failed: {e}")
+        return BaseValidationResponse(valid=False, message="Invalid OpenRouter API key")
 
 
 @router.post("/tmdb/validation")
