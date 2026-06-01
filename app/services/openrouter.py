@@ -3,7 +3,7 @@ from loguru import logger
 
 from app.core.config import settings
 
-DEFAULT_MODEL = "google/gemini-2.0-flash-exp:free"
+DEFAULT_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 TIMEOUT = 60.0
 
 
@@ -68,7 +68,9 @@ class OpenRouterService:
                     },
                     json=payload,
                 )
-                response.raise_for_status()
+                if response.status_code != 200:
+                    logger.error(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
+                    return ""
                 data = response.json()
                 return data["choices"][0]["message"]["content"].strip()
         except Exception as e:
