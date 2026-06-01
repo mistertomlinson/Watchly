@@ -90,6 +90,7 @@ class TraktTokenRequest(BaseModel):
     sorting_order: str = Field(default="default")
     simkl_api_key: str | None = Field(default=None)
     gemini_api_key: str | None = Field(default=None)
+    openrouter_api_key: str | None = Field(default=None)
     tmdb_api_key: str | None = Field(default=None)
 
 
@@ -243,6 +244,7 @@ async def create_trakt_token(payload: TraktTokenRequest, request: Request):
         sorting_order=payload.sorting_order,
         simkl_api_key=payload.simkl_api_key,
         gemini_api_key=payload.gemini_api_key,
+        openrouter_api_key=payload.openrouter_api_key,
         tmdb_api_key=payload.tmdb_api_key,
     )
 

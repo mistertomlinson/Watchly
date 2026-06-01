@@ -34,6 +34,7 @@ class TokenRequest(BaseModel):
     )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
     gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI features")
+    openrouter_api_key: str | None = Field(default=None, description="OpenRouter API Key for AI features")
     tmdb_api_key: str | None = Field(
         default=None, description="TMDB API Key (required for new clients if server has none)"
     )
@@ -105,6 +106,7 @@ async def create_token(payload: TokenRequest, request: Request) -> TokenResponse
         sorting_order=payload.sorting_order,
         simkl_api_key=payload.simkl_api_key,
         gemini_api_key=payload.gemini_api_key,
+        openrouter_api_key=payload.openrouter_api_key,
         tmdb_api_key=payload.tmdb_api_key,
     )
 

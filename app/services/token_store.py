@@ -137,6 +137,16 @@ class TokenStore:
                 except Exception as exc:
                     logger.warning(f"Failed to encrypt gemini_api_key for {redact_token(user_id)}: {exc}")
 
+        # Encrypt openrouter_api_key if present
+        if storage_data.get("settings") and isinstance(storage_data["settings"], dict):
+            openrouter_api_key = storage_data["settings"].get("openrouter_api_key")
+            if openrouter_api_key:
+                try:
+                    if not openrouter_api_key.startswith("gAAAAAB"):
+                        storage_data["settings"]["openrouter_api_key"] = self.encrypt_token(openrouter_api_key)
+                except Exception as exc:
+                    logger.warning(f"Failed to encrypt openrouter_api_key for {redact_token(user_id)}: {exc}")
+
         # Encrypt tmdb_api_key if present
         if storage_data.get("settings") and isinstance(storage_data["settings"], dict):
             tmdb_api_key = storage_data["settings"].get("tmdb_api_key")
@@ -310,6 +320,14 @@ class TokenStore:
                         data["settings"]["gemini_api_key"] = self.decrypt_token(gemini_api_key)
                 except Exception as e:
                     logger.debug(f"Decryption failed for gemini_api_key associated with {redact_token(token)}: {e}")
+
+            openrouter_api_key = data["settings"].get("openrouter_api_key")
+            if openrouter_api_key:
+                try:
+                    if openrouter_api_key.startswith("gAAAAA"):
+                        data["settings"]["openrouter_api_key"] = self.decrypt_token(openrouter_api_key)
+                except Exception as e:
+                    logger.debug(f"Decryption failed for openrouter_api_key associated with {redact_token(token)}: {e}")
 
             tmdb_api_key = data["settings"].get("tmdb_api_key")
             if tmdb_api_key:
