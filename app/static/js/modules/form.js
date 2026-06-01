@@ -551,7 +551,7 @@ function initializeOpenRouter() {
         const apiKey = apiKeyInput.value.trim();
 
         if (!apiKey) {
-            showGeminiValidationMessage("Please enter a Gemini API key", "error");
+            showOpenRouterValidationMessage("Please enter an OpenRouter API key", "error");
             return false;
         }
 
@@ -571,14 +571,14 @@ function initializeOpenRouter() {
             const data = await response.json();
 
             if (data.valid) {
-                showGeminiValidationMessage("Gemini API key is valid ✓", "success");
+                showOpenRouterValidationMessage("OpenRouter API key is valid ✓", "success");
                 return true;
             } else {
-                showGeminiValidationMessage(data.message || "Invalid Gemini API key", "error");
+                showOpenRouterValidationMessage(data.message || "Invalid OpenRouter API key", "error");
                 return false;
             }
         } catch (error) {
-            showGeminiValidationMessage("Validation failed. Please try again.", "error");
+            showOpenRouterValidationMessage("Validation failed. Please try again.", "error");
             return false;
         } finally {
             validateBtn.disabled = false;
@@ -587,7 +587,7 @@ function initializeOpenRouter() {
         }
     }
 
-    function showGeminiValidationMessage(message, type) {
+    function showOpenRouterValidationMessage(message, type) {
         validationMessage.textContent = message;
         validationMessage.className = `mt-2 text-xs ${type === "success" ? "text-green-400" : "text-red-400"}`;
         validationMessage.classList.remove("hidden");
