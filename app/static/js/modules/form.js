@@ -593,7 +593,7 @@ function initializeOpenRouter() {
         validationMessage.classList.remove("hidden");
     }
 
-    validateBtn.addEventListener("click", validateGeminiKey);
+    validateBtn.addEventListener("click", validateOpenRouterKey);
 
     apiKeyInput.addEventListener("input", () => {
         validationMessage.classList.add("hidden");
