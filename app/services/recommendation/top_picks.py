@@ -417,10 +417,18 @@ EXAMPLE:
 
             resolve_tasks = []
             parsed = []
+            seen_titles = set()
+            max_to_resolve = gemini_request_limit
             for line in lines:
+                if len(parsed) >= max_to_resolve:
+                    break
                 parts = line.split("|")
                 if len(parts) >= 3:
                     _, name, year = parts[0].strip(), parts[1].strip(), parts[2].strip()[:4]
+                    title_key = name.lower().strip()
+                    if title_key in seen_titles:
+                        continue
+                    seen_titles.add(title_key)
                     parsed.append((name, year))
                     resolve_tasks.append(self._resolve_title_to_tmdb(name, year, mtype))
 
