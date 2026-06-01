@@ -357,6 +357,27 @@ class TopPicksService:
 
             interest_summary = profile.interest_summary or ""
 
+            year_min = getattr(self.user_settings, "year_min", None) if self.user_settings else None
+            year_max = getattr(self.user_settings, "year_max", None) if self.user_settings else None
+            year_constraint = ""
+            if year_min and year_max:
+                year_constraint = f"\n- ONLY recommend titles released between {year_min} and {year_max}."
+            elif year_min:
+                year_constraint = f"\n- ONLY recommend titles released after {year_min}."
+            elif year_max:
+                year_constraint = f"\n- ONLY recommend titles released before {year_max}."
+
+            popularity = getattr(self.user_settings, "popularity", "balanced") if self.user_settings else "balanced"
+            popularity_instruction = {
+                "mainstream": "Focus on popular, widely-known titles that are highly rated.",
+                "balanced": "Include a mix of well-known titles and lesser-known quality titles.",
+                "gems": "Focus on hidden gems — lesser-known, critically acclaimed titles that most people haven't seen.",
+                "all": "Include any quality title regardless of popularity level.",
+            }.get(popularity, "Include a mix of well-known titles and lesser-known quality titles.")
+
+            gemini_request_limit = limit * 3
+            all_watched_lines = list(dict.fromkeys(loved_lines + watched_lines))
+
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}
@@ -364,15 +385,15 @@ User Interest Summary: {interest_summary}
 Content they LOVED or LIKED (highest priority signals):
 {chr(10).join(loved_lines) if loved_lines else "None recorded"}
 
-Recently watched:
-{chr(10).join(watched_lines) if watched_lines else "None recorded"}
+COMPLETE watch history — DO NOT recommend ANY of these titles:
+{chr(10).join(all_watched_lines) if all_watched_lines else "None recorded"}
 
-TASK: Recommend exactly {limit} {content_type}s this person has NOT watched yet. Include a mix of well-known titles and hidden gems they are unlikely to have seen.
+TASK: Recommend exactly {gemini_request_limit} {content_type}s this person has NOT watched yet.
 - Strongly reflect their taste profile and interest summary
-- Include both well-known titles and hidden gems they likely haven't seen
-- Prioritize quality and relevance over popularity
-- DO NOT recommend anything from their watched/loved/liked lists above. This is critical — every title you recommend must be one they have NOT seen
-- Lean toward their strongest preferences but include some variety
+- {popularity_instruction}
+- Prioritize quality and relevance
+- DO NOT recommend ANYTHING from the watch history above — check every title before including it
+- Lean toward their strongest preferences but include some variety{year_constraint}
 
 RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year

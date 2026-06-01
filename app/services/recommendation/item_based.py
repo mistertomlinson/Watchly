@@ -141,6 +141,16 @@ class ItemBasedService:
             if year_min and year_max:
                 year_constraint = f"\n- ONLY recommend titles released between {year_min} and {year_max}. Do not suggest anything outside this range."
             content_label = seed_genres if seed_genres else content_type
+            gemini_limit = limit * 3
+
+            popularity = getattr(self.user_settings, "popularity", "balanced") if self.user_settings else "balanced"
+            popularity_instruction = {
+                "mainstream": "Focus on popular, widely-known titles that are highly rated.",
+                "balanced": "Include a mix of well-known titles and lesser-known quality titles.",
+                "gems": "Focus on hidden gems — lesser-known, critically acclaimed titles that most people haven't seen.",
+                "all": "Include any quality title regardless of popularity level.",
+            }.get(popularity, "Include a mix of well-known titles and lesser-known quality titles.")
+
             prompt = f"""You are a {content_label} recommendation expert.
 
 The user just watched: {seed_title} ({seed_year})
@@ -148,20 +158,16 @@ The user just watched: {seed_title} ({seed_year})
 About this title: {seed_overview}
 Genres: {seed_genres}
 
-
-Their watch history (DO NOT recommend these):
+COMPLETE watch history — DO NOT recommend ANY of these titles:
 {chr(10).join(watched_lines) if watched_lines else "None recorded"}
-TASK: Recommend exactly {limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, only recommend documentaries. If it is a horror film, recommend horror films. Match the genre closely.
+
+TASK: Recommend exactly {gemini_limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, only recommend documentaries. If it is a horror film, recommend horror films. Match the genre closely.
 - Focus on similarity to the seed title
-- Avoid anything in their watch history above
-- Include both well-known and obscure titles{year_constraint}
+- {popularity_instruction}
+- DO NOT recommend ANYTHING from the watch history above — check every title before including it{year_constraint}
 
 RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""
-
-            # Request extra results to compensate for post-filtering losses
-            gemini_limit = min(limit * 2, 60)
-            prompt = prompt.replace(f"Recommend exactly {limit} {content_type}s", f"Recommend exactly {gemini_limit} {content_type}s")
             response = await gemini_service.generate_flash_content_async(
                 prompt=prompt,
                 system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
