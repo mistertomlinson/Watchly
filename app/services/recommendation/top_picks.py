@@ -24,7 +24,7 @@ from app.services.recommendation.utils import (
     resolve_tmdb_id,
 )
 from app.services.scoring import ScoringService
-from app.services.gemini import gemini_service
+from app.services.openrouter import gemini_service
 from app.services.simkl import simkl_service
 from app.services.tmdb.service import TMDBService
 

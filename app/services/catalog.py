@@ -133,7 +133,7 @@ class DynamicCatalogService:
         if user_settings:
             excluded_movie_genres = [int(g) for g in user_settings.excluded_movie_genres]
             excluded_series_genres = [int(g) for g in user_settings.excluded_series_genres]
-            gemini_api_key = user_settings.gemini_api_key
+            gemini_api_key = getattr(user_settings, 'openrouter_api_key', None) or user_settings.gemini_api_key
 
         logger.info(
             f"[Theme Catalogs] gemini_api_key={'SET' if gemini_api_key else 'NONE'},"

@@ -40,6 +40,7 @@ class UserSettings(BaseModel):
     )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
     gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI-powered features")
+    openrouter_api_key: str | None = Field(default=None, description="OpenRouter API Key for AI-powered features")
     tmdb_api_key: str | None = Field(default=None, description="TMDB API Key (used if set; else server config)")
 
 

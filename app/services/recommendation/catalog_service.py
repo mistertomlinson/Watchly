@@ -224,7 +224,7 @@ class CatalogService:
 
             # Generate interest summary if missing (needed for Gemini top picks)
             if profile and not profile.interest_summary and user_settings:
-                gemini_key = getattr(user_settings, 'gemini_api_key', None)
+                gemini_key = (getattr(user_settings, 'openrouter_api_key', None) or getattr(user_settings, 'gemini_api_key', None))
                 if gemini_key and token:
                     try:
                         from app.services.interest_summary import interest_summary_service
@@ -438,7 +438,7 @@ class CatalogService:
 
             item_service: ItemBasedService = services["item"]
 
-            gemini_key = getattr(user_settings, "gemini_api_key", None) if user_settings else None
+            gemini_key = (getattr(user_settings, "openrouter_api_key", None) or getattr(user_settings, "gemini_api_key", None)) if user_settings else None
             recommendations = await item_service.get_recommendations_for_item(
                 item_id=item_id,
                 content_type=content_type,
@@ -488,7 +488,7 @@ class CatalogService:
             if profile:
                 top_picks_service: TopPicksService = services["top_picks"]
 
-                gemini_key = getattr(user_settings, 'gemini_api_key', None) if user_settings else None
+                gemini_key = (getattr(user_settings, 'openrouter_api_key', None) or getattr(user_settings, 'gemini_api_key', None)) if user_settings else None
                 recommendations = await top_picks_service.get_top_picks(
                     profile=profile,
                     content_type=content_type,
@@ -508,7 +508,7 @@ class CatalogService:
         elif catalog_id in ("watchly.all.loved", "watchly.liked.all"):
             item_type = "loved" if catalog_id == "watchly.all.loved" else "liked"
             all_based_service: AllBasedService = services["all_based"]
-            gemini_key = getattr(user_settings, 'gemini_api_key', None) if user_settings else None
+            gemini_key = (getattr(user_settings, 'openrouter_api_key', None) or getattr(user_settings, 'gemini_api_key', None)) if user_settings else None
             recommendations = await all_based_service.get_recommendations_from_all_items(
                 library_items=library_items,
                 content_type=content_type,

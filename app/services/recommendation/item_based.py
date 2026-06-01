@@ -1,4 +1,4 @@
-from app.services.gemini import gemini_service
+from app.services.openrouter import gemini_service
 import asyncio
 from typing import Any
 
