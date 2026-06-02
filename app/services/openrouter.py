@@ -3,7 +3,7 @@ from loguru import logger
 
 from app.core.config import settings
 
-DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+DEFAULT_MODEL = "openrouter/auto"
 TIMEOUT = 60.0
 
 
