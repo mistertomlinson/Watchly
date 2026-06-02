@@ -26,6 +26,7 @@ def get_catalogs_from_config(
         display_at_home = getattr(config, "display_at_home", True) if config else True
 
         extra = DISCOVER_ONLY_EXTRA if not display_at_home else []
+        extra = extra + [{"name": "skip", "isRequired": False}]
 
         if enabled_movie:
             catalogs.append({"type": "movie", "id": cat_id, "name": movie_name or name, "extra": extra})

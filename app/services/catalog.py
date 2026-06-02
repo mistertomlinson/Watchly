@@ -46,6 +46,8 @@ class DynamicCatalogService:
         title = item.get("name") or ""
 
         extra = DISCOVER_ONLY_EXTRA if not display_at_home else []
+        # Always add skip support for pagination
+        extra = extra + [{"name": "skip", "isRequired": False}]
 
         return {
             "type": self.normalize_type(item.get("type")),
@@ -197,6 +199,8 @@ class DynamicCatalogService:
         catalogs = []
 
         extra = DISCOVER_ONLY_EXTRA if not display_at_home else []
+        # Always add skip support for pagination
+        extra = extra + [{"name": "skip", "isRequired": False}]
 
         for result in results:
             if isinstance(result, Exception):
