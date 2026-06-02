@@ -4,6 +4,8 @@ from loguru import logger
 from app.core.config import settings
 
 DEFAULT_MODEL = "openrouter/auto"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TIMEOUT = 60.0
 
 
@@ -42,12 +44,14 @@ class OpenRouterService:
         system_instruction: str,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
+        base_url: str | None = None,
     ) -> str:
         key = self._get_api_key(api_key)
         if not key:
             logger.warning("No OpenRouter API key available.")
             return ""
 
+        effective_base_url = base_url or self.base_url
         payload = {
             "model": model,
             "max_tokens": 4000,
@@ -60,7 +64,7 @@ class OpenRouterService:
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
                 response = await client.post(
-                    f"{self.base_url}/chat/completions",
+                    f"{effective_base_url}/chat/completions",
                     headers={
                         "Authorization": f"Bearer {key}",
                         "Content-Type": "application/json",
@@ -92,6 +96,15 @@ class OpenRouterService:
         api_key: str,
     ) -> str:
         """Used for recommendations and interest summaries (uses user key)."""
+        # If key looks like a Groq key, use Groq API
+        if api_key and api_key.startswith("gsk_"):
+            return await self._call(
+                prompt=prompt,
+                system_instruction=system_instruction,
+                api_key=api_key,
+                model=GROQ_MODEL,
+                base_url=GROQ_BASE_URL,
+            )
         return await self._call(
             prompt=prompt,
             system_instruction=system_instruction,
