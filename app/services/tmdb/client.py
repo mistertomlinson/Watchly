@@ -1,7 +1,12 @@
+import asyncio
 from typing import Any
 
 from app.core.base_client import BaseClient
 from app.core.version import __version__
+
+
+# Global semaphore to limit concurrent TMDB requests (free tier: 40 req/10s)
+_tmdb_semaphore = asyncio.Semaphore(30)
 
 
 class TMDBClient(BaseClient):
@@ -28,4 +33,5 @@ class TMDBClient(BaseClient):
         params["api_key"] = self.api_key
         params["language"] = self.language
         kwargs["params"] = params
-        return await super()._request(method, url, **kwargs)
+        async with _tmdb_semaphore:
+            return await super()._request(method, url, **kwargs)
