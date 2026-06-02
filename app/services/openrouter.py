@@ -3,7 +3,7 @@ from loguru import logger
 
 from app.core.config import settings
 
-DEFAULT_MODEL = "openrouter/auto"
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 TIMEOUT = 60.0
 
 
@@ -50,7 +50,7 @@ class OpenRouterService:
 
         payload = {
             "model": model,
-            "max_tokens": 2000,
+            "max_tokens": 4000,
             "messages": [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt},
