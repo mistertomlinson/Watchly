@@ -525,7 +525,7 @@ function initializeSimkl() {
     });
 }
 
-// Gemini AI Integration
+// Groq AI Integration
 function initializeOpenRouter() {
     const apiKeyInput = document.getElementById("openrouterApiKey");
     const validateBtn = document.getElementById("openrouterApiKeyValidate");
@@ -551,7 +551,7 @@ function initializeOpenRouter() {
         const apiKey = apiKeyInput.value.trim();
 
         if (!apiKey) {
-            showOpenRouterValidationMessage("Please enter an OpenRouter API key", "error");
+            showOpenRouterValidationMessage("Please enter a Groq API key", "error");
             return false;
         }
 
@@ -571,10 +571,10 @@ function initializeOpenRouter() {
             const data = await response.json();
 
             if (data.valid) {
-                showOpenRouterValidationMessage("OpenRouter API key is valid ✓", "success");
+                showOpenRouterValidationMessage("Groq API key is valid ✓", "success");
                 return true;
             } else {
-                showOpenRouterValidationMessage(data.message || "Invalid OpenRouter API key", "error");
+                showOpenRouterValidationMessage(data.message || "Invalid Groq API key", "error");
                 return false;
             }
         } catch (error) {
