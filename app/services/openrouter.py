@@ -50,6 +50,7 @@ class OpenRouterService:
 
         payload = {
             "model": model,
+            "max_tokens": 2000,
             "messages": [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt},
