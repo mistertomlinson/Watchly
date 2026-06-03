@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from collections import defaultdict
 from datetime import date, datetime
@@ -341,8 +342,9 @@ class TopPicksService:
             # Sort watched by last watched date
             watched.sort(key=lambda x: x.get("state", {}).get("lastWatched", ""), reverse=True)
 
-            # Build loved/liked section
-            loved_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in (loved + liked)[:20]]
+            # Build loved/liked section separately
+            loved_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in loved[:20]]
+            liked_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in liked[:20]]
             watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
 
             # Top genres from profile
@@ -376,14 +378,17 @@ class TopPicksService:
             }.get(popularity, "Include a mix of well-known titles and lesser-known quality titles.")
 
             gemini_request_limit = limit * 3
-            all_watched_lines = list(dict.fromkeys(loved_lines + watched_lines))
+            all_watched_lines = list(dict.fromkeys(loved_lines + liked_lines + watched_lines))
 
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}
 
-Content they LOVED or LIKED (highest priority signals):
+Content they LOVED (10/10 — strongest signal, prioritize similarity to these above all else):
 {chr(10).join(loved_lines) if loved_lines else "None recorded"}
+
+Content they LIKED (7-9/10 — secondary signal):
+{chr(10).join(liked_lines) if liked_lines else "None recorded"}
 
 COMPLETE watch history — DO NOT recommend ANY of these titles:
 {chr(10).join(all_watched_lines) if all_watched_lines else "None recorded"}
@@ -425,6 +430,8 @@ EXAMPLE:
                 parts = line.split("|")
                 if len(parts) >= 3:
                     _, name, year = parts[0].strip(), parts[1].strip(), parts[2].strip()[:4]
+                    # Strip year suffix from title if AI included it e.g. "Title (2004)"
+                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
                     title_key = name.lower().strip()
                     if title_key in seen_titles:
                         continue

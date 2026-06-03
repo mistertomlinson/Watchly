@@ -76,7 +76,7 @@ class TraktLibraryService:
                     "name": media.get("title", ""),
                     "year": media.get("year"),
                     "_is_loved": rating == 10,
-                    "_is_liked": rating == 8,
+                    "_is_liked": 7 <= rating <= 9,
                     "_is_disliked": rating == 2,
                     "_source": "trakt",
                     "_mtime": raw.get("rated_at", ""),
@@ -90,12 +90,12 @@ class TraktLibraryService:
                 }
                 if rating == 10:
                     loved.append(item)
-                elif rating == 8:
+                elif 7 <= rating <= 9:
                     liked.append(item)
                 elif rating == 2:
                     disliked.append(item)
 
-            logger.info(f"[Trakt] library: {len(watched)} watched, {len(loved)} loved (10/10), {len(liked)} liked (8/10), {len(disliked)} disliked (2/10)")
+            logger.info(f"[Trakt] library: {len(watched)} watched, {len(loved)} loved (10/10), {len(liked)} liked (7-9/10), {len(disliked)} disliked (2/10)")
 
             return {
                 "watched": watched,
