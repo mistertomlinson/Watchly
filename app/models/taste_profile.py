@@ -49,9 +49,10 @@ class TasteProfile(BaseModel):
         """Get top N genres by score."""
         return sorted(self.genre_scores.items(), key=lambda x: x[1], reverse=True)[:limit]
 
-    def get_top_keywords(self, limit: int = 5) -> list[tuple[int, float]]:
-        """Get top N keywords by score."""
-        return sorted(self.keyword_scores.items(), key=lambda x: x[1], reverse=True)[:limit]
+    def get_top_keywords(self, limit: int = 5, min_score: float = 0.6) -> list[tuple[int, float]]:
+        """Get top N keywords by score, filtered by minimum score threshold."""
+        filtered = {k: v for k, v in self.keyword_scores.items() if v >= min_score}
+        return sorted(filtered.items(), key=lambda x: x[1], reverse=True)[:limit]
 
     def get_top_eras(self, limit: int = 3) -> list[tuple[str, float]]:
         """Get top N eras by score."""
