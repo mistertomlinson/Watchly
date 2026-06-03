@@ -253,8 +253,10 @@ class CatalogService:
             )
 
             # Pad if needed to meet minimum of 8 items
-            # # TODO: This is risky because it can fetch too many unrelated items.
-            if recommendations and len(recommendations) < DEFAULT_MIN_ITEMS:
+            # Skip padding for keyword-anchored theme catalogs — padding adds unrelated items
+            # (e.g. non-remakes in "Sci-Fi Remakes"). Let these be sparse rather than inaccurate.
+            is_keyword_theme = catalog_id.startswith("watchly.theme.") and ":k" in catalog_id.split(".a:")[0] if "watchly.theme." in catalog_id else False
+            if recommendations and len(recommendations) < DEFAULT_MIN_ITEMS and not is_keyword_theme:
                 recommendations = await pad_to_min(
                     content_type,
                     recommendations,

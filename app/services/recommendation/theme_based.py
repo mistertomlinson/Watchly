@@ -101,7 +101,10 @@ class ThemeBasedService:
         # ====================
         # PHASE 2: Individual Axes (if sparse)
         # ====================
-        if len(candidates) < limit * 2:
+        # Skip Phase 2 if anchor is a keyword — individual axis queries would dilute
+        # the keyword constraint and return off-theme results (e.g. non-remakes in "Sci-Fi Remakes")
+        has_keyword_anchor = "keyword" in anchors
+        if not has_keyword_anchor and len(candidates) < limit * 2:
             fetch_tasks = []
 
             # Fire individual queries for all axes, but for flavor genre axes

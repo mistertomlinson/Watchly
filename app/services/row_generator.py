@@ -281,7 +281,7 @@ class RowGeneratorService:
         self, profile: TasteProfile, content_type: str = "movie", api_key: str | None = None
     ) -> list[RowDefinition]:
         """
-        Generate exactly 3 personalized catalog rows.
+        Generate exactly 5 personalized catalog rows.
         If api_key is provided, uses LLM to generate creative themes.
         Otherwise uses tiered sampling system.
 
@@ -600,9 +600,9 @@ class RowGeneratorService:
             )
 
             prompt = (
-                "Using only the user's interest summary below, generate exactly 3 streaming collections for"
+                "Using only the user's interest summary below, generate exactly 5 streaming collections for"
                 f" {content_type}. Use genres (required), keywords, and country when relevant.\n\nInterest"
-                f" Summary:\n{summary}\n\nGenerate 3 rows in this order:\n1. THE CORE — What they will love"
+                f" Summary:\n{summary}\n\nGenerate 5 rows in this order:\n1. THE CORE — What they will love"
                 " most: strongest match to their taste (genres + keywords + country if relevant).\n2. MIXED"
                 " PREFERENCES — Blend of their tastes with more variety (genres + keywords + country if"
                 " relevant).\n3. RISING STAR — Discovery: suggest themes they might not have explored yet but"
@@ -610,14 +610,14 @@ class RowGeneratorService:
                 " country; openness to new content here.\n\nRules:\n- Genres: use ONLY these TMDB Genre IDs:"
                 f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
                 " or null when relevant.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
-                " of strings), country (string or null).\n- Output a JSON array of 3 objects."
+                " of strings), country (string or null).\n- Output a JSON array of 5 objects."
             )
 
             data = await gemini_service.generate_structured_async(
                 prompt=prompt,
                 response_schema=list[LLMRowTheme],
                 system_instruction=(
-                    "You are a creative film curator. Design 3 catalog rows from the user's interest summary."
+                    "You are a creative film curator. Design 5 catalog rows from the user's interest summary."
                     " Row 1 (The Core): strong match. Row 2 (Mixed): blend + variety. Row 3 (Rising Star):"
                     " discovery—suggest new content they would enjoy, not just more of the same. Use genres,"
                     " keywords, and country. Output valid JSON only."
