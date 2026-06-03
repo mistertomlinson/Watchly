@@ -607,10 +607,15 @@ class RowGeneratorService:
                 " PREFERENCES — Blend of their tastes with more variety (genres + keywords + country if"
                 " relevant).\n3. RISING STAR — Discovery: suggest themes they might not have explored yet but"
                 " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords +"
-                " country; openness to new content here.\n\nRules:\n- Genres: use ONLY these TMDB Genre IDs:"
+                " country; openness to new content here.\n4. DEEP CUT — Lesser-known or cult titles matching"
+                " their taste. Use 1-2 genres + 1 keyword max.\n5. MOOD PICK — A specific mood or tone they"
+                " would enjoy (e.g. mind-bending, atmospheric, tense). Use genres + 1 keyword max.\n\nRules:\n"
+                "- Genres: use ONLY these TMDB Genre IDs:"
                 f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
                 " or null when relevant.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
-                " of strings), country (string or null).\n- Output a JSON array of 5 objects."
+                " of strings), country (string or null).\n- IMPORTANT: Keep combinations simple and achievable."
+                " Use max 2 genres and max 1-2 keywords per row. Do NOT combine 3+ niche constraints together"
+                " (e.g. avoid Documentary + dark comedy + anthology — too niche).\n- Output a JSON array of 5 objects."
             )
 
             data = await gemini_service.generate_structured_async(
