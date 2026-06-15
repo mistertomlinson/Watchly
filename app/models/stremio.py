@@ -13,6 +13,7 @@ class StremioMeta(BaseModel):
     logo: str | None = None
     description: str | None = None
     releaseInfo: str | None = None
+    released: str | None = None
     year: str | None = None
     imdbRating: str | None = None
     genres: list[str] | None = None

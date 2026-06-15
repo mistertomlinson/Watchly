@@ -54,6 +54,7 @@ def _clean_meta(meta: dict) -> dict | None:
         "background",
         "description",
         "releaseInfo",
+        "released",
         "imdbRating",
         "genres",
         "runtime",
