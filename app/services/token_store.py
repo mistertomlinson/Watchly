@@ -208,11 +208,14 @@ class TokenStore:
         # Remove it since we've migrated to poster_rating or it's no longer needed
         if "rpdb_key" in settings_dict:
             settings_dict.pop("rpdb_key")
-            # keep empty poster_rating field for now
-            settings_dict["poster_rating"] = {
-                "provider": "rpdb",
-                "api_key": None,
-            }
+            # Only seed an empty poster_rating when one does not already exist.
+            # Previously this overwrote unconditionally, destroying both the key
+            # migrated by Case 1 above and any pre-existing valid poster_rating.
+            if not settings_dict.get("poster_rating"):
+                settings_dict["poster_rating"] = {
+                    "provider": "rpdb",
+                    "api_key": None,
+                }
             if not needs_save:  # Only log if we didn't already log migration
                 logger.info(f"[MIGRATION] Removing deprecated rpdb_key field for {redact_token(token)}")
             needs_save = True
@@ -225,11 +228,17 @@ class TokenStore:
                 else:
                     await redis_service.set(redis_key, json.dumps(data))
 
-                # Invalidate cache so next read gets the migrated data
+                # Invalidate cache so next read gets the migrated data.
+                # NOTE: the alru_cache decorator is on _get_user_data_cached, not on
+                # get_user_data. Calling it on the latter raised AttributeError every
+                # time and was swallowed below, leaving stale data cached for the full
+                # 6h TTL after a successful migration.
                 try:
-                    self.get_user_data.cache_invalidate(token)
-                except Exception:
+                    self._get_user_data_cached.cache_invalidate(token)
+                except KeyError:
                     pass
+                except Exception as e:
+                    logger.warning(f"[MIGRATION] Cache invalidation failed for {redact_token(token)}: {e}")
 
                 logger.info(
                     "[MIGRATION] Successfully migrated and encrypted poster_rating " f"format for {redact_token(token)}"

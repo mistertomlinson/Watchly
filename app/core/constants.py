@@ -35,9 +35,13 @@ DISCOVERY_SETTINGS: dict = {
         "vote_average.gte": 7.2,
         "vote_count.gte": 100,
     },
+    # "all" is the permissive option, but previously demanded vote_count >= 100 --
+    # stricter than "balanced" (50), which made it the narrowest setting of the four
+    # for niche categories. The vote floor exists to filter unrated junk, not to
+    # gate visibility, so it is set just high enough to do that job.
     "all": {
         "popularity.gte": 0,
         "vote_average.gte": 5.0,
-        "vote_count.gte": 100,
+        "vote_count.gte": 10,
     },
 }

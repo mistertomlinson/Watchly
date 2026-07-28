@@ -63,6 +63,7 @@ class RecommendationMetadata:
             "background": cls._get_backdrop_url(details),
             "description": details.get("overview"),
             "releaseInfo": release_date[:4] if release_date else None,
+            "released": release_date if release_date else None,
             "imdbRating": str(details.get("vote_average", "")),
             "genres": [g.get("name") for g in genres_full if isinstance(g, dict)],
             "vote_average": details.get("vote_average"),

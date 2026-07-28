@@ -54,6 +54,7 @@ def _clean_meta(meta: dict) -> dict | None:
         "background",
         "description",
         "releaseInfo",
+        "released",
         "imdbRating",
         "genres",
         "runtime",
@@ -189,11 +190,15 @@ class CatalogService:
                         redirect_uri=f"{settings.HOST_NAME}/tokens/trakt/callback",
                         access_token=auth_key,
                     )
-                    library_items = await trakt_bundle.library.get_library_items()
+                    try:
+                        library_items = await trakt_bundle.library.get_library_items()
+                    finally:
+                        await trakt_bundle.close()
                 else:
                     logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Stremio")
                     library_items = await bundle.library.get_library_items(auth_key)
-                # Cache it for future use
+                # Cache it for future use. The empty-library guard lives in
+                # user_cache.set_library_items() so it covers every caller.
                 await user_cache.set_library_items(token, library_items)
 
             services = self._initialize_services(language, user_settings)
@@ -341,6 +346,29 @@ class CatalogService:
         if credentials.get("auth_provider") == "trakt":
             if not auth_key:
                 raise HTTPException(status_code=401, detail="Trakt session expired. Please reconfigure.")
+            # Verify the token actually works. Without this a revoked or expired token
+            # is handed straight to the library fetch, which swallows the 401 and
+            # returns an empty library -- surfacing as generic TMDB rows rather than
+            # as an auth problem.
+            trakt_bundle = TraktBundle(
+                client_id=settings.TRAKT_CLIENT_ID,
+                client_secret=settings.TRAKT_CLIENT_SECRET,
+                redirect_uri=f"{settings.HOST_NAME}/tokens/trakt/callback",
+                access_token=auth_key,
+            )
+            try:
+                await trakt_bundle.user.get_user_info()
+            except Exception as e:
+                logger.error(
+                    f"[{redact_token(token)}] Stored Trakt token was rejected: {e}. "
+                    "Reconnect Trakt from the configure page."
+                )
+                raise HTTPException(
+                    status_code=401,
+                    detail="Trakt authorization is no longer valid. Please reconnect Trakt.",
+                ) from e
+            finally:
+                await trakt_bundle.close()
             return auth_key
 
         email = credentials.get("email")

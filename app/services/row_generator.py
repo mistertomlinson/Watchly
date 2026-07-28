@@ -8,6 +8,7 @@ Generates 3 personalized catalog rows using a tiered sampling system:
 """
 
 import asyncio
+import json
 import random
 from enum import Enum
 from typing import Any
@@ -260,16 +261,32 @@ class RowBuilder:
         return None
 
 
+# Minimum raw TMDB inventory a themed row must have before it is worth showing.
+# Raw total_results is a generous upper bound: the user's year range, popularity
+# floor and watched-history filtering all cut into it, so the effective pool is a
+# good deal smaller than this number.
+MIN_ROW_INVENTORY = 60
+
+# Keywords too semantically empty to define a row. IDs verified against the TMDB
+# keyword endpoint -- four of the original eight comments named the wrong keyword
+# ("based on true story" was actually 818 = based on novel or book, "philosophical"
+# was 4344 = musical, "suspense" was 663 = fortune teller, "based on novel" was
+# 9717 = based on comic), which suppressed several perfectly good themes.
+#
+# Thin-but-meaningful keywords no longer need to be listed here: MIN_ROW_INVENTORY
+# in _repair_thin_rows rejects anything without enough titles behind it.
 GENERIC_KEYWORD_BLACKLIST = {
-    239797,  # complex
-    197582,  # mysterious
-    9717,    # based on novel
-    818,     # based on true story
-    4344,    # philosophical
-    2964,    # future
-    663,     # suspense
-    11162,   # miniseries (format descriptor, not content)
+    239797,  # complex        - subjective, describes no subject matter
+    197582,  # mysterious     - subjective, describes no subject matter
+    2964,    # future         - too broad; overlaps the sci-fi genre
+    11162,   # miniseries     - format descriptor, not content
 }
+
+# Previously blacklisted by mistake, now allowed:
+#   818    based on novel or book (8257 titles)
+#   9717   based on comic        (851 titles)
+#   4344   musical               (3844 titles)
+#   663    fortune teller        (79 titles - inventory check gates this one)
 
 class RowGeneratorService:
     """Generates dynamic, personalized row definitions from a User Taste Profile."""
@@ -278,7 +295,11 @@ class RowGeneratorService:
         self.tmdb_service = tmdb_service or get_tmdb_service()
 
     async def generate_rows(
-        self, profile: TasteProfile, content_type: str = "movie", api_key: str | None = None
+        self,
+        profile: TasteProfile,
+        content_type: str = "movie",
+        api_key: str | None = None,
+        token: str | None = None,
     ) -> list[RowDefinition]:
         """
         Generate exactly 5 personalized catalog rows.
@@ -297,9 +318,21 @@ class RowGeneratorService:
                 llm_rows = await self._generate_rows_with_llm(profile, features, content_type, api_key)
                 if llm_rows:
                     logger.info(f"Generated {len(llm_rows)} LLM-driven rows for {content_type}")
+                    await self._cache_llm_rows(token, content_type, llm_rows)
                     return llm_rows
             except Exception as e:
-                logger.warning(f"LLM row generation failed, falling back to tiered sampling: {e}")
+                logger.warning(f"LLM row generation failed: {e}")
+
+            # The LLM call failed (rate limit, quota, outage). Prefer the last set of
+            # rows it produced over mechanically sampled ones -- otherwise a single
+            # 429 gets cached in the manifest and degrades every row for hours.
+            cached_rows = await self._get_cached_llm_rows(token, content_type)
+            if cached_rows:
+                logger.info(
+                    f"Serving {len(cached_rows)} cached LLM rows for {content_type} "
+                    "(live generation unavailable)"
+                )
+                return cached_rows
 
         # 3. Fallback to Tiered Sampling
         rows_data = []
@@ -326,8 +359,46 @@ class RowGeneratorService:
         # 4. Generate titles via server's default Gemini model (gemma)
         final_rows = await self._generate_titles(rows_data[:3])
 
+        # Tiered sampling picks keywords purely by profile frequency, with no regard
+        # for how many titles actually carry them. A niche keyword combined with a
+        # genre can yield literally zero results (e.g. squatting + comedy on TV), so
+        # the same inventory check applied to LLM rows is applied here.
+        try:
+            final_rows = await self._repair_thin_rows(final_rows, features, content_type)
+        except Exception as e:
+            logger.warning(f"[RowRepair] tiered-sampling repair failed: {e}")
+
         logger.info(f"Generated {len(final_rows)} dynamic rows (Tiered Sampling) for {content_type}")
         return final_rows
+
+    @staticmethod
+    def _llm_rows_key(token: str, content_type: str) -> str:
+        return f"watchly:llm_rows:{token}:{content_type}"
+
+    async def _cache_llm_rows(self, token: str | None, content_type: str, rows: list) -> None:
+        """Persist the most recent successful LLM row set as a fallback."""
+        if not token or not rows:
+            return
+        try:
+            from app.services.redis_service import redis_service
+            payload = json.dumps([r.model_dump(mode="json") for r in rows])
+            await redis_service.set(self._llm_rows_key(token, content_type), payload, 604800)
+        except Exception as e:
+            logger.debug(f"[LLM Rows] failed to cache rows: {e}")
+
+    async def _get_cached_llm_rows(self, token: str | None, content_type: str) -> list | None:
+        """Return the last successful LLM row set, if one is stored."""
+        if not token:
+            return None
+        try:
+            from app.services.redis_service import redis_service
+            raw = await redis_service.get(self._llm_rows_key(token, content_type))
+            if not raw:
+                return None
+            return [RowDefinition(**d) for d in json.loads(raw)]
+        except Exception as e:
+            logger.debug(f"[LLM Rows] failed to read cached rows: {e}")
+            return None
 
     def _update_used_axes(self, row: RowComponents, used_genres: set, used_keywords: set):
         """Track used genres and keywords to ensure row diversity."""
@@ -519,6 +590,22 @@ class RowGeneratorService:
 
         return signature_rows
 
+    @staticmethod
+    def _clean_title(title: str) -> str:
+        """Strip wrapping quotes an LLM sometimes adds around a returned title.
+
+        Models asked for "a single best title and nothing else" frequently answer
+        with the title in quotes, which then ends up rendered literally in the
+        catalog row name.
+        """
+        t = (title or "").strip()
+        for _ in range(2):
+            if len(t) >= 2 and t[0] in '"\'\u201c\u2018' and t[-1] in '"\'\u201d\u2019':
+                t = t[1:-1].strip()
+            else:
+                break
+        return t or title
+
     async def _generate_titles(self, rows_data: list[RowComponents]) -> list[RowDefinition]:
         """Generate titles for tiered sampling rows via server's default Gemini model."""
         if not rows_data:
@@ -574,6 +661,98 @@ class RowGeneratorService:
             pass
         return None
 
+    async def _row_inventory(self, axes: list, content_type: str) -> int:
+        """Return TMDB's total_results for the discover query a row will run."""
+        genres = [str(a.value) for a in axes if a.name == AXIS_GENRE]
+        keywords = [str(a.value) for a in axes if a.name == AXIS_KEYWORD]
+        countries = [str(a.value) for a in axes if a.name == AXIS_COUNTRY]
+
+        params = {}
+        if genres:
+            params["with_genres"] = "|".join(genres)
+        if keywords:
+            params["with_keywords"] = "|".join(keywords)
+        if countries:
+            params["with_origin_country"] = countries[0]
+        if not params:
+            return 0
+
+        try:
+            res = await self.tmdb_service.get_discover(content_type, page=1, **params)
+            return int(res.get("total_results", 0) or 0)
+        except Exception as e:
+            logger.debug(f"[RowRepair] inventory probe failed: {e}")
+            # Fail open: never discard a row because of a transient TMDB error.
+            return MIN_ROW_INVENTORY
+
+    async def _repair_thin_rows(
+        self,
+        rows: list,
+        features: "ExtractedFeatures",
+        content_type: str,
+    ) -> list:
+        """Ensure every row can actually fill itself.
+
+        A keyword the LLM picks may have almost no titles behind it (e.g. "squatting"
+        has ~31 films on TMDB). Such a row previously padded itself with unrelated
+        content. Here we instead swap the keyword for a viable one from the user's
+        profile, or -- failing that -- drop the keyword axis and let the row stand on
+        its genre/country. The row is never removed, so the catalog count is stable.
+        """
+        used_keywords = {a.value for r in rows for a in r.axes if a.name == AXIS_KEYWORD}
+
+        for row in rows:
+            kw_axes = [a for a in row.axes if a.name == AXIS_KEYWORD]
+            if not kw_axes:
+                continue
+
+            inventory = await self._row_inventory(row.axes, content_type)
+            if inventory >= MIN_ROW_INVENTORY:
+                continue
+
+            logger.info(
+                f"[RowRepair] '{row.title}' has only {inventory} titles "
+                f"(min {MIN_ROW_INVENTORY}); attempting repair"
+            )
+
+            non_kw = [a for a in row.axes if a.name != AXIS_KEYWORD]
+            repaired = False
+
+            # Step 1: try a different keyword from the profile.
+            for kid, _score in features.keywords:
+                if kid in used_keywords or kid in GENERIC_KEYWORD_BLACKLIST:
+                    continue
+                candidate = list(non_kw) + [
+                    RowAxis(name=AXIS_KEYWORD, value=kid, role=AxisRole.FLAVOR)
+                ]
+                if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
+                    kw_name = features.get_keyword_name(kid)
+                    genre_names = [
+                        features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
+                    ]
+                    row.axes = candidate
+                    row.id = build_row_id(candidate)
+                    row.title = " ".join(
+                        [p for p in ([normalize_keyword(kw_name or "")] + genre_names) if p]
+                    ) or row.title
+                    used_keywords.add(kid)
+                    repaired = True
+                    logger.info(f"[RowRepair] swapped in keyword {kid} -> '{row.title}'")
+                    break
+
+            # Step 2: keep the row, lose the keyword.
+            if not repaired and non_kw:
+                genre_names = [
+                    features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
+                ]
+                row.axes = non_kw
+                row.id = build_row_id(non_kw)
+                if genre_names:
+                    row.title = " ".join(genre_names)
+                logger.info(f"[RowRepair] dropped keyword axis -> '{row.title}'")
+
+        return rows
+
     async def _generate_rows_with_llm(
         self,
         profile: TasteProfile,
@@ -626,6 +805,13 @@ class RowGeneratorService:
             )
 
             if not data or not isinstance(data, list):
+                # Previously returned silently, making an LLM/schema failure
+                # indistinguishable from "no key configured" -- both just fell through
+                # to tiered sampling with no explanation.
+                logger.warning(
+                    f"[LLM Rows] unusable response for {content_type}: "
+                    f"type={type(data).__name__} value={str(data)[:300]}"
+                )
                 return None
 
             final_rows = []
@@ -677,6 +863,8 @@ class RowGeneratorService:
                         a.value for a in row_comp.axes if a.name == AXIS_KEYWORD
                     )
 
+            if final_rows:
+                final_rows = await self._repair_thin_rows(final_rows, features, content_type)
             return final_rows if final_rows else None
 
         except Exception as e:

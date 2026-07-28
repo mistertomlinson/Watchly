@@ -25,6 +25,10 @@ class CatalogUpdater:
     def __init__(self):
         # In-memory lock to prevent duplicate updates for the same token
         self._updating_tokens: set[str] = set()
+        # Strong references to in-flight background tasks. asyncio only keeps a weak
+        # reference to a bare create_task() result, so without this the task can be
+        # garbage collected mid-execution and the refresh silently never completes.
+        self._background_tasks: set[asyncio.Task] = set()
 
     def _needs_update(self, credentials: dict[str, Any]) -> bool:
         """Check if catalog update is needed based on last_updated timestamp."""
@@ -209,10 +213,26 @@ class CatalogUpdater:
                 credentials["authKey"] = access_token
                 credentials["trakt_refresh_token"] = token_data.get("refresh_token", refresh_token_value)
                 credentials["trakt_expires_at"] = int(time.time()) + token_data.get("expires_in", 7776000)
-                await token_store.update_user_data(token, credentials)
+                # Persist immediately. Trakt rotates the refresh token on use, so the
+                # old one is already dead server-side by this point. If this write
+                # fails the account is unrecoverable without a manual reconnect, so
+                # surface it loudly rather than letting it pass as a warning.
+                try:
+                    await token_store.update_user_data(token, credentials)
+                except Exception as persist_exc:
+                    logger.error(
+                        f"[{redact_token(token)}] CRITICAL: refreshed Trakt token but failed to "
+                        f"persist it: {persist_exc}. The previous refresh token is now invalid "
+                        "server-side; this account will require a manual reconnect."
+                    )
+                    return False
                 logger.info(f"[{redact_token(token)}] Trakt access token refreshed successfully")
             except Exception as e:
-                logger.warning(f"[{redact_token(token)}] Failed to refresh Trakt token: {e}")
+                # Do not fall through with the stale token: the resulting 401 surfaces
+                # as an empty library rather than as an auth failure. Return False so
+                # last_updated is not advanced and the refresh is retried.
+                logger.error(f"[{redact_token(token)}] Failed to refresh Trakt token: {e}")
+                return False
 
         trakt_bundle = TraktBundle(
             client_id=settings.TRAKT_CLIENT_ID,
@@ -257,8 +277,11 @@ class CatalogUpdater:
         self._updating_tokens.add(token)
         logger.info(f"[{redact_token(token)}] Triggering catalog update")
 
-        # Fire and forget background task
-        asyncio.create_task(self._update_task(token, credentials))
+        # Fire and forget background task, retaining a strong reference until it
+        # finishes so it cannot be collected while still running.
+        task = asyncio.create_task(self._update_task(token, credentials))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _update_task(self, token: str, credentials: dict[str, Any]) -> None:
         """Background task that performs the actual catalog update."""

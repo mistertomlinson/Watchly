@@ -8,6 +8,15 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TIMEOUT = 60.0
 
+# Providers count the REQUESTED max_tokens against per-minute token budgets, not the
+# tokens actually returned. 4000 was reserved for every call regardless of size, which
+# on Groq's free tier (12k TPM) meant a handful of concurrent calls exhausted the
+# budget and returned 429 before the model ever ran. These are sized to the real
+# responses, with headroom.
+DEFAULT_MAX_TOKENS = 4000
+STRUCTURED_MAX_TOKENS = 1200  # a JSON array of ~5 themed rows
+TITLE_MAX_TOKENS = 60         # a single 2-5 word catalog title
+
 
 class OpenRouterService:
     def __init__(self):
@@ -45,6 +54,7 @@ class OpenRouterService:
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
         base_url: str | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> str:
         key = self._get_api_key(api_key)
         if not key:
@@ -54,7 +64,7 @@ class OpenRouterService:
         effective_base_url = base_url or self.base_url
         payload = {
             "model": model,
-            "max_tokens": 4000,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt},
@@ -87,6 +97,7 @@ class OpenRouterService:
         return await self._call(
             prompt=prompt,
             system_instruction=self.get_catalog_title_prompt(),
+            max_tokens=TITLE_MAX_TOKENS,
         )
 
     async def generate_flash_content_async(
@@ -124,11 +135,27 @@ class OpenRouterService:
             system_instruction
             + "\n\nRespond ONLY with valid JSON matching the requested schema. No other text."
         )
-        result = await self._call(
-            prompt=prompt,
-            system_instruction=structured_instruction,
-            api_key=api_key,
-        )
+        # Route by key type, matching generate_flash_content_async. Without this a
+        # Groq key was sent to the OpenRouter endpoint and rejected with
+        # "401 Missing Authentication header", so structured row generation silently
+        # fell back to tiered sampling while plain-text calls kept working.
+        key = self._get_api_key(api_key)
+        if key and key.startswith("gsk_"):
+            result = await self._call(
+                prompt=prompt,
+                system_instruction=structured_instruction,
+                api_key=api_key,
+                model=GROQ_MODEL,
+                base_url=GROQ_BASE_URL,
+                max_tokens=STRUCTURED_MAX_TOKENS,
+            )
+        else:
+            result = await self._call(
+                prompt=prompt,
+                system_instruction=structured_instruction,
+                api_key=api_key,
+                max_tokens=STRUCTURED_MAX_TOKENS,
+            )
         if not result:
             return None
         try:

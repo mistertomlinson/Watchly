@@ -313,7 +313,7 @@ def _popup_close_html(
 <head><title>Trakt Authorization</title></head>
 <body>
 <p style="font-family:sans-serif;text-align:center;margin-top:3rem">
-  {'Authorization successful! You can close this window.' if success else f'Authorization failed: {error}'}
+  {'Authorization successful! You can close this window.' if success else f'Authorization failed: {_html_escape(error)}'}
 </p>
 <script>
   try {{
@@ -328,5 +328,29 @@ def _popup_close_html(
 
 
 def _js_str(value: str | None) -> str:
+    """Serialise a value for safe embedding inside an inline <script> block.
+
+    json.dumps alone is NOT sufficient here: the HTML parser terminates the
+    surrounding <script> element at a literal '</script>' sequence regardless of
+    JavaScript string context, so a crafted `error` value can break out of the
+    script and inject markup. Escaping the forward slash in '</' produces
+    '<\\/script>', which is an equivalent JSON string but is not recognised as a
+    closing tag by the HTML parser. U+2028/U+2029 are also escaped as they are
+    line terminators in JavaScript but not in JSON.
+    """
     import json
-    return json.dumps(value)
+    encoded = json.dumps(value)
+    encoded = encoded.replace("</", "<\\/")
+    encoded = encoded.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return encoded
+
+
+def _html_escape(value: str | None) -> str:
+    """Escape a value for safe interpolation into HTML text content.
+
+    `error` originates from the OAuth callback query string and was previously
+    written into the page body unescaped, giving reflected XSS on an origin that
+    also holds the configure UI and posts tokens via postMessage.
+    """
+    import html
+    return html.escape(value or "Unknown error")

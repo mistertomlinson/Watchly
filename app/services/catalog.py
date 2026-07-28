@@ -16,6 +16,11 @@ from app.services.user_cache import user_cache
 from app.utils.catalog import get_catalogs_from_config
 
 
+# Delay applied to the second row-generation task so concurrent LLM calls do not
+# collide on the provider's tokens-per-minute limit.
+LLM_STAGGER_SECONDS = 3.0
+
+
 class DynamicCatalogService:
     """
     Generates dynamic catalog rows based on user library and preferences.
@@ -181,17 +186,36 @@ class DynamicCatalogService:
                     logger.warning(f"Failed to save profile for {media_type}: {e}")
 
             try:
-                catalogs = await self.row_generator.generate_rows(profile, media_type, api_key=gemini_api_key)
+                catalogs = await self.row_generator.generate_rows(
+                    profile, media_type, api_key=gemini_api_key, token=token
+                )
                 return media_type, catalogs
             except Exception as e:
                 logger.error(f"Failed to generate thematic rows for {media_type}: {e}")
                 raise e
 
+        # Movie and series row generation each make LLM calls. Fired simultaneously
+        # they contend for the same per-minute token budget (Groq's free tier is
+        # 12k TPM), and the loser gets a 429 and silently degrades to tiered
+        # sampling. Offsetting the second task keeps both inside the budget at the
+        # cost of a small delay on a cold rebuild only.
+        async def _staggered(delay: float, coro_factory):
+            if delay:
+                await asyncio.sleep(delay)
+            return await coro_factory()
+
         tasks = []
         if enabled_movie:
-            tasks.append(_generate_for_type("movie", excluded_movie_genres))
+            tasks.append(
+                _staggered(0, lambda: _generate_for_type("movie", excluded_movie_genres))
+            )
         if enabled_series:
-            tasks.append(_generate_for_type("series", excluded_series_genres))
+            tasks.append(
+                _staggered(
+                    LLM_STAGGER_SECONDS if enabled_movie else 0,
+                    lambda: _generate_for_type("series", excluded_series_genres),
+                )
+            )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

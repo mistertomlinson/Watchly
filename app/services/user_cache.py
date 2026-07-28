@@ -11,6 +11,11 @@ from app.core.security import redact_token
 from app.models.taste_profile import TasteProfile
 from app.services.redis_service import redis_service
 
+# Derived caches (library, profiles, watched sets, hashes) are rebuilt on demand
+# from the upstream provider, so they do not need to live forever. Without a TTL
+# these keys accumulate indefinitely for deleted or abandoned tokens.
+DERIVED_CACHE_TTL_SECONDS = 2592000  # 30 days
+
 
 class UserCacheService:
     @staticmethod
@@ -70,8 +75,20 @@ class UserCacheService:
             token: User token
             library_items: Library items dictionary to cache
         """
+        # Refuse to cache an empty library. Upstream clients (Trakt/Stremio) swallow
+        # auth and rate-limit failures and return an empty-but-well-formed dict rather
+        # than raising. Caching that -- with no TTL -- pins the account into permanent
+        # trending/TMDB fallback until the key is manually deleted.
+        _li = library_items or {}
+        if not any(_li.get(k) for k in ("watched", "loved", "liked", "added")):
+            logger.warning(
+                f"[{redact_token(token)}...] Library has no items; refusing to cache "
+                "(likely upstream auth or rate-limit failure)"
+            )
+            return
+
         key = self._library_items_key(token)
-        await redis_service.set(key, json.dumps(library_items))
+        await redis_service.set(key, json.dumps(library_items), DERIVED_CACHE_TTL_SECONDS)
         logger.debug(f"[{redact_token(token)}...] Cached library items")
 
         # Invalidate all catalog caches when library items are updated
@@ -124,7 +141,7 @@ class UserCacheService:
             profile: TasteProfile instance to cache
         """
         key = self._profile_key(token, content_type)
-        await redis_service.set(key, profile.model_dump_json())
+        await redis_service.set(key, profile.model_dump_json(), DERIVED_CACHE_TTL_SECONDS)
         logger.debug(f"[{redact_token(token)}...] Cached profile for {content_type}")
 
     async def invalidate_profile(self, token: str, content_type: str) -> None:
@@ -188,7 +205,7 @@ class UserCacheService:
             "watched_tmdb": list(watched_tmdb),
             "watched_imdb": list(watched_imdb),
         }
-        await redis_service.set(key, json.dumps(data))
+        await redis_service.set(key, json.dumps(data), DERIVED_CACHE_TTL_SECONDS)
         logger.debug(f"[{redact_token(token)}...] Cached watched sets for {content_type}")
 
     async def invalidate_watched_sets(self, token: str, content_type: str) -> None:
@@ -271,8 +288,8 @@ class UserCacheService:
         build_time_key = self._last_profile_build_key(token, content_type)
 
         # Store hash and build timestamp
-        await redis_service.set(hash_key, current_hash)
-        await redis_service.set(build_time_key, str(time.time()))
+        await redis_service.set(hash_key, current_hash, DERIVED_CACHE_TTL_SECONDS)
+        await redis_service.set(build_time_key, str(time.time()), DERIVED_CACHE_TTL_SECONDS)
 
         logger.debug(f"[{redact_token(token)}...] Updated library hash for {content_type}")
 

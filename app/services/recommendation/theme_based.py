@@ -61,7 +61,16 @@ class ThemeBasedService:
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
 
         # 3. Extract mandatory filters (country/era from ANY role)
-        all_constraints = {**anchors, **flavors, **fallbacks}
+        # Union the roles. A plain dict merge let the LEAST important role (fallback)
+        # overwrite the anchor for any shared axis, so the defining constraint of the
+        # row was dropped before the query was built.
+        all_constraints: dict = {}
+        for _role in (anchors, flavors, fallbacks):
+            for _k, _v in _role.items():
+                _bucket = all_constraints.setdefault(_k, [])
+                for _x in (_v if isinstance(_v, list) else [_v]):
+                    if _x not in _bucket:
+                        _bucket.append(_x)
         mandatory_filters = {}
         if "country" in all_constraints:
             mandatory_filters["country"] = all_constraints["country"]
@@ -103,7 +112,10 @@ class ThemeBasedService:
         # ====================
         # Skip Phase 2 if anchor is a keyword — individual axis queries would dilute
         # the keyword constraint and return off-theme results (e.g. non-remakes in "Sci-Fi Remakes")
-        has_keyword_anchor = "keyword" in anchors
+        # Any keyword in the recipe -- not just an anchor keyword -- makes per-axis
+        # queries unsafe: they fetch items that match ONE axis and ignore the keyword
+        # entirely, which is how unrelated titles reached keyword-named rows.
+        has_keyword_anchor = "keyword" in all_constraints
         if not has_keyword_anchor and len(candidates) < limit * 2:
             fetch_tasks = []
 
@@ -242,37 +254,66 @@ class ThemeBasedService:
             if target is None:
                 continue
 
+            # Accumulate rather than assign. A row can legitimately carry two genres
+            # or two keywords in the same role; the previous dict assignment silently
+            # discarded all but the last, so "Drama + Squatting + True Crime" only
+            # ever queried one keyword.
+            def _add(tgt, key, value):
+                bucket = tgt.setdefault(key, [])
+                for piece in str(value).split("-"):
+                    if piece and piece not in bucket:
+                        bucket.append(piece)
+
             if val.startswith("g"):
-                target["genre"] = val[1:]
+                _add(target, "genre", val[1:])
             elif val.startswith("k"):
-                target["keyword"] = val[1:]
+                _add(target, "keyword", val[1:])
             elif val.startswith("ct"):
-                target["country"] = val[2:]
+                _add(target, "country", val[2:])
             elif val.startswith("y"):
-                target["era"] = val[1:]
+                _add(target, "era", val[1:])
             elif val.startswith("r"):
-                target["runtime"] = val[1:]
+                _add(target, "runtime", val[1:])
             elif val.startswith("cr"):
-                target["creator"] = val[2:]
+                _add(target, "creator", val[2:])
 
         return anchors, flavors, fallbacks
 
     def _axes_to_params(self, axes: dict, content_type: str) -> dict:
         """Convert axes to TMDB discover params."""
+        def _vals(key):
+            v = axes.get(key)
+            if v is None:
+                return []
+            if isinstance(v, list):
+                out = []
+                for item in v:
+                    for piece in str(item).split("-"):
+                        if piece and piece not in out:
+                            out.append(piece)
+                return out
+            return [p for p in str(v).split("-") if p]
+
         params = {}
-        if "genre" in axes:
-            params["with_genres"] = axes["genre"].replace("-", "|")
-        if "keyword" in axes:
-            params["with_keywords"] = axes["keyword"].replace("-", "|")
-        if "country" in axes:
+        # TMDB treats "," as AND and "|" as OR. These were joined with "|", so a row
+        # promising two genres or two keywords returned anything matching EITHER --
+        # the direct cause of off-theme entries in themed rows.
+        genres = _vals("genre")
+        if genres:
+            params["with_genres"] = ",".join(genres)
+        keywords = _vals("keyword")
+        if keywords:
+            params["with_keywords"] = ",".join(keywords)
+        countries = _vals("country")
+        if countries:
             # Normalize common incorrect codes to ISO 3166-1 alpha-2
             country_code_fixes = {"UK": "GB", "EN": "GB"}
-            country_val = axes["country"]
+            country_val = countries[0]
             params["with_origin_country"] = country_code_fixes.get(country_val, country_val)
         if "era" in axes:
             try:
                 # Value can be single year or range
-                val = axes["era"]
+                val = (axes["era"][0] if isinstance(axes["era"], list) else axes["era"])
                 if "-" in val:
                     start_year = int(val.split("-")[0])
                     end_year = int(val.split("-")[1])
@@ -287,7 +328,7 @@ class ThemeBasedService:
                 logger.error("Failed to parse era axis: {}", axes["era"])
                 pass
         if "runtime" in axes:
-            bucket = axes["runtime"]
+            bucket = (axes["runtime"][0] if isinstance(axes["runtime"], list) else axes["runtime"])
             is_movie = content_type == "movie"
             s_max = RUNTIME_BUCKET_SHORT_MAX_MOVIE if is_movie else RUNTIME_BUCKET_SHORT_MAX_SERIES
             m_max = RUNTIME_BUCKET_MEDIUM_MAX_MOVIE if is_movie else RUNTIME_BUCKET_MEDIUM_MAX_SERIES
@@ -304,25 +345,41 @@ class ThemeBasedService:
         """Calculate weighted score based on axis matches."""
         score = 0.0
 
+        def _as_list(value):
+            if isinstance(value, list):
+                out = []
+                for item_v in value:
+                    for piece in str(item_v).split("-"):
+                        if piece and piece not in out:
+                            out.append(piece)
+                return out
+            return [p for p in str(value).split("-") if p]
+
         def check_match(axis_name, value):
             if axis_name == "genre":
                 item_genres = [str(gid) for gid in item.get("genre_ids", [])]
-                target_genres = str(value).split("-")
-                return any(tg in item_genres for tg in target_genres)
+                target_genres = _as_list(value)
+                # ALL requested genres must be present. The query now uses AND
+                # semantics, so scoring must agree or ranking contradicts the filter.
+                return bool(target_genres) and all(tg in item_genres for tg in target_genres)
             if axis_name == "keyword":
-                return True  # Optimistic match for discovery items
+                # Previously returned True unconditionally, which meant items fetched
+                # WITHOUT the keyword constraint (see _expand_search) scored as full
+                # matches and could collect the perfect-match bonus.
+                return bool(item.get("_keyword_matched", False))
             if axis_name == "country":
                 item_countries = item.get("origin_country", [])
-                return value in item_countries
+                return any(c in item_countries for c in _as_list(value))
             if axis_name == "era":
                 rel = item.get("release_date") or item.get("first_air_date")
+                era_val = value[0] if isinstance(value, list) else value
                 if rel:
                     try:
                         y = int(rel[:4])
-                        if "-" in value:
-                            start, end = map(int, value.split("-"))
+                        if "-" in str(era_val):
+                            start, end = map(int, str(era_val).split("-"))
                         else:
-                            start = int(value)
+                            start = int(era_val)
                             end = start + 9
                         return start <= y <= end
                     except Exception:
@@ -357,13 +414,32 @@ class ThemeBasedService:
         return score
 
     async def _expand_search(self, content_type: str, params: dict, anchors: dict, flavors: dict) -> list[dict]:
-        """Expansion logic if results are sparse."""
-        # 1. Relax Keyword: Remove keyword constraint
-        if "with_keywords" in params:
-            new_params = params.copy()
-            del new_params["with_keywords"]
-            return await self._fetch_discover_candidates(content_type, new_params, pages=[1, 2])
+        """Expansion logic if results are sparse.
 
+        A keyword is the most specific thing a themed row can promise, so it is the
+        one constraint we never drop. Previously this deleted with_keywords entirely
+        and back-filled with whatever matched the remaining genre/year filters, which
+        is why niche rows ("Squatting") returned a handful of real matches followed by
+        unrelated popular titles. Instead we keep the keyword and relax the SOFTER
+        constraints (genre, runtime) to find more genuine matches.
+        """
+        if "with_keywords" in params:
+            # Keep the keyword; drop the softer filters and search deeper.
+            new_params = {
+                k: v
+                for k, v in params.items()
+                if k in ("with_keywords", "language", "region", "include_adult")
+                or k.startswith("primary_release_date")
+                or k.startswith("first_air_date")
+                or k.startswith("vote_")
+                or k.startswith("sort_")
+            }
+            return await self._fetch_discover_candidates(
+                content_type, new_params, pages=[1, 2, 3, 4]
+            )
+
+        # Non-keyword themes have no equivalently specific constraint to preserve,
+        # so there is nothing safe to relax here.
         return []
 
     def _calculate_pages_to_fetch(self, num_excluded_genres: int) -> list[int]:
@@ -402,15 +478,49 @@ class ThemeBasedService:
         # Apply global user filters (year range, popularity)
         params = apply_discover_filters(params, self.user_settings)
 
+        # The vote_count floor is calibrated for broad browsing, but a narrow themed
+        # query (e.g. true-crime documentaries) can lose 90%+ of its pool to it --
+        # niche categories are watched widely and rated rarely. If the constrained
+        # pool is too small to fill the row, retry once with a token floor so the
+        # row is populated from genuinely on-theme titles rather than padded with
+        # off-theme ones later.
+        floor = params.get("vote_count.gte")
+        if floor and int(floor) > 10:
+            try:
+                probe = await self.tmdb_service.get_discover(content_type, page=1, **params)
+                if int(probe.get("total_results", 0) or 0) < 40:
+                    relaxed = dict(params)
+                    relaxed["vote_count.gte"] = 10
+                    wider = await self.tmdb_service.get_discover(content_type, page=1, **relaxed)
+                    if int(wider.get("total_results", 0) or 0) > int(
+                        probe.get("total_results", 0) or 0
+                    ):
+                        logger.info(
+                            f"[ThemeDiscover] relaxing vote floor {floor} -> 10 "
+                            f"({probe.get('total_results')} -> {wider.get('total_results')} results)"
+                        )
+                        params = relaxed
+            except Exception as e:
+                logger.debug(f"[ThemeDiscover] vote-floor probe failed: {e}")
+
         tasks = [self.tmdb_service.get_discover(content_type, page=p, **params) for p in pages]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Record whether this particular query actually constrained on keywords.
+        # TMDB discover results carry no keyword data, so this is the only reliable
+        # signal that an item genuinely matches the theme's keyword axis. Items from
+        # relaxed/expanded queries are tagged False and can be ranked down instead of
+        # being treated as perfect matches.
+        keyword_constrained = bool(params.get("with_keywords"))
 
         for res in results:
             if isinstance(res, Exception):
                 logger.debug(f"Error fetching discover: {res}")
                 continue
-            candidates.extend(res.get("results", []))
+            for item in res.get("results", []):
+                item["_keyword_matched"] = keyword_constrained
+                candidates.append(item)
 
         return candidates
 

@@ -142,11 +142,18 @@ class RecommendationFiltering:
         Get dynamic quality thresholds (min_rating, min_votes) based on popularity preference.
         """
 
+        # NOTE: these must stay in step with DISCOVERY_SETTINGS in app/core/constants.py,
+        # which defines the same four presets for the discover query itself. The two
+        # tables had drifted: "balanced" demanded 6.7/250 here versus 6.0/50 there, and
+        # "all" 5.0/50 versus 5.0/10 -- so the documented preset was not the one being
+        # enforced. A 250-vote floor also excluded well-regarded but lightly-rated
+        # titles (documentaries and international releases especially), starving
+        # narrow themed rows.
         quality_rating_mapping = {
             "mainstream": (6.2, 500),  # (min_rating, min_votes)
-            "balanced": (6.7, 250),
+            "balanced": (6.0, 50),
             "gems": (7.2, 100),
-            "all": (5.0, 50),
+            "all": (5.0, 10),
         }
         if not user_settings:
             return quality_rating_mapping.get("balanced")
