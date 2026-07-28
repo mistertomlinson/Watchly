@@ -1,5 +1,6 @@
 from app.services.openrouter import gemini_service
 import asyncio
+import re
 from typing import Any
 
 from loguru import logger
@@ -184,9 +185,11 @@ RESPONSE FORMAT (one per line, no other text):
                 parts = line.split("|")
                 if len(parts) >= 3:
                     name, year = parts[1].strip(), parts[2].strip()[:4]
+                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
                     resolve_tasks.append(self._resolve_title(name, year, mtype))
                 elif len(parts) == 2:
                     name, year = parts[0].strip(), parts[1].strip()[:4]
+                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
                     resolve_tasks.append(self._resolve_title(name, year, mtype))
 
             results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
