@@ -137,6 +137,10 @@ class DynamicCatalogService:
         excluded_movie_genres = []
         excluded_series_genres = []
         gemini_api_key = None
+        # Inventory probes need these to count titles the user will actually see
+        # rather than TMDB's unfiltered total, and settings only exist per-request.
+        self.row_generator.user_settings = user_settings
+
         if user_settings:
             excluded_movie_genres = [int(g) for g in user_settings.excluded_movie_genres]
             excluded_series_genres = [int(g) for g in user_settings.excluded_series_genres]

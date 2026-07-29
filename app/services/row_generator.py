@@ -21,6 +21,7 @@ from app.models.taste_profile import TasteProfile
 from app.services.openrouter import gemini_service
 from app.services.tmdb.countries import COUNTRY_ADJECTIVES
 from app.services.tmdb.genre import movie_genres, series_genres
+from app.services.recommendation.utils import apply_discover_filters
 from app.services.tmdb.service import TMDBService, get_tmdb_service
 
 GOLD_TIER_LIMIT = 3  # Top 1-3 items
@@ -318,11 +319,14 @@ class RowBuilder:
         return None
 
 
-# Minimum raw TMDB inventory a themed row must have before it is worth showing.
-# Raw total_results is a generous upper bound: the user's year range, popularity
-# floor and watched-history filtering all cut into it, so the effective pool is a
-# good deal smaller than this number.
-MIN_ROW_INVENTORY = 60
+# Minimum inventory a themed row must have before it is worth showing.
+# The probe now applies the user's own discover filters (year range, vote floor)
+# and uses the same AND keyword/genre semantics as the real catalog query, so this
+# figure is close to what the row will actually return -- only watched-history
+# exclusion is unaccounted for. Rows at 10-15 titles fill a shelf perfectly well;
+# the check exists to catch rows returning 0-2, which is what over-specific LLM
+# themes produce.
+MIN_ROW_INVENTORY = 8
 
 # How long a generated row set stays usable before we spend LLM requests on a new
 # one. Rows were previously regenerated on every manifest rebuild (every 6h, per
@@ -358,8 +362,13 @@ class RowGeneratorService:
 
     """Generates dynamic, personalized row definitions from a User Taste Profile."""
 
-    def __init__(self, tmdb_service: TMDBService | None = None):
+    def __init__(self, tmdb_service: TMDBService | None = None, user_settings=None):
         self.tmdb_service = tmdb_service or get_tmdb_service()
+        # Needed so inventory probes count titles the user will ACTUALLY see.
+        # Without the year range and vote floor applied, total_results reports a
+        # pool several times larger than the one the real query returns, making
+        # any MIN_ROW_INVENTORY threshold guesswork.
+        self.user_settings = user_settings
 
     async def generate_rows(
         self,
@@ -785,16 +794,22 @@ class RowGeneratorService:
         countries = [str(a.value) for a in axes if a.name == AXIS_COUNTRY]
 
         params = {}
+        # Must match the semantics of the real catalog query. theme_based.py joins
+        # these with "," (AND) -- probing with "|" (OR) counted a far larger pool
+        # than the row would actually return, so rows passed the inventory check
+        # and then rendered empty.
         if genres:
-            params["with_genres"] = "|".join(genres)
+            params["with_genres"] = ",".join(genres)
         if keywords:
-            params["with_keywords"] = "|".join(keywords)
+            params["with_keywords"] = ",".join(keywords)
         if countries:
             params["with_origin_country"] = countries[0]
         if not params:
             return 0
 
         try:
+            if self.user_settings is not None:
+                params = apply_discover_filters(params, self.user_settings)
             res = await self.tmdb_service.get_discover(content_type, page=1, **params)
             return int(res.get("total_results", 0) or 0)
         except Exception as e:
@@ -874,6 +889,22 @@ class RowGeneratorService:
 
             non_kw = [a for a in row.axes if a.name != AXIS_KEYWORD]
             repaired = False
+
+            # Only substitute a profile keyword when the row had SEVERAL, so the
+            # theme survives in some form. Profile keywords are ranked by how much
+            # the user watches them, not by relevance to this row -- swapping the
+            # sole keyword of "Political Conspiracy Thrillers" produced a martial
+            # arts row still wearing the political title. With one keyword, dropping
+            # it is honest: the genres and the LLM title still agree.
+            if len(kw_axes) < 2:
+                non_kw_axes = [a for a in row.axes if a.name != AXIS_KEYWORD]
+                if non_kw_axes:
+                    row.axes = non_kw_axes
+                    row.id = build_row_id(non_kw_axes)
+                    logger.info(
+                        f"[RowRepair] sole keyword too thin; dropped it -> '{row.title}'"
+                    )
+                continue
 
             # Step 1: try a different keyword from the profile.
             for kid, _score in features.keywords:
