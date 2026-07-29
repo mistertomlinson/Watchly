@@ -147,7 +147,12 @@ class RowDefinition(BaseModel):
 class LLMRowTheme(BaseModel):
     """Schema for structured LLM output - a single themed catalog row."""
 
-    title: str = Field(description="Creative, short title for the collection (2-5 words)")
+    title: str = Field(
+        description=(
+            "2-5 word title describing the CONTENT. Never name the row's purpose "
+            "(no core/mixed/rising/deep cut/mood/picks/favorites)."
+        )
+    )
     genres: list[int] = Field(description="List of valid TMDB genre IDs")
     keywords: list[str] = Field(default_factory=list, description="Specific TMDB keyword names")
     country: str | None = Field(default=None, description="ISO 3166-1 country code or null")
@@ -625,7 +630,7 @@ class RowGeneratorService:
                 logger.warning(f"Gemini failed for row {i}: {result}")
                 title = row.build_fallback()
             elif result:
-                title = result.strip()
+                title = self._clean_title(result)
             else:
                 title = row.build_fallback()
 
@@ -781,17 +786,17 @@ class RowGeneratorService:
             prompt = (
                 "Using only the user's interest summary below, generate exactly 5 streaming collections for"
                 f" {content_type}. Use genres (required), keywords, and country when relevant.\n\nInterest"
-                f" Summary:\n{summary}\n\nGenerate 5 rows in this order:\n1. THE CORE — What they will love"
-                " most: strongest match to their taste (genres + keywords + country if relevant).\n2. MIXED"
-                " PREFERENCES — Blend of their tastes with more variety (genres + keywords + country if"
-                " relevant).\n3. RISING STAR — Discovery: suggest themes they might not have explored yet but"
+                f" Summary:\n{summary}\n\nGenerate 5 rows. The bracketed labels are internal planning labels only and must NEVER appear in a title:\n1. [strongest match] — What they will love"
+                " most: strongest match to their taste (genres + keywords + country if relevant).\n2. [variety]"
+                " — Blend of their tastes with more variety (genres + keywords + country if"
+                " relevant).\n3. [discovery] — Discovery: suggest themes they might not have explored yet but"
                 " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords +"
-                " country; openness to new content here.\n4. DEEP CUT — Lesser-known or cult titles matching"
-                " their taste. Use 1-2 genres + 1 keyword max.\n5. MOOD PICK — A specific mood or tone they"
+                " country; openness to new content here.\n4. [lesser-known] — Lesser-known or cult titles matching"
+                " their taste. Use 1-2 genres + 1 keyword max.\n5. [mood] — A specific mood or tone they"
                 " would enjoy (e.g. mind-bending, atmospheric, tense). Use genres + 1 keyword max.\n\nRules:\n"
                 "- Genres: use ONLY these TMDB Genre IDs:"
                 f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
-                " or null when relevant.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
+                " or null when relevant.\n- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE constraint rather than summarising every axis. Good: Crime+Drama, GB, 'based on novel or book' -> British Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
                 " of strings), country (string or null).\n- IMPORTANT: Keep combinations simple and achievable."
                 " Use max 2 genres and max 1-2 keywords per row. Do NOT combine 3+ niche constraints together"
                 " (e.g. avoid Documentary + dark comedy + anthology — too niche).\n- Output a JSON array of 5 objects."
