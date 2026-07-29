@@ -824,7 +824,12 @@ class RowGeneratorService:
             # A row with a single genre and nothing else ("Mystery") is not a theme:
             # it returns the same popular titles any generic list would. Give it a
             # keyword from the profile so it says something specific.
-            if not kw_axes and len(row.axes) < 2:
+            # Count DISTINCT (name, value) pairs, not axis entries. Patch 40's
+            # re-anchoring can add the same genre twice (once as ANCHOR, once as
+            # FLAVOR), so a row like a:g80.f:g80 -- bare Crime, nothing else --
+            # looked like two axes and slipped past this check.
+            distinct_axes = {(a.name, str(a.value)) for a in row.axes}
+            if not kw_axes and len(distinct_axes) < 2:
                 for kid, _score in features.keywords:
                     if kid in used_keywords or kid in GENERIC_KEYWORD_BLACKLIST:
                         continue
