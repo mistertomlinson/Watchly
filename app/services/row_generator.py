@@ -11,7 +11,7 @@ import asyncio
 import json
 import random
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -45,6 +45,10 @@ class RowAxis(BaseModel):
     value: Any
     role: AxisRole
     weight: float = 1.0
+    # Human-readable form of `value` (genre name, keyword name, country name).
+    # Recorded at add time so titles can be composed from the axes themselves
+    # rather than from a flat, order-dependent list of strings.
+    display: str | None = None
 
 
 def normalize_keyword(kw: str) -> str:
@@ -172,9 +176,55 @@ class RowComponents(BaseModel):
         """Build Gemini prompt from parts."""
         return " + ".join(self.prompt_parts)
 
+    # TMDB keyword names read as sentence fragments and make poor titles verbatim.
+    KEYWORD_DISPLAY_OVERRIDES: ClassVar[dict[str, str]] = {
+        "based on novel or book": "Novel-Based",
+        "based on true story": "True Story",
+        "based on comic": "Comic-Based",
+        "artificial intelligence (a.i.)": "AI",
+        "true crime": "True Crime",
+        "dystopia": "Dystopian",
+        "murder investigation": "Murder Mystery",
+        "dark comedy": "Dark",
+        "woman director": "Women-Directed",
+    }
+
     def build_fallback(self) -> str:
-        """Build fallback title from parts."""
-        return " ".join(self.fallback_parts)
+        """Compose a readable title from the row's axes.
+
+        Previously this joined fallback_parts in whatever order they happened to be
+        added, producing titles like "Based On Novel Or Book Mystery". Ordering by
+        axis type -- country, then keyword, then genre as the closing noun -- gives
+        "Novel-Based Mystery" instead.
+        """
+        by_axis: dict[str, list[str]] = {}
+        for axis in self.axes:
+            if axis.role not in (AxisRole.ANCHOR, AxisRole.FLAVOR):
+                continue
+            display = getattr(axis, "display", None) or self._display_for(axis)
+            if not display:
+                continue
+            by_axis.setdefault(axis.name, []).append(display)
+
+        countries = by_axis.get(AXIS_COUNTRY, [])[:1]
+        keywords = by_axis.get(AXIS_KEYWORD, [])[:2]
+        genres = by_axis.get(AXIS_GENRE, [])[:2]
+
+        keywords = [self.KEYWORD_DISPLAY_OVERRIDES.get(k.strip().lower(), k) for k in keywords]
+
+        # Drop a keyword that merely restates a genre (e.g. "Dystopian" + "Science Fiction")
+        genre_words = {g.strip().lower() for g in genres}
+        keywords = [k for k in keywords if k.strip().lower() not in genre_words]
+
+        parts = countries + keywords + genres
+        title = " ".join(p for p in parts if p).strip()
+
+        # Fall back to the old behaviour if axis data was unavailable
+        return title or " ".join(self.fallback_parts)
+
+    def _display_for(self, axis) -> str | None:
+        """Recover a display string for an axis from the recorded fallback parts."""
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for row building."""
@@ -227,6 +277,7 @@ class RowBuilder:
 
         # Build prompt and fallback title parts
         display_val = self._get_display_value(name, value)
+        axis.display = display_val
         if display_val:
             prefix = ""
             if role == AxisRole.ANCHOR:
@@ -734,15 +785,27 @@ class RowGeneratorService:
                     RowAxis(name=AXIS_KEYWORD, value=kid, role=AxisRole.FLAVOR)
                 ]
                 if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
-                    kw_name = features.get_keyword_name(kid)
+                    kw_name = normalize_keyword(features.get_keyword_name(kid) or "")
+                    kw_name = RowComponents.KEYWORD_DISPLAY_OVERRIDES.get(
+                        kw_name.strip().lower(), kw_name
+                    )
                     genre_names = [
                         features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
                     ]
+                    country_names = [
+                        get_country_adjective(a.value) for a in non_kw if a.name == AXIS_COUNTRY
+                    ]
+                    # Drop a keyword that just restates a genre, and keep the genre
+                    # last so the title reads as a noun phrase:
+                    # [Country] [Keyword] [Genre] -> "British Novel-Based Drama"
+                    if kw_name.strip().lower() in {g.strip().lower() for g in genre_names}:
+                        kw_name = ""
                     row.axes = candidate
                     row.id = build_row_id(candidate)
-                    row.title = " ".join(
-                        [p for p in ([normalize_keyword(kw_name or "")] + genre_names) if p]
-                    ) or row.title
+                    row.title = (
+                        " ".join(p for p in (country_names[:1] + [kw_name] + genre_names[:1]) if p)
+                        or row.title
+                    )
                     used_keywords.add(kid)
                     repaired = True
                     logger.info(f"[RowRepair] swapped in keyword {kid} -> '{row.title}'")
@@ -753,10 +816,13 @@ class RowGeneratorService:
                 genre_names = [
                     features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
                 ]
+                country_names = [
+                    get_country_adjective(a.value) for a in non_kw if a.name == AXIS_COUNTRY
+                ]
                 row.axes = non_kw
                 row.id = build_row_id(non_kw)
                 if genre_names:
-                    row.title = " ".join(genre_names)
+                    row.title = " ".join(country_names[:1] + genre_names[:2])
                 logger.info(f"[RowRepair] dropped keyword axis -> '{row.title}'")
 
         return rows
@@ -808,7 +874,7 @@ class RowGeneratorService:
                 " would enjoy (e.g. mind-bending, atmospheric, tense). Use genres + 1 keyword max.\n\nRules:\n"
                 "- Genres: use ONLY these TMDB Genre IDs:"
                 f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
-                " or null when relevant.\n- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE constraint rather than summarising every axis. Good: Crime+Drama, GB, 'based on novel or book' -> British Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
+                " or null when relevant.\n- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE constraint rather than summarising every axis. Good: Crime+Drama, GB, 'based on novel or book' -> British Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Never write a country CODE (GB, US, KR) in a title -- the code belongs in the country field only. Use the adjective: GB -> British, US -> American, KR -> Korean, JP -> Japanese, FR -> French. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks, GB Crime Comedies.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
                 " of strings), country (string or null).\n- IMPORTANT: Keep combinations simple and achievable."
                 " Use max 2 genres and max 1-2 keywords per row. Do NOT combine 3+ niche constraints together"
                 " (e.g. avoid Documentary + dark comedy + anthology — too niche).\n- Output a JSON array of 5 objects."
