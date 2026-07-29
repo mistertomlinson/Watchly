@@ -352,6 +352,10 @@ GENERIC_KEYWORD_BLACKLIST = {
 #   663    fortune teller        (79 titles - inventory check gates this one)
 
 class RowGeneratorService:
+    # Strong references to in-flight background refreshes; asyncio only holds a
+    # weak reference to a bare create_task() result.
+    _bg_tasks: set = set()
+
     """Generates dynamic, personalized row definitions from a User Taste Profile."""
 
     def __init__(self, tmdb_service: TMDBService | None = None):
@@ -388,6 +392,23 @@ class RowGeneratorService:
                     "(under 24h old, no LLM request spent)"
                 )
                 return fresh
+
+            # Stale-while-revalidate: an expired set is still far better than making
+            # the caller wait ~40s for the LLM. Serve it now and refresh in the
+            # background so the next request gets the new one. Without this a cold
+            # rebuild exceeds the client's read timeout and shows nothing at all.
+            stale = await self._get_cached_llm_rows(token, content_type, max_age=None)
+            if stale:
+                logger.info(
+                    f"Serving {len(stale)} stale LLM rows for {content_type} and "
+                    "regenerating in the background"
+                )
+                task = asyncio.create_task(
+                    self._regenerate_in_background(profile, features, content_type, api_key, token)
+                )
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+                return stale
 
             try:
                 llm_rows = await self._generate_rows_with_llm(
@@ -863,6 +884,26 @@ class RowGeneratorService:
                 logger.info(f"[RowRepair] dropped keyword axis -> '{row.title}'")
 
         return rows
+
+    async def _regenerate_in_background(
+        self,
+        profile: TasteProfile,
+        features: "ExtractedFeatures",
+        content_type: str,
+        api_key: str,
+        token: str | None,
+    ) -> None:
+        """Refresh a stale row set without blocking the request that noticed it."""
+        try:
+            rows = await self._generate_rows_with_llm(profile, features, content_type, api_key)
+            if rows:
+                rows = await self._repair_thin_rows(rows, features, content_type)
+                await self._cache_llm_rows(token, content_type, rows)
+                logger.info(
+                    f"[LLM Rows] background refresh stored {len(rows)} rows for {content_type}"
+                )
+        except Exception as e:
+            logger.warning(f"[LLM Rows] background refresh failed for {content_type}: {e}")
 
     async def _generate_rows_with_llm(
         self,

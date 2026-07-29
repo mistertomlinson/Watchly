@@ -164,8 +164,23 @@ class DynamicCatalogService:
                 logger.warning(f"Failed to build profile for {media_type}")
                 return media_type, []
 
+            # Reuse a previously generated summary. This is a description of the
+            # user's taste -- it changes when the library changes, not every six
+            # hours -- and regenerating it was costing 40-70s per content type on
+            # every rebuild, which is the bulk of cold-start latency and 2 of the
+            # 4 LLM requests per manifest.
+            if gemini_api_key and token and not profile.interest_summary:
+                cached_profile = await user_cache.get_profile(token, media_type)
+                cached_summary = getattr(cached_profile, "interest_summary", None)
+                if cached_summary:
+                    profile.interest_summary = cached_summary
+                    logger.info(
+                        f"Reusing cached interest summary for {media_type} "
+                        "(no LLM request spent)"
+                    )
+
             # Generate interest summary if API key is present.
-            if gemini_api_key and token:
+            if gemini_api_key and token and not profile.interest_summary:
                 try:
                     logger.info(f"Generating interest summary for {media_type}...")
                     summary = await interest_summary_service.generate_summary(profile, gemini_api_key)
