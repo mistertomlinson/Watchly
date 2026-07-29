@@ -469,7 +469,48 @@ EXAMPLE:
                 params2 = {"query": name, "page": 1}
                 results2 = await self.tmdb_service.client.get(f"/search/{search_type}", params=params2)
                 items = results2.get("results", [])
-            return items[0] if items else None
+            if not items:
+                return None
+
+            # TMDB search is fuzzy and always returns *something*, so taking
+            # items[0] blindly meant a hallucinated or misremembered LLM title
+            # resolved to whatever was closest -- e.g. a BJJ tournament recording
+            # appearing among film recommendations. Require the result to actually
+            # resemble what was asked for.
+            def _norm(s: str) -> str:
+                return "".join(ch for ch in (s or "").lower() if ch.isalnum() or ch == " ").strip()
+
+            wanted = _norm(name)
+            wanted_words = set(wanted.split())
+            if not wanted_words:
+                return None
+
+            for item in items[:5]:
+                candidate = _norm(item.get("title") or item.get("name") or "")
+                if not candidate:
+                    continue
+                if candidate == wanted:
+                    return item
+                cand_words = set(candidate.split())
+                overlap = len(wanted_words & cand_words) / len(wanted_words)
+
+                # Full containment: every word of the query appears in the
+                # candidate. This is the long-subtitle case -- "Birds of Prey" vs
+                # "Birds of Prey (and the Fantabulous Emancipation of One Harley
+                # Quinn)" -- and a length guard wrongly rejected it.
+                if overlap == 1.0 and candidate.startswith(wanted):
+                    return item
+
+                # Otherwise accept a close match (punctuation, localised naming)
+                # but reject a coincidental one-word collision.
+                if overlap >= 0.7 and abs(len(cand_words) - len(wanted_words)) <= 3:
+                    return item
+
+            logger.debug(
+                f"[TopPicks] no confident TMDB match for {name!r} "
+                f"(best was {items[0].get('title') or items[0].get('name')!r})"
+            )
+            return None
         except Exception as e:
             logger.debug(f"Failed to resolve title {name}: {e}")
             return None
