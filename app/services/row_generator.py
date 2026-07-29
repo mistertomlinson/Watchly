@@ -305,6 +305,7 @@ class RowGeneratorService:
         content_type: str = "movie",
         api_key: str | None = None,
         token: str | None = None,
+        avoid_titles: set[str] | None = None,
     ) -> list[RowDefinition]:
         """
         Generate exactly 5 personalized catalog rows.
@@ -320,7 +321,9 @@ class RowGeneratorService:
         # 2. Try LLM generation if key is present
         if api_key:
             try:
-                llm_rows = await self._generate_rows_with_llm(profile, features, content_type, api_key)
+                llm_rows = await self._generate_rows_with_llm(
+                    profile, features, content_type, api_key, avoid_titles
+                )
                 if llm_rows:
                     logger.info(f"Generated {len(llm_rows)} LLM-driven rows for {content_type}")
                     await self._cache_llm_rows(token, content_type, llm_rows)
@@ -764,6 +767,7 @@ class RowGeneratorService:
         features: ExtractedFeatures,
         content_type: str,
         api_key: str,
+        avoid_titles: set[str] | None = None,
     ) -> list[RowDefinition] | None:
         """Generate rows from the user's interest summary; balance personalization with discovery."""
         try:
@@ -783,6 +787,14 @@ class RowGeneratorService:
                 "e.g. adjacent genres or topics they might not have tried yet. We will resolve keywords."
             )
 
+            avoid_clause = ""
+            if avoid_titles:
+                avoid_clause = (
+                    "\n\nALREADY USED — these exact titles are taken by another section of"
+                    " this catalogue. Do not reuse them and do not produce near-identical"
+                    f" variants: {', '.join(sorted(avoid_titles))}."
+                )
+
             prompt = (
                 "Using only the user's interest summary below, generate exactly 5 streaming collections for"
                 f" {content_type}. Use genres (required), keywords, and country when relevant.\n\nInterest"
@@ -800,6 +812,7 @@ class RowGeneratorService:
                 " of strings), country (string or null).\n- IMPORTANT: Keep combinations simple and achievable."
                 " Use max 2 genres and max 1-2 keywords per row. Do NOT combine 3+ niche constraints together"
                 " (e.g. avoid Documentary + dark comedy + anthology — too niche).\n- Output a JSON array of 5 objects."
+                + avoid_clause
             )
 
             data = await gemini_service.generate_structured_async(
