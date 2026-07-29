@@ -1,9 +1,15 @@
 import httpx
+import os
+
 from loguru import logger
 
 from app.core.config import settings
 
-DEFAULT_MODEL = "openrouter/auto"
+# "openrouter/auto" routes to PAID models and bills per token. "openrouter/free"
+# is OpenRouter's free-tier auto-router: it picks a currently-free model matching
+# the request's needs (including structured output), so this keeps working as
+# individual free models are retired. Override with OPENROUTER_MODEL to pin one.
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TIMEOUT = 60.0
@@ -14,7 +20,19 @@ TIMEOUT = 60.0
 # budget and returned 429 before the model ever ran. These are sized to the real
 # responses, with headroom.
 DEFAULT_MAX_TOKENS = 4000
-STRUCTURED_MAX_TOKENS = 1200  # a JSON array of ~5 themed rows
+# 1200 was sized for Groq, which counts the REQUESTED ceiling against a 12k
+# tokens-per-minute budget. OpenRouter meters requests, not tokens, so a higher
+# ceiling is free there -- and necessary: models that reason before answering
+# were spending the whole allowance thinking and returning finish_reason=length
+# with no content at all.
+# Groq meters the REQUESTED ceiling against a 12k tokens-per-minute budget, so a
+# large value there exhausts the quota before the model runs. OpenRouter meters
+# requests, not tokens, so headroom is free -- and needed, because models that
+# reason before answering otherwise spend the whole allowance thinking and return
+# finish_reason=length with no content.
+STRUCTURED_MAX_TOKENS_GROQ = 1200
+STRUCTURED_MAX_TOKENS_OPENROUTER = 8000
+STRUCTURED_MAX_TOKENS = STRUCTURED_MAX_TOKENS_OPENROUTER  # a JSON array of ~5 themed rows, plus reasoning headroom
 TITLE_MAX_TOKENS = 60         # a single 2-5 word catalog title
 
 
@@ -87,7 +105,26 @@ class OpenRouterService:
                     logger.error(f"OpenRouter API error {response.status_code}: {response.text[:500]}")
                     return ""
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                # Some models (reasoning models in particular) return a null
+                # content field and put their output elsewhere, or return an
+                # empty message with a finish_reason. Crashing on .strip() here
+                # surfaced as an opaque "unusable response" much further up.
+                choices = data.get("choices") or []
+                if not choices:
+                    logger.error(f"LLM response had no choices: {str(data)[:300]}")
+                    return ""
+                message = choices[0].get("message") or {}
+                content = message.get("content")
+                # NB: do NOT fall back to message["reasoning"] here. On reasoning
+                # models that field holds the chain-of-thought, not the answer, and
+                # it ends up rendered verbatim as a catalog row title.
+                if not content:
+                    logger.error(
+                        f"LLM returned empty content (model={data.get('model')}, "
+                        f"finish_reason={choices[0].get('finish_reason')})"
+                    )
+                    return ""
+                return content.strip()
         except Exception as e:
             logger.exception(f"OpenRouter API error: {e}")
             return ""
@@ -147,14 +184,14 @@ class OpenRouterService:
                 api_key=api_key,
                 model=GROQ_MODEL,
                 base_url=GROQ_BASE_URL,
-                max_tokens=STRUCTURED_MAX_TOKENS,
+                max_tokens=STRUCTURED_MAX_TOKENS_GROQ,
             )
         else:
             result = await self._call(
                 prompt=prompt,
                 system_instruction=structured_instruction,
                 api_key=api_key,
-                max_tokens=STRUCTURED_MAX_TOKENS,
+                max_tokens=STRUCTURED_MAX_TOKENS_OPENROUTER,
             )
         if not result:
             return None

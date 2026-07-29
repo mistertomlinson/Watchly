@@ -930,6 +930,17 @@ class RowGeneratorService:
                 api_key=api_key,
             )
 
+            if isinstance(data, list):
+                logger.info(
+                    f"[LLM Rows] model returned {len(data)} raw themes for {content_type}: "
+                    + "; ".join(
+                        f"{d.get('title', '?')}"
+                        f"[g={d.get('genres')} k={d.get('keywords')} c={d.get('country')}]"
+                        for d in data
+                        if isinstance(d, dict)
+                    )
+                )
+
             if not data or not isinstance(data, list):
                 # Previously returned silently, making an LLM/schema failure
                 # indistinguishable from "no key configured" -- both just fell through
@@ -972,6 +983,25 @@ class RowGeneratorService:
                         # Demote repeated anchor genres to FLAVOR
                         builder.add_axis(AXIS_GENRE, gid, AxisRole.FLAVOR)
 
+                # If every genre this row asked for was already anchored by an earlier
+                # row, the builder ends up with no anchor at all and build() returns
+                # None -- silently discarding the row. With a concentrated taste
+                # profile (sci-fi/crime/thriller) this killed 2 of every 5 themes.
+                # An overlapping discover pool is much better than a missing row:
+                # keywords and country still differentiate them, and AND semantics
+                # means the resulting queries are not actually the same.
+                if not row_anchor_genres and genre_ids:
+                    for gid in genre_ids:
+                        gid = int(gid)
+                        if gid in current_genre_map:
+                            builder.add_axis(AXIS_GENRE, gid, AxisRole.ANCHOR)
+                            row_anchor_genres.append(gid)
+                            logger.debug(
+                                f"[LLM Rows] '{title}' had no free anchor genre; "
+                                f"re-anchoring on {gid} to keep the row"
+                            )
+                            break
+
                 for kw_name in kw_names:
                     kid = await self._resolve_keyword_to_id(kw_name, profile_kw_map)
                     if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST and kid not in used_anchor_keywords:
@@ -989,6 +1019,10 @@ class RowGeneratorService:
                         a.value for a in row_comp.axes if a.name == AXIS_KEYWORD
                     )
 
+            logger.info(
+                f"[LLM Rows] {len(final_rows)} of {len(data)} themes survived processing "
+                f"for {content_type}"
+            )
             if final_rows:
                 final_rows = await self._repair_thin_rows(final_rows, features, content_type)
             return final_rows if final_rows else None
