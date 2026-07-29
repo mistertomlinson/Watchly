@@ -820,6 +820,41 @@ class RowGeneratorService:
 
         for row in rows:
             kw_axes = [a for a in row.axes if a.name == AXIS_KEYWORD]
+
+            # A row with a single genre and nothing else ("Mystery") is not a theme:
+            # it returns the same popular titles any generic list would. Give it a
+            # keyword from the profile so it says something specific.
+            if not kw_axes and len(row.axes) < 2:
+                for kid, _score in features.keywords:
+                    if kid in used_keywords or kid in GENERIC_KEYWORD_BLACKLIST:
+                        continue
+                    candidate = list(row.axes) + [
+                        RowAxis(name=AXIS_KEYWORD, value=kid, role=AxisRole.FLAVOR)
+                    ]
+                    if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
+                        kw_name = normalize_keyword(features.get_keyword_name(kid) or "")
+                        kw_name = RowComponents.KEYWORD_DISPLAY_OVERRIDES.get(
+                            kw_name.strip().lower(), kw_name
+                        )
+                        genre_names = [
+                            features.get_genre_name(a.value)
+                            for a in row.axes
+                            if a.name == AXIS_GENRE
+                        ]
+                        row.axes = candidate
+                        row.id = build_row_id(candidate)
+                        if kw_name:
+                            row.title = " ".join(
+                                p for p in ([kw_name] + genre_names[:1]) if p
+                            ) or row.title
+                        used_keywords.add(kid)
+                        logger.info(
+                            f"[RowRepair] under-specified row -> '{row.title}' "
+                            f"(added keyword {kid})"
+                        )
+                        break
+                continue
+
             if not kw_axes:
                 continue
 
@@ -856,8 +891,18 @@ class RowGeneratorService:
                     # Drop a keyword that just restates a genre, and keep the genre
                     # last so the title reads as a noun phrase:
                     # [Country] [Keyword] [Genre] -> "British Novel-Based Drama"
-                    if kw_name.strip().lower() in {g.strip().lower() for g in genre_names}:
+                    # Drop whichever side is redundant. An exact match means the
+                    # keyword adds nothing ("Dystopian" + "Dystopian"); a keyword
+                    # that CONTAINS the genre makes the genre redundant instead --
+                    # "true crime" + "Crime" was rendering as "True Crime Crime".
+                    kw_low = kw_name.strip().lower()
+                    genre_lows = {g.strip().lower() for g in genre_names}
+                    if kw_low in genre_lows:
                         kw_name = ""
+                    else:
+                        genre_names = [
+                            g for g in genre_names if g.strip().lower() not in kw_low.split()
+                        ]
                     row.axes = candidate
                     row.id = build_row_id(candidate)
                     row.title = (
@@ -871,16 +916,12 @@ class RowGeneratorService:
 
             # Step 2: keep the row, lose the keyword.
             if not repaired and non_kw:
-                genre_names = [
-                    features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
-                ]
-                country_names = [
-                    get_country_adjective(a.value) for a in non_kw if a.name == AXIS_COUNTRY
-                ]
+                # Keep the LLM's title. It was written to describe the genres as
+                # well as the keyword, so it still fits once the keyword is dropped
+                # -- and rebuilding from genres alone produced bland, mechanical
+                # names like "Drama Crime" that say nothing about the content.
                 row.axes = non_kw
                 row.id = build_row_id(non_kw)
-                if genre_names:
-                    row.title = " ".join(country_names[:1] + genre_names[:2])
                 logger.info(f"[RowRepair] dropped keyword axis -> '{row.title}'")
 
         return rows
