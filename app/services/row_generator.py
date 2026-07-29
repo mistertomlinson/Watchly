@@ -9,6 +9,7 @@ Generates 3 personalized catalog rows using a tiered sampling system:
 
 import asyncio
 import json
+import time
 import random
 from enum import Enum
 from typing import Any, ClassVar
@@ -323,6 +324,12 @@ class RowBuilder:
 # good deal smaller than this number.
 MIN_ROW_INVENTORY = 60
 
+# How long a generated row set stays usable before we spend LLM requests on a new
+# one. Rows were previously regenerated on every manifest rebuild (every 6h, per
+# content type, per profile), which is what exhausts free-tier quotas. A day gives
+# visibly fresh themes at 2 requests/day instead of 8+.
+ROW_SET_MAX_AGE_SECONDS = 86400
+
 # Keywords too semantically empty to define a row. IDs verified against the TMDB
 # keyword endpoint -- four of the original eight comments named the wrong keyword
 # ("based on true story" was actually 818 = based on novel or book, "philosophical"
@@ -371,6 +378,17 @@ class RowGeneratorService:
 
         # 2. Try LLM generation if key is present
         if api_key:
+            # Reuse a recent set rather than spending a request to regenerate one.
+            fresh = await self._get_cached_llm_rows(
+                token, content_type, max_age=ROW_SET_MAX_AGE_SECONDS
+            )
+            if fresh:
+                logger.info(
+                    f"Reusing {len(fresh)} cached LLM rows for {content_type} "
+                    "(under 24h old, no LLM request spent)"
+                )
+                return fresh
+
             try:
                 llm_rows = await self._generate_rows_with_llm(
                     profile, features, content_type, api_key, avoid_titles
@@ -440,12 +458,19 @@ class RowGeneratorService:
             return
         try:
             from app.services.redis_service import redis_service
-            payload = json.dumps([r.model_dump(mode="json") for r in rows])
+            payload = json.dumps(
+                {
+                    "generated_at": time.time(),
+                    "rows": [r.model_dump(mode="json") for r in rows],
+                }
+            )
             await redis_service.set(self._llm_rows_key(token, content_type), payload, 604800)
         except Exception as e:
             logger.debug(f"[LLM Rows] failed to cache rows: {e}")
 
-    async def _get_cached_llm_rows(self, token: str | None, content_type: str) -> list | None:
+    async def _get_cached_llm_rows(
+        self, token: str | None, content_type: str, max_age: float | None = None
+    ) -> list | None:
         """Return the last successful LLM row set, if one is stored."""
         if not token:
             return None
@@ -454,7 +479,19 @@ class RowGeneratorService:
             raw = await redis_service.get(self._llm_rows_key(token, content_type))
             if not raw:
                 return None
-            return [RowDefinition(**d) for d in json.loads(raw)]
+            data = json.loads(raw)
+            if isinstance(data, list):  # legacy format, no timestamp
+                return [RowDefinition(**d) for d in data]
+            rows = [RowDefinition(**d) for d in data.get("rows", [])]
+            if max_age is not None:
+                age = time.time() - float(data.get("generated_at", 0))
+                if age > max_age:
+                    logger.info(
+                        f"[LLM Rows] cached set for {content_type} is "
+                        f"{age / 3600:.1f}h old; regenerating"
+                    )
+                    return None
+            return rows
         except Exception as e:
             logger.debug(f"[LLM Rows] failed to read cached rows: {e}")
             return None
