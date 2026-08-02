@@ -23,6 +23,11 @@ from app.services.stremio.service import StremioBundle
 from app.services.trakt.service import TraktBundle
 from app.services.tmdb.service import get_tmdb_service
 from app.services.token_store import token_store
+from app.services.simkl_provider import (
+    SimklApiClient,
+    SimklAuthorizationError,
+    SimklLibraryProvider,
+)
 from app.services.user_cache import user_cache
 from app.utils.catalog import cache_profile_and_watched_sets
 
@@ -38,6 +43,23 @@ def shuffle_data_if_needed(
     if should_shuffle(user_settings, catalog_id):
         random.shuffle(data)
     return data
+
+
+def _provider_auth_error_catalog(
+    content_type: str,
+    message: str = "Simkl authorization expired. Reconnect Simkl in Watchly.",
+) -> dict[str, list[dict[str, Any]]]:
+    """Return a message-only card without a poster URL or browser action."""
+    return {
+        "metas": [
+            {
+                "id": "tt0000000",
+                "type": content_type,
+                "name": message,
+                "description": message,
+            }
+        ]
+    }
 
 
 def _clean_meta(meta: dict) -> dict | None:
@@ -125,6 +147,19 @@ class CatalogService:
                 detail="Invalid or expired token. Please reconfigure the addon.",
             )
 
+        # A confirmed provider authorization failure overrides both fresh and
+        # stale recommendation caches so the TV interface visibly reports it.
+        if (
+            credentials.get("auth_provider") == "simkl"
+            and credentials.get("provider_auth_error") == "simkl"
+        ):
+            headers["Cache-Control"] = "no-store, max-age=0"
+            message = credentials.get(
+                "provider_auth_error_message",
+                "Simkl authorization expired. Reconnect Simkl in Watchly.",
+            )
+            return _provider_auth_error_catalog(content_type, message), headers
+
         # Trigger lazy update if needed
         if settings.AUTO_UPDATE_CATALOGS:
             logger.info(f"[{redact_token(token)}...] Triggering auto update for token")
@@ -194,6 +229,20 @@ class CatalogService:
                         library_items = await trakt_bundle.library.get_library_items()
                     finally:
                         await trakt_bundle.close()
+                elif credentials.get("auth_provider") == "simkl":
+                    logger.info(
+                        f"[{redact_token(token)}...] Library items not cached, "
+                        "fetching from Simkl"
+                    )
+                    simkl_client = SimklApiClient(
+                        settings.SIMKL_CLIENT_ID, auth_key
+                    )
+                    try:
+                        library_items = await SimklLibraryProvider(
+                            simkl_client
+                        ).get_library_items()
+                    finally:
+                        await simkl_client.close()
                 else:
                     logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Stremio")
                     library_items = await bundle.library.get_library_items(auth_key)
@@ -288,6 +337,25 @@ class CatalogService:
 
             return data, headers
 
+        except SimklAuthorizationError as e:
+            logger.error(
+                f"[{redact_token(token)}...] Simkl authorization failure "
+                f"during catalog generation: {e}"
+            )
+            credentials["provider_auth_error"] = "simkl"
+            credentials["provider_auth_error_message"] = (
+                "Simkl authorization expired. Reconnect Simkl in Watchly."
+            )
+            try:
+                await token_store.update_user_data(token, credentials)
+            except Exception as persist_exc:
+                logger.error(
+                    f"[{redact_token(token)}...] Failed to persist Simkl "
+                    f"authorization error: {persist_exc}"
+                )
+            headers["Cache-Control"] = "no-store, max-age=0"
+            return _provider_auth_error_catalog(content_type), headers
+
         except Exception as e:
             logger.error(f"[{redact_token(token)}...] Failed to generate catalog: {e}")
 
@@ -340,6 +408,15 @@ class CatalogService:
 
     async def _resolve_auth(self, bundle: StremioBundle, credentials: dict, token: str) -> str:
         auth_key = credentials.get("authKey")
+
+        # Simkl accounts use a long-lived OAuth token and do not have a
+        # refresh token. The provider refresh path verifies it every six hours.
+        if credentials.get("auth_provider") == "simkl":
+            if not auth_key:
+                raise SimklAuthorizationError(
+                    "Missing Simkl authorization token"
+                )
+            return auth_key
 
         # Trakt accounts use a Trakt access token stored as authKey.
         # Skip Stremio session validation entirely for these accounts.

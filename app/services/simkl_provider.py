@@ -9,6 +9,14 @@ from loguru import logger
 from app.services.library_provider import add_rated_item, empty_library, make_library_item
 
 
+class SimklAuthorizationError(RuntimeError):
+    """The stored Simkl OAuth token was rejected and must be reauthorized."""
+
+
+class SimklProviderError(RuntimeError):
+    """A non-authorization Simkl failure occurred."""
+
+
 class SimklApiClient:
     """Authenticated Simkl client for user-library endpoints."""
 
@@ -32,7 +40,14 @@ class SimklApiClient:
 
     async def get(self, path: str, **params: Any) -> Any:
         response = await self.client.get(path, params={k: v for k, v in params.items() if v is not None})
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if response.status_code in {401, 403}:
+                raise SimklAuthorizationError(
+                    "Simkl authorization is no longer valid"
+                ) from exc
+            raise
         return response.json()
 
     async def get_user(self) -> dict[str, Any]:
@@ -104,9 +119,13 @@ class SimklLibraryProvider:
                 len(library["added"]),
             )
             return library
+        except SimklAuthorizationError:
+            raise
         except Exception as exc:
             logger.exception(f"[Simkl] Failed to get library items: {exc}")
-            return empty_library()
+            raise SimklProviderError(
+                "Simkl library request failed"
+            ) from exc
 
     @staticmethod
     def _extract_entries(payload: Any, *keys: str) -> list[dict[str, Any]]:
