@@ -284,9 +284,18 @@ function showStatus(name) {
     const display = document.getElementById('simklStatusDisplay');
     const avatar = document.getElementById('simklStatusAvatar');
     const connect = document.getElementById('simklConnectBtn');
-    if (display) display.textContent = name;
-    if (avatar) avatar.textContent = name.slice(0, 2).toUpperCase();
-    status?.classList.remove('hidden'); connect?.classList.add('hidden');
+
+    const rawName = String(name || '').trim();
+    const visibleName = !rawName || /^\\d+$/.test(rawName) ? 'Simkl User' : rawName;
+    const words = visibleName.split(/\\s+/).filter(Boolean);
+    const initials = visibleName === 'Simkl User'
+        ? 'S'
+        : words.slice(0, 2).map(word => word[0]).join('').toUpperCase();
+
+    if (display) display.textContent = visibleName;
+    if (avatar) avatar.textContent = initials || 'S';
+    status?.classList.remove('hidden');
+    connect?.classList.add('hidden');
     switchTab('simkl');
 }
 

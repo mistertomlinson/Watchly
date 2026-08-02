@@ -125,10 +125,52 @@ async def _identity(access_token: str) -> tuple[str, str, dict[str, Any]]:
         user = await client.get_user()
     finally:
         await client.close()
-    account = user.get("account") if isinstance(user.get("account"), dict) else user
-    username = str(account.get("username") or account.get("name") or account.get("id") or "simkl_user")
-    user_id = f"simkl:{username}"
-    return user_id, username, user
+    account = user.get("account") if isinstance(user.get("account"), dict) else {}
+    profile = user.get("user") if isinstance(user.get("user"), dict) else {}
+    public_profile = user.get("profile") if isinstance(user.get("profile"), dict) else {}
+
+    # Preserve Simkl's stable account ID internally while locating the public
+    # display name in any of the profile containers returned by /users/settings.
+    stable_id = str(
+        account.get("id")
+        or profile.get("id")
+        or public_profile.get("id")
+        or user.get("id")
+        or account.get("username")
+        or profile.get("username")
+        or public_profile.get("username")
+        or user.get("username")
+        or "simkl_user"
+    )
+
+    containers = [profile, public_profile, account, user]
+    for container in list(containers):
+        for nested_key in ("user", "profile", "account"):
+            nested = container.get(nested_key)
+            if isinstance(nested, dict) and nested not in containers:
+                containers.append(nested)
+
+    display_name = "Simkl User"
+    for field in ("name", "username", "nickname", "display_name", "login"):
+        for container in containers:
+            value = container.get(field)
+            candidate = str(value).strip() if value is not None else ""
+            if candidate and not candidate.isdigit():
+                display_name = candidate
+                break
+        if display_name != "Simkl User":
+            break
+
+    if display_name == "Simkl User":
+        logger.info(
+            "Simkl profile did not expose a readable name; "
+            f"top-level keys={sorted(user.keys())}, "
+            f"account keys={sorted(account.keys())}, "
+            f"user-profile keys={sorted(profile.keys())}"
+        )
+
+    user_id = f"simkl:{stable_id}"
+    return user_id, display_name, user
 
 
 @router.post("/identity")
@@ -142,7 +184,7 @@ async def simkl_identity(payload: SimklTokenRequest):
     response: dict[str, Any] = {
         "user_id": user_id,
         "username": username,
-        "display": user.get("name") or username,
+        "display": username,
         "exists": bool(user_data),
     }
     if user_data:
