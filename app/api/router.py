@@ -5,6 +5,7 @@ from .endpoints.catalogs import router as catalogs_router
 from .endpoints.health import router as health_router
 from .endpoints.manifest import router as manifest_router
 from .endpoints.meta import router as meta_router
+from .endpoints.simkl import router as simkl_router
 from .endpoints.stats import router as stats_router
 from .endpoints.tokens import router as tokens_router
 from .endpoints.trakt import router as trakt_router
@@ -22,6 +23,7 @@ api_router.include_router(manifest_router)
 api_router.include_router(catalogs_router)
 api_router.include_router(tokens_router)
 api_router.include_router(trakt_router)
+api_router.include_router(simkl_router)
 api_router.include_router(health_router)
 api_router.include_router(meta_router)
 api_router.include_router(announcement_router)
