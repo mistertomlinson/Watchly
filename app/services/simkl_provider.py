@@ -39,13 +39,13 @@ class SimklApiClient:
         data = await self.get("/users/settings")
         return data if isinstance(data, dict) else {}
 
-    async def get_all_items(self, media_type: str) -> dict[str, Any]:
-        data = await self.get(
+    async def get_all_items(self, media_type: str) -> Any:
+        # Simkl documents these path values as movie, tv, and anime.
+        return await self.get(
             f"/sync/all-items/{media_type}",
             extended="full",
             episode_watched_at="yes",
         )
-        return data if isinstance(data, dict) else {}
 
 
 class SimklLibraryProvider:
@@ -58,8 +58,8 @@ class SimklLibraryProvider:
         library = empty_library()
         try:
             movies_payload, shows_payload, anime_payload = await asyncio.gather(
-                self.client.get_all_items("movies"),
-                self.client.get_all_items("shows"),
+                self.client.get_all_items("movie"),
+                self.client.get_all_items("tv"),
                 self.client.get_all_items("anime"),
             )
 
@@ -69,37 +69,34 @@ class SimklLibraryProvider:
 
             self._consume_entries(
                 library,
-                movies_payload.get("movies", []),
+                self._extract_entries(movies_payload, "movies"),
                 content_type="movie",
-                media_key="movie",
+                media_keys=("movie",),
                 seen_watched=seen_watched,
                 seen_rated=seen_rated,
                 seen_added=seen_added,
             )
             self._consume_entries(
                 library,
-                shows_payload.get("shows", []),
+                self._extract_entries(shows_payload, "shows", "tv"),
                 content_type="series",
-                media_key="show",
+                media_keys=("show", "tv"),
                 seen_watched=seen_watched,
                 seen_rated=seen_rated,
                 seen_added=seen_added,
             )
-            # Anime uses the same Watchly series pipeline. Movie/special anime may
-            # still be normalized as series because Watchly currently exposes only
-            # movie and series content types.
             self._consume_entries(
                 library,
-                anime_payload.get("anime", []),
+                self._extract_entries(anime_payload, "anime"),
                 content_type="series",
-                media_key="show",
+                media_keys=("show", "anime"),
                 seen_watched=seen_watched,
                 seen_rated=seen_rated,
                 seen_added=seen_added,
             )
 
             logger.info(
-                "[Simkl] library: %d watched, %d loved, %d liked, %d disliked, %d added",
+                "[Simkl] library: {} watched, {} loved, {} liked, {} disliked, {} added",
                 len(library["watched"]),
                 len(library["loved"]),
                 len(library["liked"]),
@@ -111,30 +108,62 @@ class SimklLibraryProvider:
             logger.exception(f"[Simkl] Failed to get library items: {exc}")
             return empty_library()
 
+    @staticmethod
+    def _extract_entries(payload: Any, *keys: str) -> list[dict[str, Any]]:
+        """Accept Simkl's list response and older/object-wrapped response shapes."""
+        if isinstance(payload, list):
+            return [entry for entry in payload if isinstance(entry, dict)]
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return [entry for entry in value if isinstance(entry, dict)]
+            # Some API responses group entries by status.
+            grouped: list[dict[str, Any]] = []
+            for value in payload.values():
+                if isinstance(value, list):
+                    grouped.extend(entry for entry in value if isinstance(entry, dict))
+            return grouped
+        return []
+
     def _consume_entries(
         self,
         library: dict[str, list[dict[str, Any]]],
         entries: list[dict[str, Any]],
         *,
         content_type: str,
-        media_key: str,
+        media_keys: tuple[str, ...],
         seen_watched: set[str],
         seen_rated: set[str],
         seen_added: set[str],
     ) -> None:
         for raw in entries:
-            media = raw.get(media_key) or {}
-            ids = media.get("ids") or {}
-            status = str(raw.get("status") or "").lower()
-            rating = self._coerce_rating(raw.get("user_rating"))
-            watched_at = raw.get("last_watched_at") or raw.get("watched_date")
-            watched_count = raw.get("watched_episodes_count") or (1 if watched_at or status == "completed" else 0)
+            media = self._find_media(raw, media_keys)
+            ids = media.get("ids") or raw.get("ids") or {}
+            status = str(raw.get("status") or raw.get("list") or "").lower().replace("_", "").replace(" ", "")
+            rating = self._coerce_rating(
+                raw.get("user_rating")
+                or raw.get("rating")
+                or (raw.get("ratings") or {}).get("user")
+            )
+            watched_at = (
+                raw.get("last_watched_at")
+                or raw.get("watched_at")
+                or raw.get("watched_date")
+                or raw.get("last_watched")
+            )
+            watched_count = (
+                raw.get("watched_episodes_count")
+                or raw.get("episodes_watched")
+                or raw.get("plays")
+                or (1 if watched_at or status == "completed" else 0)
+            )
 
             item = make_library_item(
                 ids=ids,
                 content_type=content_type,
-                title=media.get("title") or "",
-                year=media.get("year"),
+                title=media.get("title") or media.get("name") or raw.get("title") or "",
+                year=media.get("year") or raw.get("year"),
                 provider="simkl",
                 watched_at=watched_at,
                 plays=max(int(watched_count or 0), 1),
@@ -145,8 +174,14 @@ class SimklLibraryProvider:
                 continue
 
             item_id = item["_id"]
-            is_watched = bool(watched_at or watched_count or status in {"watching", "completed", "hold", "dropped"})
-            is_added = status in {"plantowatch", "watching", "completed", "hold", "dropped"}
+            is_watched = bool(
+                watched_at
+                or watched_count
+                or status in {"watching", "completed", "hold", "onhold", "dropped"}
+            )
+            is_added = status in {
+                "plantowatch", "planning", "watching", "completed", "hold", "onhold", "dropped"
+            }
 
             if is_watched and item_id not in seen_watched:
                 seen_watched.add(item_id)
@@ -159,6 +194,14 @@ class SimklLibraryProvider:
             if is_added and item_id not in seen_added:
                 seen_added.add(item_id)
                 library["added"].append(item)
+
+    @staticmethod
+    def _find_media(raw: dict[str, Any], media_keys: tuple[str, ...]) -> dict[str, Any]:
+        for key in media_keys:
+            value = raw.get(key)
+            if isinstance(value, dict):
+                return value
+        return raw
 
     @staticmethod
     def _coerce_rating(value: Any) -> int | None:
