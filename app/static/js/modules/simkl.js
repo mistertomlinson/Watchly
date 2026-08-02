@@ -49,6 +49,10 @@ function clearSimklStorage() {
     try { localStorage.removeItem(SIMKL_STORAGE_KEY); } catch (e) { }
 }
 
+function selectedProvider() {
+    try { return localStorage.getItem('watchly_login_tab') || 'stremio'; } catch (e) { return 'stremio'; }
+}
+
 function injectSimklUi() {
     if (document.getElementById('tabSimkl')) return;
 
@@ -124,7 +128,9 @@ function initializeConnectButton() {
             if (!response.ok) throw new Error(body.detail || 'Failed to start Simkl authorization');
             const auth = await openPopup(body.url);
             const identity = await fetchIdentity(auth);
+            try { localStorage.removeItem('watchly_trakt_auth'); } catch (e) { }
             saveAuth(auth);
+            switchTab('simkl');
             showStatus(identity.display || identity.username || 'Simkl User');
             if (identity.exists && identity.settings) populateSettings(identity.settings);
             unlockNavigation();
@@ -178,7 +184,7 @@ async function fetchIdentity(auth) {
 
 async function attemptAutoLogin() {
     const auth = getStoredAuth();
-    if (!auth?.access_token) return;
+    if (!auth?.access_token || selectedProvider() !== 'simkl') return;
     try {
         const identity = await fetchIdentity(auth);
         showStatus(identity.display || identity.username || 'Simkl User');
@@ -195,7 +201,7 @@ function initializeSubmitOverride() {
     if (!submit) return;
     submit.addEventListener('click', async event => {
         const auth = getStoredAuth();
-        if (!auth?.access_token) return;
+        if (!auth?.access_token || selectedProvider() !== 'simkl') return;
         event.preventDefault();
         event.stopImmediatePropagation();
         await submitSimkl(auth, submit);
