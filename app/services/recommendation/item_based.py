@@ -27,6 +27,29 @@ class ItemBasedService:
         self.tmdb_service: TMDBService = tmdb_service
         self.user_settings = user_settings
 
+    @staticmethod
+    def _deduplicate_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove repeated recommendation entries while preserving source order."""
+        unique: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
+
+        for item in items:
+            item_id = item.get("id") or item.get("_id")
+
+            # Items without an identifier cannot be safely compared. Preserve them;
+            # later metadata validation can decide whether they are usable.
+            if item_id is None:
+                unique.append(item)
+                continue
+
+            if item_id in seen_ids:
+                continue
+
+            seen_ids.add(item_id)
+            unique.append(item)
+
+        return unique
+
     async def get_recommendations_for_item(
         self,
         item_id: str,
@@ -64,6 +87,7 @@ class ItemBasedService:
                 item_id, content_type, library_items, gemini_api_key, limit
             )
             if len(gemini_results) >= limit // 2:
+                gemini_results = self._deduplicate_candidates(gemini_results)
                 logger.info(f"Using Gemini recommendations for {item_id}: {len(gemini_results)} results")
                 return gemini_results
             logger.info(f"Gemini returned only {len(gemini_results)} for {item_id}, falling back to TMDB")
@@ -84,8 +108,9 @@ class ItemBasedService:
         simkl_candidates, candidates = await asyncio.gather(*tasks)
 
 
-        # extend candidates always include simkl candidates
-        candidates = simkl_candidates + candidates
+        # Include Simkl candidates first, then remove duplicates both within
+        # Simkl results and across the Simkl/TMDB result sets.
+        candidates = self._deduplicate_candidates(simkl_candidates + candidates)
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
@@ -102,7 +127,9 @@ class ItemBasedService:
         # Apply year and popularity filters from user settings
         final = filter_items_by_settings(final, self.user_settings)
 
-        return final
+        # Defensive final pass after metadata resolution. Different upstream
+        # records can occasionally resolve to the same IMDb/Stremio item.
+        return self._deduplicate_candidates(final)
 
     async def _fetch_gemini_item_recommendations(
         self,
