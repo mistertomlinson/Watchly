@@ -1,3 +1,4 @@
+import asyncio
 import random
 import re
 import time
@@ -106,9 +107,57 @@ def _clean_meta(meta: dict) -> dict | None:
 
 class CatalogService:
     def __init__(self):
-        pass
+        self._inflight_catalogs: dict[
+            tuple[str, str, str],
+            asyncio.Task,
+        ] = {}
+
+    def _clear_inflight_catalog(
+        self,
+        key: tuple[str, str, str],
+        task: asyncio.Task,
+    ) -> None:
+        if self._inflight_catalogs.get(key) is task:
+            self._inflight_catalogs.pop(key, None)
 
     async def get_catalog(
+        self, token: str, content_type: str, catalog_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        key = (token, content_type, catalog_id)
+        task = self._inflight_catalogs.get(key)
+
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._get_catalog_impl(
+                    token,
+                    content_type,
+                    catalog_id,
+                ),
+                name=(
+                    "watchly-catalog-"
+                    f"{content_type}-{catalog_id}"
+                ),
+            )
+            self._inflight_catalogs[key] = task
+            task.add_done_callback(
+                lambda completed, catalog_key=key:
+                    self._clear_inflight_catalog(
+                        catalog_key,
+                        completed,
+                    )
+            )
+        else:
+            logger.info(
+                f"[{redact_token(token)}...] "
+                "Joining in-flight catalog build for "
+                f"{content_type}/{catalog_id}"
+            )
+
+        # A disconnected client may cancel its own wait, but it must not
+        # cancel the shared build that another request is awaiting.
+        return await asyncio.shield(task)
+
+    async def _get_catalog_impl(
         self, token: str, content_type: str, catalog_id: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """

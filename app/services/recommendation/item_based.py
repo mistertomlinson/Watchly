@@ -206,24 +206,77 @@ RESPONSE FORMAT (one per line, no other text):
                 return []
 
             candidates = []
-            lines = [l.strip() for l in response.strip().splitlines() if l.strip() and "|" in l]
-            resolve_tasks = []
-            for line in lines:
-                parts = line.split("|")
-                if len(parts) >= 3:
-                    name, year = parts[1].strip(), parts[2].strip()[:4]
-                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-                    resolve_tasks.append(self._resolve_title(name, year, mtype))
-                elif len(parts) == 2:
-                    name, year = parts[0].strip(), parts[1].strip()[:4]
-                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-                    resolve_tasks.append(self._resolve_title(name, year, mtype))
+            raw_lines = [
+                line.strip()
+                for line in response.strip().splitlines()
+                if line.strip() and "|" in line
+            ]
 
-            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
-            logger.info(f"Gemini raw lines for {seed_title}: {lines[:5]}")
+            parsed_titles: list[tuple[str, str]] = []
+            seen_title_years: set[tuple[str, str]] = set()
+
+            for line in raw_lines:
+                parts = line.split("|")
+
+                if len(parts) >= 3:
+                    name = parts[1].strip()
+                    year = parts[2].strip()[:4]
+                elif len(parts) == 2:
+                    name = parts[0].strip()
+                    year = parts[1].strip()[:4]
+                else:
+                    continue
+
+                name = re.sub(
+                    r'\s*\(\d{4}\)\s*$',
+                    '',
+                    name,
+                ).strip()
+
+                if not name:
+                    continue
+
+                title_year_key = (
+                    name.casefold(),
+                    year,
+                )
+
+                if title_year_key in seen_title_years:
+                    continue
+
+                seen_title_years.add(title_year_key)
+                parsed_titles.append((name, year))
+
+                if len(parsed_titles) >= gemini_limit:
+                    break
+
+            logger.info(
+                f"Gemini item recs for {seed_title}: "
+                f"accepted {len(parsed_titles)} unique lines "
+                f"from {len(raw_lines)} raw lines "
+                f"(cap={gemini_limit})"
+            )
+
+            resolve_tasks = [
+                self._resolve_title(name, year, mtype)
+                for name, year in parsed_titles
+            ]
+
+            results = await asyncio.gather(
+                *resolve_tasks,
+                return_exceptions=True,
+            )
+            logger.info(
+                f"Gemini raw lines for {seed_title}: "
+                f"{raw_lines[:5]}"
+            )
             for result in results:
                 if isinstance(result, dict) and result.get("id"):
                     candidates.append(result)
+
+            candidates = self._deduplicate_candidates(
+                candidates
+            )[:gemini_limit]
 
             # Enrich with IMDB IDs and full metadata
             enriched = await RecommendationMetadata.fetch_batch(
