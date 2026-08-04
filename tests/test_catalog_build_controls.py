@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.services.openrouter import RECOMMENDATION_MAX_TOKENS
 from app.services.recommendation import item_based as item_based_module
 from app.services.recommendation.catalog_service import CatalogService
 from app.services.recommendation.item_based import ItemBasedService
@@ -121,6 +122,7 @@ async def test_gemini_output_is_deduplicated_and_hard_capped_before_tmdb_enrichm
     )
 
     gemini_response = "\n".join(raw_lines)
+    llm_mock = AsyncMock(return_value=gemini_response)
 
     async def fake_fetch_batch(
         tmdb_service,
@@ -139,7 +141,7 @@ async def test_gemini_output_is_deduplicated_and_hard_capped_before_tmdb_enrichm
         patch.object(
             item_based_module.gemini_service,
             "generate_flash_content_async",
-            new=AsyncMock(return_value=gemini_response),
+            new=llm_mock,
         ),
         patch.object(
             item_based_module.RecommendationMetadata,
@@ -159,6 +161,11 @@ async def test_gemini_output_is_deduplicated_and_hard_capped_before_tmdb_enrichm
             gemini_api_key="test-key",
             limit=20,
         )
+
+    assert (
+        llm_mock.await_args.kwargs["max_tokens"]
+        == RECOMMENDATION_MAX_TOKENS
+    )
 
     # limit=20 means the Gemini parsing cap is limit * 3 = 60.
     assert len(resolved_titles) == 60

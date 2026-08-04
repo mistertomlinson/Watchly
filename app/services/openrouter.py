@@ -1,5 +1,7 @@
-import httpx
 import os
+import time
+
+import httpx
 
 from loguru import logger
 
@@ -9,7 +11,11 @@ from app.core.config import settings
 # is OpenRouter's free-tier auto-router: it picks a currently-free model matching
 # the request's needs (including structured output), so this keeps working as
 # individual free models are retired. Override with OPENROUTER_MODEL to pin one.
-DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+DEFAULT_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "google/gemma-3-27b-it:free",
+)
+OPENROUTER_FREE_FALLBACK_MODEL = "openrouter/free"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 TIMEOUT = 60.0
@@ -20,6 +26,9 @@ TIMEOUT = 60.0
 # budget and returned 429 before the model ever ran. These are sized to the real
 # responses, with headroom.
 DEFAULT_MAX_TOKENS = 4000
+# Recommendation responses are plain pipe-delimited title lists. This ceiling
+# prevents malformed or repetitive output from delaying catalog completion.
+RECOMMENDATION_MAX_TOKENS = 1200
 # 1200 was sized for Groq, which counts the REQUESTED ceiling against a 12k
 # tokens-per-minute budget. OpenRouter meters requests, not tokens, so a higher
 # ceiling is free there -- and necessary: models that reason before answering
@@ -34,6 +43,19 @@ STRUCTURED_MAX_TOKENS_GROQ = 1200
 STRUCTURED_MAX_TOKENS_OPENROUTER = 8000
 STRUCTURED_MAX_TOKENS = STRUCTURED_MAX_TOKENS_OPENROUTER  # a JSON array of ~5 themed rows, plus reasoning headroom
 TITLE_MAX_TOKENS = 60         # a single 2-5 word catalog title
+
+
+def ordered_openrouter_models(
+    primary_model: str = DEFAULT_MODEL,
+) -> list[str]:
+    """Return the configured primary model followed by the free router."""
+    if primary_model == OPENROUTER_FREE_FALLBACK_MODEL:
+        return [primary_model]
+
+    return [
+        primary_model,
+        OPENROUTER_FREE_FALLBACK_MODEL,
+    ]
 
 
 class OpenRouterService:
@@ -73,6 +95,7 @@ class OpenRouterService:
         model: str = DEFAULT_MODEL,
         base_url: str | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        models: list[str] | None = None,
     ) -> str:
         key = self._get_api_key(api_key)
         if not key:
@@ -80,14 +103,22 @@ class OpenRouterService:
             return ""
 
         effective_base_url = base_url or self.base_url
+        requested_models = models or [model]
+
         payload = {
-            "model": model,
             "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt},
             ],
         }
+
+        if models:
+            payload["models"] = models
+        else:
+            payload["model"] = model
+
+        started_at = time.monotonic()
 
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -124,17 +155,47 @@ class OpenRouterService:
                         f"finish_reason={choices[0].get('finish_reason')})"
                     )
                     return ""
+
+                elapsed = time.monotonic() - started_at
+                logger.info(
+                    "LLM call completed "
+                    f"requested_models={','.join(requested_models)} "
+                    f"resolved_model={data.get('model') or model} "
+                    f"finish_reason={choices[0].get('finish_reason')} "
+                    f"duration={elapsed:.2f}s "
+                    f"max_tokens={max_tokens} "
+                    f"content_chars={len(content)}"
+                )
+
                 return content.strip()
         except Exception as e:
             logger.exception(f"OpenRouter API error: {e}")
             return ""
 
-    async def generate_content_async(self, prompt: str) -> str:
-        """Used for catalog title generation (uses server-side key)."""
+    async def generate_content_async(
+        self,
+        prompt: str,
+        api_key: str | None = None,
+    ) -> str:
+        """Generate a catalog title using BYOK when supplied."""
+        key = self._get_api_key(api_key)
+
+        if key and key.startswith("gsk_"):
+            return await self._call(
+                prompt=prompt,
+                system_instruction=self.get_catalog_title_prompt(),
+                api_key=api_key,
+                model=GROQ_MODEL,
+                base_url=GROQ_BASE_URL,
+                max_tokens=TITLE_MAX_TOKENS,
+            )
+
         return await self._call(
             prompt=prompt,
             system_instruction=self.get_catalog_title_prompt(),
+            api_key=api_key,
             max_tokens=TITLE_MAX_TOKENS,
+            models=ordered_openrouter_models(),
         )
 
     async def generate_flash_content_async(
@@ -142,9 +203,9 @@ class OpenRouterService:
         prompt: str,
         system_instruction: str,
         api_key: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> str:
-        """Used for recommendations and interest summaries (uses user key)."""
-        # If key looks like a Groq key, use Groq API
+        """Used for recommendations and interest summaries with BYOK."""
         if api_key and api_key.startswith("gsk_"):
             return await self._call(
                 prompt=prompt,
@@ -152,11 +213,15 @@ class OpenRouterService:
                 api_key=api_key,
                 model=GROQ_MODEL,
                 base_url=GROQ_BASE_URL,
+                max_tokens=max_tokens,
             )
+
         return await self._call(
             prompt=prompt,
             system_instruction=system_instruction,
             api_key=api_key,
+            max_tokens=max_tokens,
+            models=ordered_openrouter_models(),
         )
 
     async def generate_structured_async(
@@ -192,6 +257,7 @@ class OpenRouterService:
                 system_instruction=structured_instruction,
                 api_key=api_key,
                 max_tokens=STRUCTURED_MAX_TOKENS_OPENROUTER,
+                models=ordered_openrouter_models(),
             )
         if not result:
             return None

@@ -1,4 +1,7 @@
-from app.services.openrouter import gemini_service
+from app.services.openrouter import (
+    RECOMMENDATION_MAX_TOKENS,
+    gemini_service,
+)
 import asyncio
 import re
 from typing import Any
@@ -200,6 +203,7 @@ RESPONSE FORMAT (one per line, no other text):
                 prompt=prompt,
                 system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
                 api_key=gemini_api_key,
+                max_tokens=RECOMMENDATION_MAX_TOKENS,
             )
 
             if not response:

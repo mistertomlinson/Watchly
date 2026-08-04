@@ -25,7 +25,10 @@ from app.services.recommendation.utils import (
     resolve_tmdb_id,
 )
 from app.services.scoring import ScoringService
-from app.services.openrouter import gemini_service
+from app.services.openrouter import (
+    RECOMMENDATION_MAX_TOKENS,
+    gemini_service,
+)
 from app.services.simkl import simkl_service
 from app.services.tmdb.service import TMDBService
 
@@ -411,6 +414,7 @@ EXAMPLE:
                 prompt=prompt,
                 system_instruction=f"You are a personalized {content_type} recommendation expert. Return ONLY the pipe-separated list, no explanations.",
                 api_key=gemini_api_key,
+                max_tokens=RECOMMENDATION_MAX_TOKENS,
             )
 
             if not response:

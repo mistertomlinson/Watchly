@@ -733,13 +733,24 @@ class RowGeneratorService:
         return t or title
 
     async def _generate_titles(self, rows_data: list[RowComponents]) -> list[RowDefinition]:
-        """Generate titles for tiered sampling rows via server's default Gemini model."""
+        """Generate titles using the user's BYOK key when configured."""
         if not rows_data:
             return []
 
-        # Build prompts and fire Gemini requests (uses server key + default model)
+        api_key = (
+            getattr(self.user_settings, "openrouter_api_key", None)
+            if self.user_settings
+            else None
+        )
+
         prompts = [row.build_prompt() for row in rows_data]
-        gemini_tasks = [gemini_service.generate_content_async(p) for p in prompts]
+        gemini_tasks = [
+            gemini_service.generate_content_async(
+                prompt,
+                api_key=api_key,
+            )
+            for prompt in prompts
+        ]
         results = await asyncio.gather(*gemini_tasks, return_exceptions=True)
 
         final_rows = []
