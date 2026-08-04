@@ -415,6 +415,7 @@ EXAMPLE:
                 system_instruction=f"You are a personalized {content_type} recommendation expert. Return ONLY the pipe-separated list, no explanations.",
                 api_key=gemini_api_key,
                 max_tokens=RECOMMENDATION_MAX_TOKENS,
+                minimum_pipe_lines=5,
             )
 
             if not response:

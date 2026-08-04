@@ -204,6 +204,7 @@ RESPONSE FORMAT (one per line, no other text):
                 system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
                 api_key=gemini_api_key,
                 max_tokens=RECOMMENDATION_MAX_TOKENS,
+                minimum_pipe_lines=5,
             )
 
             if not response:
