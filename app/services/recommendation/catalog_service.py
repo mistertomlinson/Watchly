@@ -105,6 +105,9 @@ def _clean_meta(meta: dict) -> dict | None:
     return cleaned
 
 
+BACKGROUND_CATALOG_REFRESH_LIMIT = 2
+
+
 class CatalogService:
     def __init__(self):
         self._inflight_catalogs: dict[
@@ -118,6 +121,9 @@ class CatalogService:
             tuple[str, str, str],
             asyncio.Task,
         ] = {}
+        self._background_catalog_refresh_semaphore = asyncio.Semaphore(
+            BACKGROUND_CATALOG_REFRESH_LIMIT
+        )
 
     def _clear_inflight_catalog(
         self,
@@ -150,6 +156,28 @@ class CatalogService:
                 f"{key[1]}/{key[2]}: {exc}"
             )
 
+    async def _run_background_catalog_refresh(
+        self,
+        token: str,
+        content_type: str,
+        catalog_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Published catalogs have already been returned to the client before
+        # reaching this queue. Bounding replacement work prevents a cold Home
+        # refresh from fanning every dirty row into TMDB simultaneously.
+        async with self._background_catalog_refresh_semaphore:
+            logger.info(
+                f"[{redact_token(token)}...] "
+                "Running queued background catalog refresh for "
+                f"{content_type}/{catalog_id}"
+            )
+            return await self._get_catalog_impl(
+                token,
+                content_type,
+                catalog_id,
+                force_refresh=True,
+            )
+
     def _schedule_background_catalog_refresh(
         self,
         token: str,
@@ -168,11 +196,10 @@ class CatalogService:
             return
 
         task = asyncio.create_task(
-            self._get_catalog_impl(
+            self._run_background_catalog_refresh(
                 token,
                 content_type,
                 catalog_id,
-                force_refresh=True,
             ),
             name=f"watchly-catalog-refresh-{content_type}-{catalog_id}",
         )

@@ -2,13 +2,17 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
+from app.core import base_client as base_client_module
+from app.core.base_client import BaseClient
 from app.services.openrouter import RECOMMENDATION_MAX_TOKENS
 from app.services.recommendation import catalog_service as catalog_service_module
 from app.services.recommendation import item_based as item_based_module
 from app.services.recommendation.catalog_service import CatalogService
 from app.services.recommendation.item_based import ItemBasedService
+from app.services.tmdb import client as tmdb_client_module
 
 
 @pytest.mark.asyncio
@@ -569,3 +573,146 @@ async def test_current_background_build_publishes_persistent_snapshot_with_sourc
         ttl=None,
         source_revision=100,
     )
+
+
+
+@pytest.mark.asyncio
+async def test_background_catalog_refreshes_are_bounded():
+    service = CatalogService()
+
+    release_builds = asyncio.Event()
+    two_started = asyncio.Event()
+    started = []
+    active = 0
+    max_active = 0
+
+    async def fake_get_catalog_impl(
+        token,
+        content_type,
+        catalog_id,
+        force_refresh=False,
+    ):
+        nonlocal active, max_active
+
+        active += 1
+        max_active = max(max_active, active)
+        started.append((token, content_type, catalog_id, force_refresh))
+
+        if active == catalog_service_module.BACKGROUND_CATALOG_REFRESH_LIMIT:
+            two_started.set()
+
+        try:
+            await release_builds.wait()
+        finally:
+            active -= 1
+
+        return ({"metas": []}, {})
+
+    service._get_catalog_impl = fake_get_catalog_impl
+
+    for index in range(3):
+        service._schedule_background_catalog_refresh(
+            "profile-one-token",
+            "movie",
+            f"watchly.theme.test-{index}",
+        )
+
+    await asyncio.wait_for(two_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert len(started) == 2
+    assert max_active == catalog_service_module.BACKGROUND_CATALOG_REFRESH_LIMIT
+    assert len(service._background_catalog_refreshes) == 3
+
+    release_builds.set()
+
+    tasks = list(service._background_catalog_refreshes.values())
+    await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+
+    assert len(started) == 3
+    assert max_active == catalog_service_module.BACKGROUND_CATALOG_REFRESH_LIMIT
+    assert service._background_catalog_refreshes == {}
+
+
+@pytest.mark.asyncio
+async def test_tmdb_rate_gate_waits_when_window_is_full():
+    tmdb_client_module._tmdb_request_times.clear()
+
+    fake_sleep = AsyncMock()
+
+    with (
+        patch.object(tmdb_client_module, "TMDB_REQUESTS_PER_SECOND", 2),
+        patch.object(tmdb_client_module, "TMDB_RATE_WINDOW_SECONDS", 1.0),
+        patch.object(
+            tmdb_client_module.time,
+            "monotonic",
+            side_effect=[100.0, 100.1, 100.2, 101.0],
+        ),
+        patch.object(
+            tmdb_client_module.asyncio,
+            "sleep",
+            new=fake_sleep,
+        ),
+    ):
+        await tmdb_client_module._wait_for_tmdb_rate_slot()
+        await tmdb_client_module._wait_for_tmdb_rate_slot()
+        await tmdb_client_module._wait_for_tmdb_rate_slot()
+
+    fake_sleep.assert_awaited_once()
+    assert fake_sleep.await_args.args[0] == pytest.approx(0.8)
+    assert len(tmdb_client_module._tmdb_request_times) == 2
+
+    tmdb_client_module._tmdb_request_times.clear()
+
+
+@pytest.mark.asyncio
+async def test_retry_attempts_are_rate_gated_and_honor_retry_after():
+    class RateGatedTestClient(BaseClient):
+        def __init__(self):
+            super().__init__(max_retries=2)
+            self.rate_gate_calls = 0
+
+        async def _before_request_attempt(self):
+            self.rate_gate_calls += 1
+
+    request_attempts = 0
+
+    def handler(request):
+        nonlocal request_attempts
+        request_attempts += 1
+
+        if request_attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "2.5"},
+                request=request,
+            )
+
+        return httpx.Response(
+            200,
+            json={"ok": True},
+            request=request,
+        )
+
+    client = RateGatedTestClient()
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+     )
+
+    fake_sleep = AsyncMock()
+
+    try:
+        with patch.object(
+            base_client_module.asyncio,
+            "sleep",
+            new=fake_sleep,
+        ):
+            result = await client.get("https://example.test/resource")
+    finally:
+        await client.close()
+
+    assert result == {"ok": True}
+    assert request_attempts == 2
+    assert client.rate_gate_calls == 2
+    fake_sleep.assert_awaited_once_with(2.5)
