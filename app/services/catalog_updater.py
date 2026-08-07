@@ -77,9 +77,12 @@ class CatalogUpdater:
             logger.warning(f"[{redact_token(token)}] Attempted to refresh catalogs with no credentials.")
             raise HTTPException(status_code=401, detail="Invalid or expired token. Please reconfigure the addon.")
 
-        # Trakt-backed accounts use a different refresh path
-        if credentials.get("auth_provider") == "trakt":
+        # External library providers use provider-specific refresh paths.
+        auth_provider = credentials.get("auth_provider")
+        if auth_provider == "trakt":
             return await self._refresh_trakt_catalogs(token, credentials, update_timestamp)
+        if auth_provider == "simkl":
+            return await self._refresh_simkl_catalogs(token, credentials, update_timestamp)
 
         auth_key = credentials.get("authKey")
         # check if auth key is valid
@@ -172,6 +175,81 @@ class CatalogUpdater:
             return False
         finally:
             await bundle.close()
+
+    async def _refresh_simkl_catalogs(
+        self, token: str, credentials: dict[str, Any], update_timestamp: bool = True
+    ) -> bool:
+        """Refresh a Simkl-backed account and detect revoked authorization."""
+        from app.services.simkl_provider import (
+            SimklApiClient,
+            SimklAuthorizationError,
+            SimklLibraryProvider,
+        )
+
+        user_settings = None
+        if credentials.get("settings"):
+            try:
+                user_settings = UserSettings(**credentials["settings"])
+            except Exception as exc:
+                logger.warning(
+                    f"[{redact_token(token)}] Failed to parse Simkl user settings: {exc}"
+                )
+                return True
+
+        access_token = credentials.get("authKey")
+        if not access_token or not settings.SIMKL_CLIENT_ID:
+            logger.warning(
+                f"[{redact_token(token)}] Simkl credentials missing, skipping refresh"
+            )
+            return True
+
+        client = SimklApiClient(settings.SIMKL_CLIENT_ID, access_token)
+        try:
+            # This authenticated identity request makes revoked/expired tokens
+            # visible even while the 30-day library cache is still populated.
+            await client.get_user()
+            library_items = await SimklLibraryProvider(client).get_library_items()
+            await manifest_service.cache_library_and_profiles_from_items(
+                library_items, user_settings, token
+            )
+
+            credentials.pop("provider_auth_error", None)
+            credentials.pop("provider_auth_error_message", None)
+
+            if update_timestamp:
+                now = datetime.now(timezone.utc)
+                credentials["last_updated"] = now.replace(microsecond=0).isoformat()
+
+            await token_store.update_user_data(token, credentials)
+            logger.info(f"[{redact_token(token)}] Simkl catalog refresh complete")
+            return True
+
+        except SimklAuthorizationError as exc:
+            logger.error(
+                f"[{redact_token(token)}] Stored Simkl authorization was rejected: {exc}"
+            )
+            credentials["provider_auth_error"] = "simkl"
+            credentials["provider_auth_error_message"] = (
+                "Simkl authorization expired. Reconnect Simkl in Watchly."
+            )
+            try:
+                await token_store.update_user_data(token, credentials)
+            except Exception as persist_exc:
+                logger.error(
+                    f"[{redact_token(token)}] Failed to persist Simkl "
+                    f"authorization error: {persist_exc}"
+                )
+            return False
+
+        except Exception as exc:
+            # Network failures, rate limits, and Simkl server errors must not be
+            # mislabeled as revoked authorization. Existing stale data remains.
+            logger.exception(
+                f"[{redact_token(token)}] Simkl catalog refresh failed: {exc}"
+            )
+            return False
+        finally:
+            await client.close()
 
     async def _refresh_trakt_catalogs(
         self, token: str, credentials: dict[str, Any], update_timestamp: bool = True

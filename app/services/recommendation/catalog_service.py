@@ -1,3 +1,4 @@
+import asyncio
 import random
 import re
 import time
@@ -23,6 +24,11 @@ from app.services.stremio.service import StremioBundle
 from app.services.trakt.service import TraktBundle
 from app.services.tmdb.service import get_tmdb_service
 from app.services.token_store import token_store
+from app.services.simkl_provider import (
+    SimklApiClient,
+    SimklAuthorizationError,
+    SimklLibraryProvider,
+)
 from app.services.user_cache import user_cache
 from app.utils.catalog import cache_profile_and_watched_sets
 
@@ -38,6 +44,23 @@ def shuffle_data_if_needed(
     if should_shuffle(user_settings, catalog_id):
         random.shuffle(data)
     return data
+
+
+def _provider_auth_error_catalog(
+    content_type: str,
+    message: str = "Simkl authorization expired. Reconnect Simkl in Watchly.",
+) -> dict[str, list[dict[str, Any]]]:
+    """Return a message-only card without a poster URL or browser action."""
+    return {
+        "metas": [
+            {
+                "id": "tt0000000",
+                "type": content_type,
+                "name": message,
+                "description": message,
+            }
+        ]
+    }
 
 
 def _clean_meta(meta: dict) -> dict | None:
@@ -82,12 +105,163 @@ def _clean_meta(meta: dict) -> dict | None:
     return cleaned
 
 
+BACKGROUND_CATALOG_REFRESH_LIMIT = 2
+
+
 class CatalogService:
     def __init__(self):
-        pass
+        self._inflight_catalogs: dict[
+            tuple[str, str, str],
+            asyncio.Task,
+        ] = {}
+
+        # Replacement builds are keyed by token as well as catalog identity.
+        # Identical rows belonging to different profiles are never coalesced.
+        self._background_catalog_refreshes: dict[
+            tuple[str, str, str],
+            asyncio.Task,
+        ] = {}
+        self._background_catalog_refresh_semaphore = asyncio.Semaphore(
+            BACKGROUND_CATALOG_REFRESH_LIMIT
+        )
+
+    def _clear_inflight_catalog(
+        self,
+        key: tuple[str, str, str],
+        task: asyncio.Task,
+    ) -> None:
+        if self._inflight_catalogs.get(key) is task:
+            self._inflight_catalogs.pop(key, None)
+
+    def _finish_background_catalog_refresh(
+        self,
+        key: tuple[str, str, str],
+        task: asyncio.Task,
+    ) -> None:
+        if self._background_catalog_refreshes.get(key) is task:
+            self._background_catalog_refreshes.pop(key, None)
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.debug(
+                f"[{redact_token(key[0])}...] "
+                "Background catalog refresh cancelled for "
+                f"{key[1]}/{key[2]}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{redact_token(key[0])}...] "
+                "Background catalog refresh failed for "
+                f"{key[1]}/{key[2]}: {exc}"
+            )
+
+    async def _run_background_catalog_refresh(
+        self,
+        token: str,
+        content_type: str,
+        catalog_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        # Published catalogs have already been returned to the client before
+        # reaching this queue. Bounding replacement work prevents a cold Home
+        # refresh from fanning every dirty row into TMDB simultaneously.
+        async with self._background_catalog_refresh_semaphore:
+            logger.info(
+                f"[{redact_token(token)}...] "
+                "Running queued background catalog refresh for "
+                f"{content_type}/{catalog_id}"
+            )
+            return await self._get_catalog_impl(
+                token,
+                content_type,
+                catalog_id,
+                force_refresh=True,
+            )
+
+    def _schedule_background_catalog_refresh(
+        self,
+        token: str,
+        content_type: str,
+        catalog_id: str,
+    ) -> None:
+        key = (token, content_type, catalog_id)
+        existing = self._background_catalog_refreshes.get(key)
+
+        if existing is not None and not existing.done():
+            logger.debug(
+                f"[{redact_token(token)}...] "
+                "Background catalog refresh already running for "
+                f"{content_type}/{catalog_id}"
+            )
+            return
+
+        task = asyncio.create_task(
+            self._run_background_catalog_refresh(
+                token,
+                content_type,
+                catalog_id,
+            ),
+            name=f"watchly-catalog-refresh-{content_type}-{catalog_id}",
+        )
+        self._background_catalog_refreshes[key] = task
+
+        task.add_done_callback(
+            lambda completed, catalog_key=key:
+            self._finish_background_catalog_refresh(
+                catalog_key,
+                completed,
+            )
+        )
+
+        logger.info(
+            f"[{redact_token(token)}...] "
+            "Started background catalog refresh for "
+            f"{content_type}/{catalog_id}"
+        )
 
     async def get_catalog(
         self, token: str, content_type: str, catalog_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        key = (token, content_type, catalog_id)
+        task = self._inflight_catalogs.get(key)
+
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._get_catalog_impl(
+                    token,
+                    content_type,
+                    catalog_id,
+                ),
+                name=(
+                    "watchly-catalog-"
+                    f"{content_type}-{catalog_id}"
+                ),
+            )
+            self._inflight_catalogs[key] = task
+            task.add_done_callback(
+                lambda completed, catalog_key=key:
+                    self._clear_inflight_catalog(
+                        catalog_key,
+                        completed,
+                    )
+            )
+        else:
+            logger.info(
+                f"[{redact_token(token)}...] "
+                "Joining in-flight catalog build for "
+                f"{content_type}/{catalog_id}"
+            )
+
+        # A disconnected client may cancel its own wait, but it must not
+        # cancel the shared build that another request is awaiting.
+        return await asyncio.shield(task)
+
+    async def _get_catalog_impl(
+        self,
+        token: str,
+        content_type: str,
+        catalog_id: str,
+        force_refresh: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """
         Get catalog recommendations.
@@ -125,6 +299,19 @@ class CatalogService:
                 detail="Invalid or expired token. Please reconfigure the addon.",
             )
 
+        # A confirmed provider authorization failure overrides both fresh and
+        # stale recommendation caches so the TV interface visibly reports it.
+        if (
+            credentials.get("auth_provider") == "simkl"
+            and credentials.get("provider_auth_error") == "simkl"
+        ):
+            headers["Cache-Control"] = "no-store, max-age=0"
+            message = credentials.get(
+                "provider_auth_error_message",
+                "Simkl authorization expired. Reconnect Simkl in Watchly.",
+            )
+            return _provider_auth_error_catalog(content_type, message), headers
+
         # Trigger lazy update if needed
         if settings.AUTO_UPDATE_CATALOGS:
             logger.info(f"[{redact_token(token)}...] Triggering auto update for token")
@@ -138,35 +325,84 @@ class CatalogService:
         bundle = StremioBundle()
         user_settings = None
         stale_data = None
+        build_revision: int | None = None
 
         try:
             # get cached catalog
             cached_result = await user_cache.get_catalog(token, content_type, catalog_id)
 
+            dirty_revision = await user_cache.get_catalog_dirty_revision(token)
+
             if cached_result:
-                data, created_at = cached_result
+                data, created_at, source_revision = cached_result
                 age = int(time.time()) - created_at
 
-                # If data is fresh enough (within refresh interval), return it
-                if age < settings.CATALOG_REFRESH_INTERVAL_SECONDS:
-                    logger.debug(f"[{redact_token(token)}...] Using cached catalog for {content_type}/{catalog_id}")
-                    # Try to extract settings from credentials for shuffling, even on cached path
-                    user_settings = self._extract_settings(credentials)
-                    meta_data = data["metas"]
-                    meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
-                    data["metas"] = meta_data
-                    return data, headers
+                cache_dirty = (
+                    dirty_revision is not None
+                    and (
+                        source_revision is None
+                        or source_revision != dirty_revision
+                    )
+                )
 
-                # If data is stale, keep it for fallback
+                needs_refresh = (
+                    age >= settings.CATALOG_REFRESH_INTERVAL_SECONDS
+                    or cache_dirty
+                )
+
+                if not force_refresh:
+                    # Published-snapshot path. The request never waits for AI
+                    # regeneration when a last-known-good catalog already exists.
+                    user_settings = self._extract_settings(credentials)
+
+                    response_data = dict(data)
+                    meta_data = list(data.get("metas", []))
+                    response_data["metas"] = shuffle_data_if_needed(
+                        user_settings,
+                        catalog_id,
+                        meta_data,
+                    )
+
+                    if needs_refresh:
+                        reason = (
+                            "profile/library changed"
+                            if cache_dirty
+                            else f"age={age}s"
+                        )
+                        logger.info(
+                            f"[{redact_token(token)}...] "
+                            "Serving published catalog immediately; "
+                            "replacement will build in background "
+                            f"({reason}) for "
+                            f"{content_type}/{catalog_id}"
+                        )
+                        self._schedule_background_catalog_refresh(
+                            token,
+                            content_type,
+                            catalog_id,
+                        )
+                    else:
+                        logger.debug(
+                            f"[{redact_token(token)}...] "
+                            "Using published catalog for "
+                            f"{content_type}/{catalog_id}"
+                        )
+
+                    return response_data, headers
+
+                # A forced background build keeps the published payload as its
+                # failure fallback. It is never removed before replacement.
                 stale_data = data
                 logger.info(
-                    f"[{redact_token(token)}...] Catalog is stale (age: {age}s) for {content_type}/{catalog_id},"
-                    "refreshing..."
+                    f"[{redact_token(token)}...] "
+                    "Building replacement snapshot in background for "
+                    f"{content_type}/{catalog_id}"
                 )
             else:
                 logger.info(
-                    f"[{redact_token(token)}...] Catalog not cached for {content_type}/{catalog_id}, building from"
-                    " scratch"
+                    f"[{redact_token(token)}...] "
+                    f"Catalog not cached for {content_type}/{catalog_id}, "
+                    "building from scratch"
                 )
 
             # Resolve auth and settings
@@ -194,6 +430,20 @@ class CatalogService:
                         library_items = await trakt_bundle.library.get_library_items()
                     finally:
                         await trakt_bundle.close()
+                elif credentials.get("auth_provider") == "simkl":
+                    logger.info(
+                        f"[{redact_token(token)}...] Library items not cached, "
+                        "fetching from Simkl"
+                    )
+                    simkl_client = SimklApiClient(
+                        settings.SIMKL_CLIENT_ID, auth_key
+                    )
+                    try:
+                        library_items = await SimklLibraryProvider(
+                            simkl_client
+                        ).get_library_items()
+                    finally:
+                        await simkl_client.close()
                 else:
                     logger.info(f"[{redact_token(token)}...] Library items not cached, fetching from Stremio")
                     library_items = await bundle.library.get_library_items(auth_key)
@@ -241,6 +491,11 @@ class CatalogService:
                     except Exception as e:
                         logger.warning(f"Failed to generate interest summary on demand: {e}")
 
+            # Capture the exact token-scoped profile/library revision this
+            # recommendation build is based on. If it changes while the LLM is
+            # running, this replacement must not overwrite the newer generation.
+            build_revision = await user_cache.get_catalog_dirty_revision(token)
+
             whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
 
             # Route to appropriate recommendation service
@@ -281,12 +536,61 @@ class CatalogService:
             cleaned = shuffle_data_if_needed(user_settings, catalog_id, cleaned)
 
             data = {"metas": cleaned}
-            # if catalog data is not empty, set the cache with STALE_TTL (7 days)
-            # This ensures we have fallback data available if the next refresh fails
-            if cleaned:
-                await user_cache.set_catalog(token, content_type, catalog_id, data, settings.CATALOG_STALE_TTL)
+
+            current_dirty_revision = (
+                await user_cache.get_catalog_dirty_revision(token)
+            )
+            build_superseded = (
+                current_dirty_revision is not None
+                and (
+                    build_revision is None
+                    or current_dirty_revision != build_revision
+                )
+            )
+
+            # Atomic promotion: Redis is replaced only after a complete,
+            # non-empty build whose source revision is still current.
+            if cleaned and not build_superseded:
+                await user_cache.set_catalog(
+                    token,
+                    content_type,
+                    catalog_id,
+                    data,
+                    # Published snapshots must survive indefinitely until a
+                    # successful replacement or an explicit profile reset.
+                    # Freshness is tracked separately by created_at and the
+                    # token-scoped source/dirty revisions.
+                    ttl=None,
+                    source_revision=build_revision,
+                )
+            elif cleaned and build_superseded:
+                logger.info(
+                    f"[{redact_token(token)}...] "
+                    "Discarding superseded catalog replacement for "
+                    f"{content_type}/{catalog_id}; profile/library "
+                    "changed while the build was running"
+                )
 
             return data, headers
+
+        except SimklAuthorizationError as e:
+            logger.error(
+                f"[{redact_token(token)}...] Simkl authorization failure "
+                f"during catalog generation: {e}"
+            )
+            credentials["provider_auth_error"] = "simkl"
+            credentials["provider_auth_error_message"] = (
+                "Simkl authorization expired. Reconnect Simkl in Watchly."
+            )
+            try:
+                await token_store.update_user_data(token, credentials)
+            except Exception as persist_exc:
+                logger.error(
+                    f"[{redact_token(token)}...] Failed to persist Simkl "
+                    f"authorization error: {persist_exc}"
+                )
+            headers["Cache-Control"] = "no-store, max-age=0"
+            return _provider_auth_error_catalog(content_type), headers
 
         except Exception as e:
             logger.error(f"[{redact_token(token)}...] Failed to generate catalog: {e}")
@@ -340,6 +644,15 @@ class CatalogService:
 
     async def _resolve_auth(self, bundle: StremioBundle, credentials: dict, token: str) -> str:
         auth_key = credentials.get("authKey")
+
+        # Simkl accounts use a long-lived OAuth token and do not have a
+        # refresh token. The provider refresh path verifies it every six hours.
+        if credentials.get("auth_provider") == "simkl":
+            if not auth_key:
+                raise SimklAuthorizationError(
+                    "Missing Simkl authorization token"
+                )
+            return auth_key
 
         # Trakt accounts use a Trakt access token stored as authKey.
         # Skip Stremio session validation entirely for these accounts.

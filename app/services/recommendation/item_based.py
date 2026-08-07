@@ -1,4 +1,7 @@
-from app.services.openrouter import gemini_service
+from app.services.openrouter import (
+    RECOMMENDATION_MAX_TOKENS,
+    gemini_service,
+)
 import asyncio
 import re
 from typing import Any
@@ -26,6 +29,29 @@ class ItemBasedService:
     def __init__(self, tmdb_service: Any, user_settings: Any = None):
         self.tmdb_service: TMDBService = tmdb_service
         self.user_settings = user_settings
+
+    @staticmethod
+    def _deduplicate_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove repeated recommendation entries while preserving source order."""
+        unique: list[dict[str, Any]] = []
+        seen_ids: set[Any] = set()
+
+        for item in items:
+            item_id = item.get("id") or item.get("_id")
+
+            # Items without an identifier cannot be safely compared. Preserve them;
+            # later metadata validation can decide whether they are usable.
+            if item_id is None:
+                unique.append(item)
+                continue
+
+            if item_id in seen_ids:
+                continue
+
+            seen_ids.add(item_id)
+            unique.append(item)
+
+        return unique
 
     async def get_recommendations_for_item(
         self,
@@ -64,6 +90,7 @@ class ItemBasedService:
                 item_id, content_type, library_items, gemini_api_key, limit
             )
             if len(gemini_results) >= limit // 2:
+                gemini_results = self._deduplicate_candidates(gemini_results)
                 logger.info(f"Using Gemini recommendations for {item_id}: {len(gemini_results)} results")
                 return gemini_results
             logger.info(f"Gemini returned only {len(gemini_results)} for {item_id}, falling back to TMDB")
@@ -84,8 +111,9 @@ class ItemBasedService:
         simkl_candidates, candidates = await asyncio.gather(*tasks)
 
 
-        # extend candidates always include simkl candidates
-        candidates = simkl_candidates + candidates
+        # Include Simkl candidates first, then remove duplicates both within
+        # Simkl results and across the Simkl/TMDB result sets.
+        candidates = self._deduplicate_candidates(simkl_candidates + candidates)
 
         # Filter by genres and watched items
         excluded_ids = RecommendationFiltering.get_excluded_genre_ids(self.user_settings, content_type)
@@ -102,7 +130,9 @@ class ItemBasedService:
         # Apply year and popularity filters from user settings
         final = filter_items_by_settings(final, self.user_settings)
 
-        return final
+        # Defensive final pass after metadata resolution. Different upstream
+        # records can occasionally resolve to the same IMDb/Stremio item.
+        return self._deduplicate_candidates(final)
 
     async def _fetch_gemini_item_recommendations(
         self,
@@ -173,30 +203,85 @@ RESPONSE FORMAT (one per line, no other text):
                 prompt=prompt,
                 system_instruction=f"You are a {content_type} recommendation expert specializing in {seed_genres if seed_genres else content_type} content. The seed title is a {seed_genres} title. ONLY recommend {seed_genres} titles. Return ONLY the pipe-separated list.",
                 api_key=gemini_api_key,
+                max_tokens=RECOMMENDATION_MAX_TOKENS,
+                minimum_pipe_lines=5,
             )
 
             if not response:
                 return []
 
             candidates = []
-            lines = [l.strip() for l in response.strip().splitlines() if l.strip() and "|" in l]
-            resolve_tasks = []
-            for line in lines:
-                parts = line.split("|")
-                if len(parts) >= 3:
-                    name, year = parts[1].strip(), parts[2].strip()[:4]
-                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-                    resolve_tasks.append(self._resolve_title(name, year, mtype))
-                elif len(parts) == 2:
-                    name, year = parts[0].strip(), parts[1].strip()[:4]
-                    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name).strip()
-                    resolve_tasks.append(self._resolve_title(name, year, mtype))
+            raw_lines = [
+                line.strip()
+                for line in response.strip().splitlines()
+                if line.strip() and "|" in line
+            ]
 
-            results = await asyncio.gather(*resolve_tasks, return_exceptions=True)
-            logger.info(f"Gemini raw lines for {seed_title}: {lines[:5]}")
+            parsed_titles: list[tuple[str, str]] = []
+            seen_title_years: set[tuple[str, str]] = set()
+
+            for line in raw_lines:
+                parts = line.split("|")
+
+                if len(parts) >= 3:
+                    name = parts[1].strip()
+                    year = parts[2].strip()[:4]
+                elif len(parts) == 2:
+                    name = parts[0].strip()
+                    year = parts[1].strip()[:4]
+                else:
+                    continue
+
+                name = re.sub(
+                    r'\s*\(\d{4}\)\s*$',
+                    '',
+                    name,
+                ).strip()
+
+                if not name:
+                    continue
+
+                title_year_key = (
+                    name.casefold(),
+                    year,
+                )
+
+                if title_year_key in seen_title_years:
+                    continue
+
+                seen_title_years.add(title_year_key)
+                parsed_titles.append((name, year))
+
+                if len(parsed_titles) >= gemini_limit:
+                    break
+
+            logger.info(
+                f"Gemini item recs for {seed_title}: "
+                f"accepted {len(parsed_titles)} unique lines "
+                f"from {len(raw_lines)} raw lines "
+                f"(cap={gemini_limit})"
+            )
+
+            resolve_tasks = [
+                self._resolve_title(name, year, mtype)
+                for name, year in parsed_titles
+            ]
+
+            results = await asyncio.gather(
+                *resolve_tasks,
+                return_exceptions=True,
+            )
+            logger.info(
+                f"Gemini raw lines for {seed_title}: "
+                f"{raw_lines[:5]}"
+            )
             for result in results:
                 if isinstance(result, dict) and result.get("id"):
                     candidates.append(result)
+
+            candidates = self._deduplicate_candidates(
+                candidates
+            )[:gemini_limit]
 
             # Enrich with IMDB IDs and full metadata
             enriched = await RecommendationMetadata.fetch_batch(

@@ -33,6 +33,10 @@ class BaseClient:
             await self._client.aclose()
             self._client = None
 
+    async def _before_request_attempt(self) -> None:
+        """Hook for subclasses that need per-attempt pacing."""
+        return None
+
     async def _request(self, method: str, url: str, max_tries: int | None = None, **kwargs) -> httpx.Response:
         """Internal request handler with retry logic."""
         client = await self.get_client()
@@ -40,6 +44,7 @@ class BaseClient:
 
         for attempt in range(1, tries + 1):
             try:
+                await self._before_request_attempt()
                 response = await client.request(method, url, **kwargs)
                 response.raise_for_status()
                 return response
@@ -54,6 +59,20 @@ class BaseClient:
 
                 if is_retryable and attempt < tries:
                     wait_time = 0.5 * (2 ** (attempt - 1))  # Exponential backoff
+
+                    # A 429 may tell us exactly when the upstream wants the
+                    # next request. Honor a numeric Retry-After when present.
+                    if (
+                        isinstance(e, httpx.HTTPStatusError)
+                        and e.response.status_code == 429
+                    ):
+                        retry_after = e.response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait_time = max(wait_time, float(retry_after))
+                            except ValueError:
+                                pass
+
                     logger.warning(
                         f"Request failed ({method} {url}): {str(e)}. "
                         f"Retrying in {wait_time}s... (Attempt {attempt}/{tries})"
