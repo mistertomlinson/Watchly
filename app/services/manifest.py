@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from fastapi import HTTPException
@@ -18,6 +19,9 @@ from app.utils.catalog import cache_profile_and_watched_sets, sort_catalogs
 
 class ManifestService:
     """Service for generating Stremio manifest files."""
+
+    def __init__(self):
+        self._manifest_prepare_tasks: dict[str, asyncio.Task] = {}
 
     @staticmethod
     def get_base_manifest() -> dict[str, Any]:
@@ -193,52 +197,194 @@ class ManifestService:
     ) -> list[dict[str, Any]]:
         return sort_catalogs(catalogs, user_settings) if user_settings else catalogs
 
-    async def get_manifest_for_token(self, token: str) -> dict[str, Any]:
-        if not token:
-            raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
-
-        cached = await user_cache.get_manifest(token)
-        if cached:
-            return cached
-
+    async def _build_candidate_manifest_for_token(self, token: str) -> dict[str, Any]:
         creds = await token_store.get_user_data(token)
         if not creds:
             raise HTTPException(status_code=401, detail="Token not found. Please reconfigure the addon.")
 
-        try:
-            user_settings = UserSettings(**creds.get("settings", {}))
-        except Exception as exc:
-            logger.error(f"[{redact_token(token)}] Error loading user data: {exc}")
-            raise HTTPException(status_code=401, detail="Invalid token session. Please reconfigure.") from exc
-
+        user_settings = UserSettings(**creds.get("settings", {}))
         base_manifest = self.get_base_manifest()
-        fetched_catalogs: list[dict[str, Any]] = []
-        try:
-            provider = creds.get("auth_provider")
-            if provider in {"trakt", "simkl"}:
-                fetched_catalogs = await self._build_dynamic_catalogs_provider(
-                    provider, creds, user_settings, token
-                )
-            else:
-                bundle = StremioBundle()
-                try:
-                    auth_key = await self._resolve_auth_key(bundle, creds, token)
-                    if auth_key:
-                        fetched_catalogs = await self._build_dynamic_catalogs(
-                            bundle, auth_key, user_settings, token
-                        )
-                finally:
-                    await bundle.close()
-        except Exception as exc:
-            logger.exception(f"[{redact_token(token)}] Dynamic catalog build failed: {exc}")
+        provider = creds.get("auth_provider")
 
-        all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [c.copy() for c in fetched_catalogs]
+        if provider in {"trakt", "simkl"}:
+            fetched_catalogs = await self._build_dynamic_catalogs_provider(
+                provider, creds, user_settings, token
+            )
+        else:
+            bundle = StremioBundle()
+            try:
+                auth_key = await self._resolve_auth_key(bundle, creds, token)
+                fetched_catalogs = (
+                    await self._build_dynamic_catalogs(bundle, auth_key, user_settings, token)
+                    if auth_key
+                    else []
+                )
+            finally:
+                await bundle.close()
+
+        all_catalogs = [c.copy() for c in base_manifest["catalogs"]] + [
+            c.copy() for c in fetched_catalogs
+        ]
         translated = await self._translate_catalogs(all_catalogs, user_settings.language)
         sorted_catalogs = self._sort_catalogs(translated, user_settings)
         if sorted_catalogs:
             base_manifest["catalogs"] = sorted_catalogs
+        return base_manifest
 
+    async def _prewarm_manifest_catalogs(
+        self,
+        token: str,
+        manifest: dict[str, Any],
+    ) -> None:
+        # Lazy import avoids manifest -> catalog_service -> catalog_updater -> manifest
+        # during module initialization.
+        from app.services.recommendation.catalog_service import CatalogService
+
+        builder = CatalogService()
+        catalogs = manifest.get("catalogs", [])
+        total = len(catalogs)
+
+        for index, catalog in enumerate(catalogs, start=1):
+            content_type = catalog.get("type")
+            catalog_id = catalog.get("id")
+            if not content_type or not catalog_id:
+                raise RuntimeError(f"Candidate manifest contained invalid catalog definition: {catalog!r}")
+
+            cached = await user_cache.get_catalog(token, content_type, catalog_id)
+            if cached is not None:
+                continue
+
+            logger.info(
+                f"[{redact_token(token)}...] Prewarming next manifest "
+                f"catalog {index}/{total}: {content_type}/{catalog_id}"
+            )
+            await builder.get_catalog(token, content_type, catalog_id)
+
+            cached = await user_cache.get_catalog(token, content_type, catalog_id)
+            if cached is None:
+                raise RuntimeError(
+                    "Catalog build completed without publishing a cache entry for "
+                    f"{content_type}/{catalog_id}"
+                )
+
+    async def _manifest_catalogs_are_cached(
+        self,
+        token: str,
+        manifest: dict[str, Any],
+    ) -> bool:
+        for catalog in manifest.get("catalogs", []):
+            content_type = catalog.get("type")
+            catalog_id = catalog.get("id")
+            if not content_type or not catalog_id:
+                return False
+            if await user_cache.get_catalog(token, content_type, catalog_id) is None:
+                return False
+        return True
+
+    async def _prepare_next_manifest(self, token: str) -> None:
+        try:
+            if await user_cache.get_prepared_manifest(token):
+                return
+
+            candidate = await self._build_candidate_manifest_for_token(token)
+            active = await user_cache.get_active_manifest(token)
+
+            if active and active.get("catalogs") and not candidate.get("catalogs"):
+                raise RuntimeError("Candidate manifest unexpectedly contained no catalogs")
+
+            await self._prewarm_manifest_catalogs(token, candidate)
+            await user_cache.set_prepared_manifest(token, candidate)
+            logger.info(
+                f"[{redact_token(token)}...] Next Watchly manifest is fully "
+                "prewarmed and waiting for the next manifest request"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                f"[{redact_token(token)}...] Failed to prepare next Watchly "
+                f"manifest; keeping current published generation: {exc}"
+            )
+
+    def _finish_manifest_prepare(self, token: str, task: asyncio.Task) -> None:
+        if self._manifest_prepare_tasks.get(token) is task:
+            self._manifest_prepare_tasks.pop(token, None)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(
+                f"[{redact_token(token)}...] Manifest prepare task ended with error: {exc}"
+            )
+
+    def _schedule_next_manifest_prepare(self, token: str) -> None:
+        existing = self._manifest_prepare_tasks.get(token)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            self._prepare_next_manifest(token),
+            name=f"watchly-manifest-prepare-{redact_token(token)}",
+        )
+        self._manifest_prepare_tasks[token] = task
+        task.add_done_callback(
+            lambda completed, user_token=token: self._finish_manifest_prepare(user_token, completed)
+        )
+
+    async def get_manifest_for_token(self, token: str) -> dict[str, Any]:
+        if not token:
+            raise HTTPException(status_code=401, detail="Missing token. Please reconfigure the addon.")
+
+        # A generation prepared invisibly during the previous request/launch is
+        # promoted before the ordinary fresh-cache check.
+        prepared = await user_cache.get_prepared_manifest(token)
+        if prepared:
+            if await self._manifest_catalogs_are_cached(token, prepared):
+                await user_cache.set_manifest(token, prepared)
+                await user_cache.clear_prepared_manifest(token)
+                logger.info(f"[{redact_token(token)}] Promoted fully prewarmed Watchly manifest generation")
+                self._schedule_next_manifest_prepare(token)
+                return prepared
+
+            # A prepared generation may outlive one of its catalog cache entries
+            # if the user does not launch for a long time. Never promote it cold.
+            logger.warning(
+                f"[{redact_token(token)}] Prepared manifest lost one or more "
+                "catalog cache entries; discarding it instead of publishing cold IDs"
+            )
+            await user_cache.clear_prepared_manifest(token)
+
+        cached = await user_cache.get_manifest(token)
+        if cached:
+            self._schedule_next_manifest_prepare(token)
+            return cached
+
+        # If the short manifest TTL expired while the next generation failed or
+        # was still building, keep serving the last known-good published snapshot.
+        active = await user_cache.get_active_manifest(token)
+        if active:
+            await user_cache.set_manifest(token, active)
+            logger.info(
+                f"[{redact_token(token)}] Fresh manifest cache expired; "
+                "re-serving last published generation while next one prepares"
+            )
+            self._schedule_next_manifest_prepare(token)
+            return active
+
+        # Bootstrap only: never advertise brand-new catalog IDs before their
+        # payloads exist. Prepare the first full generation invisibly.
+        creds = await token_store.get_user_data(token)
+        if not creds:
+            raise HTTPException(status_code=401, detail="Token not found. Please reconfigure the addon.")
+
+        base_manifest = self.get_base_manifest()
         await user_cache.set_manifest(token, base_manifest)
+        logger.info(
+            f"[{redact_token(token)}] No published manifest snapshot yet; "
+            "serving base manifest while first generation prewarms"
+        )
+        self._schedule_next_manifest_prepare(token)
         return base_manifest
 
 

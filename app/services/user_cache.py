@@ -482,15 +482,54 @@ class UserCacheService:
         try:
             wrapped = {"manifest": manifest, "created_at": int(time.time())}
             await redis_service.set(key, json.dumps(wrapped), settings.MANIFEST_CACHE_TTL_SECONDS)
+            await self.set_active_manifest(token, manifest)
             logger.debug(f"[{redact_token(token)}...] Cached manifest (TTL: {settings.MANIFEST_CACHE_TTL_SECONDS}s)")
         except Exception as e:
             logger.warning(f"[{redact_token(token)}...] Failed to cache manifest: {e}")
+
+    async def get_active_manifest(self, token: str) -> dict | None:
+        key = f"watchly:manifest:active:{token}"
+        try:
+            data = await redis_service.get(key)
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to get active manifest snapshot: {e}")
+            return None
+
+    async def set_active_manifest(self, token: str, manifest: dict) -> None:
+        key = f"watchly:manifest:active:{token}"
+        try:
+            await redis_service.set(key, json.dumps(manifest), 30 * 24 * 60 * 60)
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to store active manifest snapshot: {e}")
+
+    async def get_prepared_manifest(self, token: str) -> dict | None:
+        key = f"watchly:manifest:prepared:{token}"
+        try:
+            data = await redis_service.get(key)
+            return json.loads(data) if data else None
+        except Exception as e:
+            logger.warning(f"[{redact_token(token)}...] Failed to get prepared manifest: {e}")
+            return None
+
+    async def set_prepared_manifest(self, token: str, manifest: dict) -> None:
+        key = f"watchly:manifest:prepared:{token}"
+        await redis_service.set(key, json.dumps(manifest), 30 * 24 * 60 * 60)
+        logger.info(
+            f"[{redact_token(token)}...] Staged fully prewarmed next manifest "
+            f"with {len(manifest.get('catalogs', []))} catalogs"
+        )
+
+    async def clear_prepared_manifest(self, token: str) -> None:
+        key = f"watchly:manifest:prepared:{token}"
+        await redis_service.delete(key)
 
     async def invalidate_manifest(self, token: str) -> None:
         """Invalidate cached manifest so it regenerates on next request."""
         key = f"watchly:manifest:{token}"
         try:
             await redis_service.delete(key)
+            await self.clear_prepared_manifest(token)
             logger.debug(f"[{redact_token(token)}...] Invalidated manifest cache")
         except Exception as e:
             logger.warning(f"[{redact_token(token)}...] Failed to invalidate manifest: {e}")
