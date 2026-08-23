@@ -4,6 +4,7 @@ from typing import Any
 from loguru import logger
 
 from app.core.constants import DEFAULT_CONCURRENCY_LIMIT
+from app.services.content_preferences import lgbtq_content_preference_reason_values
 from app.services.poster_ratings.factory import PosterProvider, poster_ratings_factory
 
 
@@ -170,6 +171,28 @@ class RecommendationMetadata:
                     return {}
 
         successful_details = [d for d in details_list if d]
+
+        # Global content-preference gate. Full TMDB details include keyword names,
+        # allowing the same corroboration threshold used by Seasonal Spotlight.
+        # Run before image requests so excluded titles incur no extra artwork calls.
+        preference_filtered_details = []
+        for details in successful_details:
+            reason = lgbtq_content_preference_reason_values(
+                title=details.get("title") or details.get("name") or "",
+                overview=details.get("overview") or "",
+                keywords=details.get("keywords"),
+            )
+            if reason:
+                logger.info(
+                    "[ContentPreference] Excluding recommendation "
+                    f"tmdb={details.get('id')} "
+                    f"title={details.get('title') or details.get('name') or ''!r} "
+                    f"reason={reason}"
+                )
+                continue
+            preference_filtered_details.append(details)
+
+        successful_details = preference_filtered_details
         image_tasks = [_images_one(d) for d in successful_details]
         images_list = await asyncio.gather(*image_tasks, return_exceptions=True)
 

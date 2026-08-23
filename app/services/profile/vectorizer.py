@@ -3,6 +3,7 @@ from typing import Any
 import httpx
 
 from app.models.scoring import ScoredItem
+from app.services.content_preferences import filter_profile_keyword_ids
 from app.services.cinemeta_service import CinemetaService, cinemeta_service
 from app.services.profile.constants import (
     CAST_POSITION_LEAD,
@@ -38,16 +39,9 @@ class ProfileVectorizer:
         # Extract genres
         genres = [g.get("id") for g in metadata.get("genres", []) if g.get("id")]
 
-        # Extract keywords
-        keywords_dict = metadata.get("keywords")
-        if isinstance(keywords_dict, dict):
-            keywords = keywords_dict.get("results", [])  # for series
-            if not keywords:
-                keywords = keywords_dict.get("keywords", [])  # for movies
-        else:
-            keywords = keywords_dict
-
-        keywords = [k.get("id") for k in keywords if k.get("id")]
+        # Extract keyword IDs, but do not learn LGBTQ subject tags as positive
+        # taste axes. Other features from the source title still contribute.
+        keywords = filter_profile_keyword_ids(metadata.get("keywords"))
 
         # Extract cast (top 10)
         cast = []
