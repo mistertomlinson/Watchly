@@ -87,7 +87,7 @@ class ThemeBasedService:
         if all_constraints:
             combined_params = self._axes_to_params(all_constraints, content_type)
             if excluded_ids:
-                with_ids = {int(g) for g in combined_params.get("with_genres", "").split("|") if g}
+                with_ids = {int(g) for g in combined_params.get("with_genres", "").replace(",", "|").split("|") if g}
                 without = [g for g in excluded_ids if g not in with_ids]
                 if without:
                     combined_params["without_genres"] = "|".join(str(g) for g in without)
@@ -121,8 +121,10 @@ class ThemeBasedService:
 
             # Fire individual queries for all axes, but for flavor genre axes
             # force anchor genres as required filters so results stay on-theme
-            anchor_genre_ids = [v for k, v in anchors.items() if k == "genre"]
-            anchor_genres_str = "|".join(str(g) for g in anchor_genre_ids) if anchor_genre_ids else None
+            anchor_genre_ids = anchors.get("genre", [])
+            if not isinstance(anchor_genre_ids, list):
+                anchor_genre_ids = [anchor_genre_ids]
+            anchor_genres_str = ",".join(str(g) for g in anchor_genre_ids) if anchor_genre_ids else None
 
             for axis_name, axis_value in all_constraints.items():
                 # Build params for this single axis
@@ -142,7 +144,7 @@ class ThemeBasedService:
 
                 # Apply excluded genres
                 if excluded_ids:
-                    with_ids = {int(g) for g in params.get("with_genres", "").split("|") if g}
+                    with_ids = {int(g) for g in params.get("with_genres", "").replace(",", "|").split("|") if g}
                     without = [g for g in excluded_ids if g not in with_ids]
                     if without:
                         params["without_genres"] = "|".join(str(g) for g in without)

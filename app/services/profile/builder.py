@@ -215,13 +215,8 @@ class ProfileBuilder:
             if frequencies is not None:
                 frequencies["eras"][era] += 1
 
-        # Countries
-        for country_code in features.get("countries", []):
-            if country_code:
-                weight = evidence_weight * FEATURE_WEIGHT_COUNTRY
-                profile.country_scores[country_code] = profile.country_scores.get(country_code, 0.0) + weight
-                if frequencies is not None:
-                    frequencies["countries"][country_code] += 1
+        # Production country is deliberately not learned as a taste signal.
+        # Co-productions do not imply a preference for each production country.
 
         crew_list = features.get("crew", [])
         if isinstance(crew_list, list):

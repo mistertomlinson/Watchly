@@ -182,11 +182,16 @@ class RecommendationMetadata:
 
         formatted_list = await asyncio.gather(*format_task, return_exceptions=True)
 
+        preferred_language = ((getattr(user_settings, "language", None) or "").split("-")[0].lower() if user_settings else "")
+
         for formatted in formatted_list:
             if isinstance(formatted, Exception):
                 logger.warning(f"Error formatting metadata: {formatted}")
                 continue
             if formatted:
+                original_language = (formatted.get("original_language") or "").lower()
+                if preferred_language and original_language and original_language != preferred_language:
+                    continue
                 final_results.append(formatted)
 
         return final_results

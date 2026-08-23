@@ -17,7 +17,7 @@ class InterestSummaryService:
             '3. Capture the main vibe of their interests (e.g., "fast-paced action," '
             '"dark historical dramas," "lighthearted animation").\n'
             "4. Prioritize genres and keywords as the strongest signals of taste.\n"
-            "5. Mention specific eras, countries, or runtime preferences when they add color.\n"
+            "5. Mention specific eras or runtime preferences when they add color.\n"
             "6. Sound natural, premium, and personalized—like a thoughtful friend describing their taste.\n\n"
             "Do NOT mention specific IDs or raw metrics. Translate the data into a narrative."
         )
@@ -25,7 +25,7 @@ class InterestSummaryService:
     def _format_profile_data(self, profile: TasteProfile) -> str:
         """Format all available profile data into a structured context string.
 
-        Genres and keywords are primary signals; eras, countries, and runtime are context.
+        Genres and keywords are primary signals; eras and runtime are context.
         We include more of each so the summary can be richer and longer.
         """
         parts: list[str] = []
@@ -40,10 +40,6 @@ class InterestSummaryService:
         if top_keywords:
             keyword_ids = [str(k_id) for k_id, _ in top_keywords]
             parts.append(f"[Primary] Top Keyword IDs (higher = more watched): {', '.join(keyword_ids)}")
-
-        top_countries = [country for country, _ in profile.get_top_countries(limit=2)]
-        if top_countries:
-            parts.append(f"[Context] Preferred Countries: {', '.join(top_countries)}")
 
         top_runtimes = sorted(profile.runtime_bucket_scores.items(), key=lambda x: x[1], reverse=True)
         runtime_prefs = [bucket for bucket, _ in top_runtimes[:3]]

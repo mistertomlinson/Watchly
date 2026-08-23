@@ -546,7 +546,6 @@ EXAMPLE:
         top_directors = profile.get_top_directors(limit=3)
         top_cast = profile.get_top_cast(limit=5)
         top_eras = profile.get_top_eras(limit=2)
-        top_countries = profile.get_top_countries(limit=5)
 
         candidates = []
         tasks = []
@@ -619,15 +618,6 @@ EXAMPLE:
                 }
 
                 self._add_discover_task(tasks, mtype, without_genres, **params)
-
-        # Discover with countries
-        if top_countries:
-            country_codes = [c[0] for c in top_countries]
-            params = {
-                "with_origin_country": "|".join(country_codes),
-                "page": 1,
-            }
-            self._add_discover_task(tasks, mtype, without_genres, **params)
 
         # Execute all in parallel
         logger.debug(f"Fetching {len(tasks)} discover queries with profile features")

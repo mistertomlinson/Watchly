@@ -79,12 +79,8 @@ class ProfileScorer:
             except (ValueError, TypeError):
                 pass
 
-        # Country score (weighted average of matching countries)
-        item_countries = ProfileScorer._extract_country_codes(item_metadata)
-        if item_countries:
-            country_matches = [normalized["countries"].get(cc, 0.0) for cc in item_countries]
-            country_score = sum(country_matches) / len(country_matches) if country_matches else 0.0
-            score += country_score * FEATURE_WEIGHT_COUNTRY
+        # Production country is not a taste signal. Language preference is
+        # enforced separately from TMDB original_language.
 
         return score
 

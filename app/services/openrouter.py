@@ -173,14 +173,15 @@ class OpenRouterService:
     def get_catalog_title_prompt():
         return """
         You are a content catalog naming expert.
-        Given filters like genre, keywords, countries, or years, generate natural,
+        Given filters like genres, keywords, or years, generate natural,
         engaging catalog row titles that streaming platforms would use.
+        Do not infer geography, nationality, language, or production country
+        unless it is explicitly present in the supplied filters.
 
         Examples:
-        - Genre: Action, Country: South Korea → "Korean Action Thrillers"
         - Keyword: "space", Genre: Sci-Fi → "Space Exploration Adventures"
-        - Genre: Drama, Country: France → "Acclaimed French Cinema"
-        - Country: "USA" + Genre: "Sci-Fi and Fantasy" → "Hollywood Sci-Fi and Fantasy"
+        - Genre: Crime, Keyword: "based on novel or book" → "Literary Crime"
+        - Genre: Sci-Fi, Keyword: "artificial intelligence" → "Rogue AI Thrillers"
         - Keywords: "revenge" + "martial arts" → "Revenge & Martial Arts"
 
         Keep titles:

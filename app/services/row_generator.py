@@ -319,14 +319,13 @@ class RowBuilder:
         return None
 
 
-# Minimum inventory a themed row must have before it is worth showing.
-# The probe now applies the user's own discover filters (year range, vote floor)
-# and uses the same AND keyword/genre semantics as the real catalog query, so this
-# figure is close to what the row will actually return -- only watched-history
-# exclusion is unaccounted for. Rows at 10-15 titles fill a shelf perfectly well;
-# the check exists to catch rows returning 0-2, which is what over-specific LLM
-# themes produce.
-MIN_ROW_INVENTORY = 8
+# Minimum raw eligible inventory a themed row must have before it is worth showing.
+# The probe applies the user's discover filters and the same AND semantics as the
+# real catalog query. Watched-history and final metadata/language filtering happen
+# later, so require headroom above the 20-item catalog limit. A target of 25 keeps
+# specific themes when they have enough depth while forcing thin 8-15 item rows
+# to relax coherently instead of publishing half-full shelves.
+MIN_ROW_INVENTORY = 25
 
 # How long a generated row set stays usable before we spend LLM requests on a new
 # one. Rows were previously regenerated on every manifest rebuild (every 6h, per
@@ -343,13 +342,15 @@ ROW_SET_MAX_AGE_SECONDS = 86400
 # Thin-but-meaningful keywords no longer need to be listed here: MIN_ROW_INVENTORY
 # in _repair_thin_rows rejects anything without enough titles behind it.
 GENERIC_KEYWORD_BLACKLIST = {
-    239797,  # complex        - subjective, describes no subject matter
-    197582,  # mysterious     - subjective, describes no subject matter
-    2964,    # future         - too broad; overlaps the sci-fi genre
-    11162,   # miniseries     - format descriptor, not content
+    239797,  # complex              - subjective, describes no subject matter
+    197582,  # mysterious           - subjective, describes no subject matter
+    2964,    # future               - too broad; overlaps the sci-fi genre
+    179430,  # aftercreditsstinger  - technical credits metadata, not a theme
+    179431,  # duringcreditsstinger - technical credits metadata, not a theme
 }
 
 # Previously blacklisted by mistake, now allowed:
+#   11162  miniseries             - useful format/theme category
 #   818    based on novel or book (8257 titles)
 #   9717   based on comic        (851 titles)
 #   4344   musical               (3844 titles)
@@ -538,8 +539,17 @@ class RowGeneratorService:
         """Extract all features from profile and resolve keyword names."""
         # Get raw features
         genres = profile.get_top_genres(limit=5)
-        keywords = profile.get_top_keywords(limit=10)
-        countries = profile.get_top_countries(limit=2)
+
+        # Remove objectively useless TMDB metadata before it can enter any row
+        # generation path. Pull extra candidates first so filtering still leaves
+        # up to ten useful keyword signals.
+        raw_keywords = profile.get_top_keywords(limit=20)
+        keywords = [
+            item for item in raw_keywords
+            if item[0] not in GENERIC_KEYWORD_BLACKLIST
+        ][:10]
+
+        countries = []
         runtimes = sorted(profile.runtime_bucket_scores.items(), key=lambda x: x[1], reverse=True)
         creators = profile.get_top_creators(limit=5)
 
@@ -631,21 +641,16 @@ class RowGeneratorService:
             return None
         builder.add_axis(AXIS_GENRE, genres[0][0], AxisRole.ANCHOR, 1.0)
 
-        # 2. Flavor: Country or Secondary Genre
-        flavor_type = random.choice([AXIS_COUNTRY, AXIS_GENRE])
-
-        if flavor_type == AXIS_COUNTRY and features.countries:
-            country = sample_from_gold_silver(features.countries, 1)
-            builder.add_axis(AXIS_COUNTRY, country[0][0], AxisRole.FLAVOR, 0.7)
-        elif flavor_type == AXIS_GENRE:
-            other_genres = [g for g in features.genres if g[0] != genres[0][0]]
-            if other_genres:
-                sec_genre = sample_from_gold_silver(other_genres, 1)
-                builder.add_axis(AXIS_GENRE, sec_genre[0][0], AxisRole.FLAVOR, 0.7)
+        # 2. Flavor: Secondary Genre
+        # Production country is not a taste signal.
+        other_genres = [g for g in features.genres if g[0] != genres[0][0]]
+        if other_genres:
+            sec_genre = sample_from_gold_silver(other_genres, 1)
+            builder.add_axis(AXIS_GENRE, sec_genre[0][0], AxisRole.FLAVOR, 0.7)
 
         row = builder.build()
         if row:
-            row.explanation = "The Blend: Mixing your top genres with international flavor or secondary interests."
+            row.explanation = "The Blend: Mixing your top genres with complementary secondary interests."
         return row
 
     def _build_rising_star_row(
@@ -658,7 +663,6 @@ class RowGeneratorService:
         Build 'The Rising Star' row:
         Anchor: recent KEYWORD (Silver)
         Flavor: GENRE (Silver)
-        Fallback: COUNTRY (Gold/Silver)
         """
         exclude_genres = exclude_genres or set()
         exclude_keywords = exclude_keywords or set()
@@ -679,11 +683,6 @@ class RowGeneratorService:
         genres = sample_from_silver(available_genres, 1) if available_genres else []
         if genres:
             builder.add_axis(AXIS_GENRE, genres[0][0], AxisRole.FLAVOR, 0.7)
-
-        # 3. Fallback: Country
-        if features.countries:
-            country = sample_from_gold_silver(features.countries, 1)
-            builder.add_axis(AXIS_COUNTRY, country[0][0], AxisRole.FALLBACK, 0.3)
 
         row = builder.build()
         if row:
@@ -779,6 +778,71 @@ class RowGeneratorService:
 
         return final_rows
 
+    async def _retitle_repaired_rows(
+        self,
+        rows: list[RowDefinition],
+        features: ExtractedFeatures,
+    ) -> None:
+        """Rename repaired rows from their final axes using the normal title AI.
+
+        Repair can add, remove, or replace keyword axes after the original title
+        was generated. Rebuild the naming prompt from the final axes so stale or
+        mechanically concatenated titles are never published. If title generation
+        fails, keep the previous title rather than degrading to a raw fallback.
+        """
+        if not rows:
+            return
+
+        api_key = (
+            getattr(self.user_settings, "openrouter_api_key", None)
+            if self.user_settings
+            else None
+        )
+
+        prompts = []
+        for row in rows:
+            builder = RowBuilder(features)
+            for axis in row.axes:
+                builder.add_axis(axis.name, axis.value, axis.role, axis.weight)
+            final_filters = builder.components.build_prompt()
+            prompts.append(
+                f"Existing title: {row.title}\n"
+                f"Final row filters after repair:\n{final_filters}\n\n"
+                "Preserve the existing title EXACTLY only if it is still supported by "
+                "the final filters. Every concrete subject or theme in the title must be "
+                "grounded in a surviving genre or keyword. If a removed keyword was the only "
+                "support for a concept such as psychological, noir, consultant, heist, hitman, "
+                "superhero, or period, remove or replace that concept. Tone-only modifiers such "
+                "as tense, gritty, suspenseful, or high-stakes may remain when they reasonably "
+                "describe the surviving genres. Make the smallest accurate revision. "
+                "Do not infer geography, nationality, language, or production country."
+            )
+
+        tasks = [
+            gemini_service.generate_content_async(prompt, api_key=api_key)
+            for prompt in prompts
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for row, result in zip(rows, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    f"[RowRepair] AI retitle failed for '{row.title}': {result}"
+                )
+                continue
+            if not result:
+                logger.warning(
+                    f"[RowRepair] AI retitle returned empty for '{row.title}'; "
+                    "keeping previous title"
+                )
+                continue
+
+            old_title = row.title
+            row.title = self._clean_title(result)
+            logger.info(
+                f"[RowRepair] AI retitle '{old_title}' -> '{row.title}'"
+            )
+
     async def _resolve_keyword_to_id(self, kw_name: str, profile_kw_map: dict[str, int]) -> int | None:
         """Resolve a keyword name to TMDB ID: profile first, then TMDB search (for discovery)."""
         kw_lower = str(kw_name).strip().lower()
@@ -828,62 +892,76 @@ class RowGeneratorService:
             # Fail open: never discard a row because of a transient TMDB error.
             return MIN_ROW_INVENTORY
 
+    @staticmethod
+    def _normalize_row_axes(axes: list[RowAxis]) -> list[RowAxis]:
+        # Deduplicate axes and guarantee that a surviving row has an anchor.
+        normalized: list[RowAxis] = []
+        seen: dict[tuple[str, str], RowAxis] = {}
+        role_priority = {
+            AxisRole.FALLBACK: 0,
+            AxisRole.FLAVOR: 1,
+            AxisRole.ANCHOR: 2,
+        }
+
+        for axis in axes:
+            key = (axis.name, str(axis.value))
+            existing = seen.get(key)
+            if existing is None:
+                normalized.append(axis)
+                seen[key] = axis
+                continue
+
+            # Keep one copy of an exact axis and preserve its strongest role.
+            if role_priority.get(axis.role, 0) > role_priority.get(existing.role, 0):
+                existing.role = axis.role
+            existing.weight = max(existing.weight, axis.weight)
+            if not existing.display and axis.display:
+                existing.display = axis.display
+
+        if normalized and not any(a.role == AxisRole.ANCHOR for a in normalized):
+            # Repairs may remove the original anchor. Prefer a surviving genre as
+            # the replacement anchor because it remains the broadest stable theme.
+            promote = next((a for a in normalized if a.name == AXIS_GENRE), None)
+            if promote is None:
+                promote = next((a for a in normalized if a.name == AXIS_KEYWORD), None)
+            if promote is None:
+                promote = normalized[0]
+            promote.role = AxisRole.ANCHOR
+
+        return normalized
+
     async def _repair_thin_rows(
         self,
         rows: list,
         features: "ExtractedFeatures",
         content_type: str,
     ) -> list:
-        """Ensure every row can actually fill itself.
+        """Ensure every row has enough eligible inventory without changing its theme.
 
-        A keyword the LLM picks may have almost no titles behind it (e.g. "squatting"
-        has ~31 films on TMDB). Such a row previously padded itself with unrelated
-        content. Here we instead swap the keyword for a viable one from the user's
-        profile, or -- failing that -- drop the keyword axis and let the row stand on
-        its genre/country. The row is never removed, so the catalog count is stable.
+        Repair first relaxes secondary constraints while preserving the row's own
+        keyword concepts. It never substitutes an unrelated profile keyword merely
+        to hit the inventory floor. If the original keyword cannot support a healthy
+        row, the keyword is removed and the title is revised from the surviving axes.
         """
-        used_keywords = {a.value for r in rows for a in r.axes if a.name == AXIS_KEYWORD}
+        retitle_rows: list[RowDefinition] = []
 
         for row in rows:
+            # Normalize before probing so legacy/re-anchored duplicate axes do not
+            # artificially narrow the TMDB query.
+            row.axes = self._normalize_row_axes(list(row.axes))
+            row.id = build_row_id(row.axes)
             kw_axes = [a for a in row.axes if a.name == AXIS_KEYWORD]
 
-            # A row with a single genre and nothing else ("Mystery") is not a theme:
-            # it returns the same popular titles any generic list would. Give it a
-            # keyword from the profile so it says something specific.
-            # Count DISTINCT (name, value) pairs, not axis entries. Patch 40's
-            # re-anchoring can add the same genre twice (once as ANCHOR, once as
-            # FLAVOR), so a row like a:g80.f:g80 -- bare Crime, nothing else --
-            # looked like two axes and slipped past this check.
+            # A bare single-axis row is under-specified, but inventing a keyword
+            # from elsewhere in the profile changes the theme rather than repairing
+            # it. Keep the grounded axis and force a title review instead.
             distinct_axes = {(a.name, str(a.value)) for a in row.axes}
             if not kw_axes and len(distinct_axes) < 2:
-                for kid, _score in features.keywords:
-                    if kid in used_keywords or kid in GENERIC_KEYWORD_BLACKLIST:
-                        continue
-                    candidate = list(row.axes) + [
-                        RowAxis(name=AXIS_KEYWORD, value=kid, role=AxisRole.FLAVOR)
-                    ]
-                    if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
-                        kw_name = normalize_keyword(features.get_keyword_name(kid) or "")
-                        kw_name = RowComponents.KEYWORD_DISPLAY_OVERRIDES.get(
-                            kw_name.strip().lower(), kw_name
-                        )
-                        genre_names = [
-                            features.get_genre_name(a.value)
-                            for a in row.axes
-                            if a.name == AXIS_GENRE
-                        ]
-                        row.axes = candidate
-                        row.id = build_row_id(candidate)
-                        if kw_name:
-                            row.title = " ".join(
-                                p for p in ([kw_name] + genre_names[:1]) if p
-                            ) or row.title
-                        used_keywords.add(kid)
-                        logger.info(
-                            f"[RowRepair] under-specified row -> '{row.title}' "
-                            f"(added keyword {kid})"
-                        )
-                        break
+                retitle_rows.append(row)
+                logger.info(
+                    f"[RowRepair] under-specified row -> '{row.title}' "
+                    "(kept grounded axes; no unrelated keyword injected)"
+                )
                 continue
 
             if not kw_axes:
@@ -901,76 +979,99 @@ class RowGeneratorService:
             non_kw = [a for a in row.axes if a.name != AXIS_KEYWORD]
             repaired = False
 
-            # Only substitute a profile keyword when the row had SEVERAL, so the
-            # theme survives in some form. Profile keywords are ranked by how much
-            # the user watches them, not by relevance to this row -- swapping the
-            # sole keyword of "Political Conspiracy Thrillers" produced a martial
-            # arts row still wearing the political title. With one keyword, dropping
-            # it is honest: the genres and the LLM title still agree.
-            if len(kw_axes) < 2:
-                non_kw_axes = [a for a in row.axes if a.name != AXIS_KEYWORD]
-                if non_kw_axes:
-                    row.axes = non_kw_axes
-                    row.id = build_row_id(non_kw_axes)
-                    logger.info(
-                        f"[RowRepair] sole keyword too thin; dropped it -> '{row.title}'"
-                    )
+            # Step 1: preserve the row's defining keyword theme by relaxing one
+            # secondary genre first. Prefer FLAVOR genres; if all genres are
+            # anchors, remove only an extra anchor and always leave one genre.
+            genre_axes = [a for a in row.axes if a.name == AXIS_GENRE]
+            if len(genre_axes) > 1:
+                removable_genres = sorted(
+                    genre_axes,
+                    key=lambda a: 0 if a.role == AxisRole.FLAVOR else 1,
+                )
+                for genre_axis in removable_genres:
+                    candidate = []
+                    removed = False
+                    for axis in row.axes:
+                        if not removed and axis is genre_axis:
+                            removed = True
+                            continue
+                        candidate.append(axis)
+
+                    if not any(a.name == AXIS_GENRE for a in candidate):
+                        continue
+
+                    if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
+                        row.axes = candidate
+                        row.id = build_row_id(candidate)
+                        retitle_rows.append(row)
+                        repaired = True
+                        logger.info(
+                            f"[RowRepair] relaxed genre {genre_axis.value} while preserving "
+                            f"keyword theme -> '{row.title}'"
+                        )
+                        break
+
+            if repaired:
                 continue
 
-            # Step 1: try a different keyword from the profile.
-            for kid, _score in features.keywords:
-                if kid in used_keywords or kid in GENERIC_KEYWORD_BLACKLIST:
-                    continue
-                candidate = list(non_kw) + [
-                    RowAxis(name=AXIS_KEYWORD, value=kid, role=AxisRole.FLAVOR)
-                ]
+            # Step 2: if several keywords made the row too narrow, keep one of
+            # the row's OWN keywords with all surviving non-keyword axes.
+            for kw_axis in kw_axes:
+                candidate = list(non_kw) + [kw_axis]
                 if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
-                    kw_name = normalize_keyword(features.get_keyword_name(kid) or "")
-                    kw_name = RowComponents.KEYWORD_DISPLAY_OVERRIDES.get(
-                        kw_name.strip().lower(), kw_name
-                    )
-                    genre_names = [
-                        features.get_genre_name(a.value) for a in non_kw if a.name == AXIS_GENRE
-                    ]
-                    country_names = [
-                        get_country_adjective(a.value) for a in non_kw if a.name == AXIS_COUNTRY
-                    ]
-                    # Drop a keyword that just restates a genre, and keep the genre
-                    # last so the title reads as a noun phrase:
-                    # [Country] [Keyword] [Genre] -> "British Novel-Based Drama"
-                    # Drop whichever side is redundant. An exact match means the
-                    # keyword adds nothing ("Dystopian" + "Dystopian"); a keyword
-                    # that CONTAINS the genre makes the genre redundant instead --
-                    # "true crime" + "Crime" was rendering as "True Crime Crime".
-                    kw_low = kw_name.strip().lower()
-                    genre_lows = {g.strip().lower() for g in genre_names}
-                    if kw_low in genre_lows:
-                        kw_name = ""
-                    else:
-                        genre_names = [
-                            g for g in genre_names if g.strip().lower() not in kw_low.split()
-                        ]
                     row.axes = candidate
                     row.id = build_row_id(candidate)
-                    row.title = (
-                        " ".join(p for p in (country_names[:1] + [kw_name] + genre_names[:1]) if p)
-                        or row.title
-                    )
-                    used_keywords.add(kid)
+                    retitle_rows.append(row)
                     repaired = True
-                    logger.info(f"[RowRepair] swapped in keyword {kid} -> '{row.title}'")
+                    logger.info(
+                        f"[RowRepair] simplified to existing keyword {kw_axis.value} "
+                        f"-> '{row.title}'"
+                    )
                     break
 
-            # Step 2: keep the row, lose the keyword.
-            if not repaired and non_kw:
-                # Keep the LLM's title. It was written to describe the genres as
-                # well as the keyword, so it still fits once the keyword is dropped
-                # -- and rebuilding from genres alone produced bland, mechanical
-                # names like "Drama Crime" that say nothing about the content.
+            if repaired:
+                continue
+
+            # Step 3: for multi-keyword rows, try one original keyword with one
+            # surviving genre. This broadens the query while preserving the actual
+            # subject/theme the LLM chose instead of swapping in an unrelated taste.
+            if len(kw_axes) > 1:
+                other_non_kw = [a for a in non_kw if a.name != AXIS_GENRE]
+                for kw_axis in kw_axes:
+                    for genre_axis in genre_axes:
+                        candidate = other_non_kw + [genre_axis, kw_axis]
+                        if await self._row_inventory(candidate, content_type) >= MIN_ROW_INVENTORY:
+                            row.axes = candidate
+                            row.id = build_row_id(candidate)
+                            retitle_rows.append(row)
+                            repaired = True
+                            logger.info(
+                                f"[RowRepair] broadened to original keyword {kw_axis.value} "
+                                f"+ genre {genre_axis.value} -> '{row.title}'"
+                            )
+                            break
+                    if repaired:
+                        break
+
+            if repaired:
+                continue
+
+            # Step 4: last resort, remove the unsupported keyword constraint and
+            # keep the broader grounded axes. Never inject an unrelated keyword.
+            if non_kw:
                 row.axes = non_kw
                 row.id = build_row_id(non_kw)
-                logger.info(f"[RowRepair] dropped keyword axis -> '{row.title}'")
+                retitle_rows.append(row)
+                logger.info(f"[RowRepair] dropped unsupported keyword axis -> '{row.title}'")
 
+        # A repair can remove the only anchor (for example, relaxing an anchor
+        # genre while leaving a flavor genre + keyword). Normalize once more after
+        # all repair decisions so every published row has a valid, deduplicated ID.
+        for row in rows:
+            row.axes = self._normalize_row_axes(list(row.axes))
+            row.id = build_row_id(row.axes)
+
+        await self._retitle_repaired_rows(retitle_rows, features)
         return rows
 
     async def _regenerate_in_background(
@@ -1029,18 +1130,17 @@ class RowGeneratorService:
 
             prompt = (
                 "Using only the user's interest summary below, generate exactly 5 streaming collections for"
-                f" {content_type}. Use genres (required), keywords, and country when relevant.\n\nInterest"
+                f" {content_type}. Use genres (required) and keywords. Production country must not influence a row.\n\nInterest"
                 f" Summary:\n{summary}\n\nGenerate 5 rows. The bracketed labels are internal planning labels only and must NEVER appear in a title:\n1. [strongest match] — What they will love"
-                " most: strongest match to their taste (genres + keywords + country if relevant).\n2. [variety]"
-                " — Blend of their tastes with more variety (genres + keywords + country if"
-                " relevant).\n3. [discovery] — Discovery: suggest themes they might not have explored yet but"
-                " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords +"
-                " country; openness to new content here.\n4. [lesser-known] — Lesser-known or cult titles matching"
+                " most: strongest match to their taste (genres + keywords).\n2. [variety]"
+                " — Blend of their tastes with more variety (genres + keywords).\n3. [discovery] — Discovery: suggest themes they might not have explored yet but"
+                " would likely enjoy (adjacent to their taste, or natural next step). Use genres + keywords;"
+                " openness to new content here.\n4. [lesser-known] — Lesser-known or cult titles matching"
                 " their taste. Use 1-2 genres + 1 keyword max.\n5. [mood] — A specific mood or tone they"
                 " would enjoy (e.g. mind-bending, atmospheric, tense). Use genres + 1 keyword max.\n\nRules:\n"
                 "- Genres: use ONLY these TMDB Genre IDs:"
-                f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ISO 3166-1 alpha-2 code (e.g. US, KR, JP, GB) or null. NEVER use UK — use GB for Britain/England."
-                " or null when relevant.\n- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE constraint rather than summarising every axis. Good: Crime+Drama, GB, 'based on novel or book' -> British Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Never write a country CODE (GB, US, KR) in a title -- the code belongs in the country field only. Use the adjective: GB -> British, US -> American, KR -> Korean, JP -> Japanese, FR -> French. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks, GB Crime Comedies.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
+                f" {valid_genre_list}\n- Keywords: {keyword_hint}\n- Country: ALWAYS null. Production country is not a user taste signal and must never define or name a row."
+                "\n- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE genre or thematic constraint rather than summarising every axis. Good: Crime+Drama, 'based on novel or book' -> Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks.\n- Each row: title (2-5 words), genres (list of IDs), keywords (list"
                 " of strings), country (string or null).\n- IMPORTANT: Keep combinations simple and achievable."
                 " Use max 2 genres and max 1-2 keywords per row. Do NOT combine 3+ niche constraints together"
                 " (e.g. avoid Documentary + dark comedy + anthology — too niche).\n- Output a JSON array of 5 objects."
@@ -1053,8 +1153,8 @@ class RowGeneratorService:
                 system_instruction=(
                     "You are a creative film curator. Design 5 catalog rows from the user's interest summary."
                     " Row 1 (The Core): strong match. Row 2 (Mixed): blend + variety. Row 3 (Rising Star):"
-                    " discovery—suggest new content they would enjoy, not just more of the same. Use genres,"
-                    " keywords, and country. Output valid JSON only."
+                    " discovery—suggest new content they would enjoy, not just more of the same. Use genres"
+                    " and keywords only. Country must always be null. Output valid JSON only."
                 ),
                 api_key=api_key,
             )
@@ -1083,9 +1183,9 @@ class RowGeneratorService:
             final_rows = []
             profile_kw_map = {name.lower(): kid for kid, name in features.keyword_names.items()}
 
-            # Track used anchor genres/keywords across rows to prevent overlapping discover pools
+            # Track anchor genres across rows to encourage variety. Keywords may repeat
+            # when paired with different genres; suppressing reuse erased valid row themes.
             used_anchor_genres: set[int] = set()
-            used_anchor_keywords: set[int] = set()
 
             for item in data:
                 if isinstance(item, dict):
@@ -1098,6 +1198,11 @@ class RowGeneratorService:
                     genre_ids = item.genres
                     kw_names = item.keywords
                     country = item.country
+
+                # Enforce the prompt's hard complexity limits even when the model
+                # returns more. Extra genres were creating needlessly tiny AND pools.
+                genre_ids = list(genre_ids or [])[:2]
+                kw_names = list(kw_names or [])[:2]
 
                 builder = RowBuilder(features)
 
@@ -1123,7 +1228,21 @@ class RowGeneratorService:
                     for gid in genre_ids:
                         gid = int(gid)
                         if gid in current_genre_map:
-                            builder.add_axis(AXIS_GENRE, gid, AxisRole.ANCHOR)
+                            # The genre is already present as FLAVOR when it was
+                            # anchored by an earlier row. Promote that existing axis
+                            # instead of appending a duplicate ANCHOR copy.
+                            existing_axis = next(
+                                (
+                                    a
+                                    for a in builder.components.axes
+                                    if a.name == AXIS_GENRE and int(a.value) == gid
+                                ),
+                                None,
+                            )
+                            if existing_axis is not None:
+                                existing_axis.role = AxisRole.ANCHOR
+                            else:
+                                builder.add_axis(AXIS_GENRE, gid, AxisRole.ANCHOR)
                             row_anchor_genres.append(gid)
                             logger.debug(
                                 f"[LLM Rows] '{title}' had no free anchor genre; "
@@ -1133,20 +1252,18 @@ class RowGeneratorService:
 
                 for kw_name in kw_names:
                     kid = await self._resolve_keyword_to_id(kw_name, profile_kw_map)
-                    if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST and kid not in used_anchor_keywords:
+                    if kid is not None and kid not in GENERIC_KEYWORD_BLACKLIST:
+                        # Keywords discovered outside the cached profile still need a
+                        # display name so repaired titles can be grounded accurately.
+                        features.keyword_names.setdefault(kid, str(kw_name).strip())
                         builder.add_axis(AXIS_KEYWORD, kid, AxisRole.FLAVOR)
 
-                if country:
-                    builder.add_axis(AXIS_COUNTRY, country, AxisRole.FLAVOR)
-
+                # Ignore country even if a model violates the prompt and returns one.
                 row_comp = builder.build()
                 if row_comp and row_comp.axes:
                     row_id = build_row_id(row_comp.axes)
                     final_rows.append(RowDefinition(title=title, id=row_id, axes=row_comp.axes))
                     used_anchor_genres.update(row_anchor_genres)
-                    used_anchor_keywords.update(
-                        a.value for a in row_comp.axes if a.name == AXIS_KEYWORD
-                    )
 
             logger.info(
                 f"[LLM Rows] {len(final_rows)} of {len(data)} themes survived processing "

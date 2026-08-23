@@ -299,14 +299,44 @@ class DynamicCatalogService:
             get_catalogs_from_config(user_settings, "watchly.creators", "From Your Favorite Creators", False, False)
         )
 
-        # 6. Add watchly.all.loved catalog
+        # 6. Add watchly.all.loved only for media types that actually have
+        # loved source items. An enabled but empty aggregate catalog cannot
+        # produce recommendations and must not block manifest prewarming.
+        loved_types = {
+            item.get("type")
+            for item in library_items.get("loved", [])
+            if isinstance(item, dict)
+        }
         catalogs.extend(
-            get_catalogs_from_config(user_settings, "watchly.all.loved", "Based on What You Loved", True, True, movie_name="Based on Movies You Loved", series_name="Based on Series You Loved")
+            catalog
+            for catalog in get_catalogs_from_config(
+                user_settings,
+                "watchly.all.loved",
+                "Based on What You Loved",
+                True,
+                True,
+                movie_name="Based on Movies You Loved",
+                series_name="Based on Series You Loved",
+            )
+            if catalog.get("type") in loved_types
         )
 
-        # 7. Add watchly.liked.all catalog
+        # 7. Apply the same source-availability rule to watchly.liked.all.
+        liked_types = {
+            item.get("type")
+            for item in library_items.get("liked", [])
+            if isinstance(item, dict)
+        }
         catalogs.extend(
-            get_catalogs_from_config(user_settings, "watchly.liked.all", "Based on What You Liked", True, True)
+            catalog
+            for catalog in get_catalogs_from_config(
+                user_settings,
+                "watchly.liked.all",
+                "Based on What You Liked",
+                True,
+                True,
+            )
+            if catalog.get("type") in liked_types
         )
 
         return catalogs
