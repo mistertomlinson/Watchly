@@ -7,6 +7,8 @@ from loguru import logger
 
 from app.core.config import settings
 from app.core.constants import CATALOG_KEY, LIBRARY_ITEMS_KEY, PROFILE_KEY, WATCHED_SETS_KEY
+
+RAW_CATALOG_KEY = "watchly:catalog_raw:{token}:{type}:{id}"
 from app.core.security import redact_token
 from app.models.taste_profile import TasteProfile
 from app.services.redis_service import redis_service
@@ -430,6 +432,48 @@ class UserCacheService:
                 return None
         return None
 
+    async def get_raw_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+    ) -> tuple[dict[str, Any], int, int | None] | None:
+        """Get the undeduped source snapshot for a catalog, if available."""
+        key = RAW_CATALOG_KEY.format(token=token, type=type, id=id)
+        cached = await redis_service.get(key)
+        if cached:
+            try:
+                data = json.loads(cached)
+                if "data" in data and "created_at" in data:
+                    return (
+                        data["data"],
+                        data["created_at"],
+                        data.get("source_revision"),
+                    )
+                return data, 0, None
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    async def set_raw_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+        catalog: dict[str, Any],
+        ttl: int | None = None,
+        source_revision: int | None = None,
+    ) -> None:
+        """Store the undeduped source snapshot used for coordinated row balancing."""
+        key = RAW_CATALOG_KEY.format(token=token, type=type, id=id)
+        wrapped_data = {
+            "data": catalog,
+            "created_at": int(time.time()),
+            "source_revision": source_revision,
+        }
+        await redis_service.set(key, json.dumps(wrapped_data), ttl)
+        logger.debug(f"[{redact_token(token)}...] Cached raw catalog for {type}/{id}")
+
     async def set_catalog(
         self,
         token: str,
@@ -544,7 +588,9 @@ class UserCacheService:
             id: Catalog ID
         """
         key = CATALOG_KEY.format(token=token, type=type, id=id)
+        raw_key = RAW_CATALOG_KEY.format(token=token, type=type, id=id)
         await redis_service.delete(key)
+        await redis_service.delete(raw_key)
         logger.debug(f"[{redact_token(token)}...] Invalidated catalog cache for {type}/{id}")
 
     async def invalidate_all_catalogs(self, token: str) -> None:
@@ -558,7 +604,9 @@ class UserCacheService:
             token: User token
         """
         pattern = f"watchly:catalog:{token}:*"
+        raw_pattern = f"watchly:catalog_raw:{token}:*"
         deleted_count = await redis_service.delete_by_pattern(pattern)
+        deleted_count += await redis_service.delete_by_pattern(raw_pattern)
         # This remains the explicit destructive-reset path, so clear this
         # profile's dirty marker as part of the same token-scoped reset.
         await redis_service.delete(self._catalog_dirty_key(token))

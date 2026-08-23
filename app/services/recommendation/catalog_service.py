@@ -563,6 +563,17 @@ class CatalogService:
                     ttl=None,
                     source_revision=build_revision,
                 )
+                # Keep an undeduped source snapshot. The manifest-level balancing
+                # pass may rewrite the visible cache, but future generations must
+                # always be able to rebalance from the complete row again.
+                await user_cache.set_raw_catalog(
+                    token,
+                    content_type,
+                    catalog_id,
+                    data,
+                    ttl=None,
+                    source_revision=build_revision,
+                )
             elif cleaned and build_superseded:
                 logger.info(
                     f"[{redact_token(token)}...] "

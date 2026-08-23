@@ -267,6 +267,199 @@ class ManifestService:
                     f"{content_type}/{catalog_id}"
                 )
 
+    @staticmethod
+    def _catalog_meta_identity(meta: dict[str, Any]) -> str | None:
+        """Return a stable identity for cross-row dedupe without using titles."""
+        value = meta.get("id") or meta.get("_tmdb_id")
+        if value is None or value == "":
+            return None
+        return str(value)
+
+    async def _dedupe_prewarmed_catalogs(
+        self,
+        token: str,
+        manifest: dict[str, Any],
+    ) -> None:
+        """Balance duplicate titles across fully built recommendation rows.
+
+        Movies and series are independent pools. Every title that appears in only
+        one row is retained there. For titles shared by multiple rows, assign each
+        title to the row with the fewest titles retained so far, recalculating after
+        every assignment. If rows are tied, keep the title in the row where it
+        ranked higher; manifest order is the final deterministic tie-break.
+
+        This intentionally operates only after every candidate-manifest catalog is
+        prewarmed, because a single catalog build cannot know the sizes or overlap
+        of its sibling rows.
+        """
+        catalogs = manifest.get("catalogs", [])
+
+        for content_type in ("movie", "series"):
+            rows: list[dict[str, Any]] = []
+
+            for position, catalog in enumerate(catalogs):
+                if catalog.get("type") != content_type:
+                    continue
+
+                catalog_id = catalog.get("id")
+                if not catalog_id:
+                    continue
+
+                cached = await user_cache.get_catalog(token, content_type, catalog_id)
+                if cached is None:
+                    raise RuntimeError(
+                        "Cannot dedupe candidate manifest because a prewarmed catalog "
+                        f"is missing: {content_type}/{catalog_id}"
+                    )
+
+                visible_data, _created_at, source_revision = cached
+                raw_cached = await user_cache.get_raw_catalog(token, content_type, catalog_id)
+                if raw_cached is not None and raw_cached[2] == source_revision:
+                    data = raw_cached[0]
+                else:
+                    # First run after this feature is deployed, or a raw snapshot
+                    # from a different source revision: seed it from the complete
+                    # visible build before any coordinated dedupe rewrite occurs.
+                    data = visible_data
+                    await user_cache.set_raw_catalog(
+                        token,
+                        content_type,
+                        catalog_id,
+                        data,
+                        ttl=None,
+                        source_revision=source_revision,
+                    )
+
+                metas = list((data or {}).get("metas") or [])
+                ordered_ids: list[str] = []
+                rank: dict[str, int] = {}
+                unidentified_count = 0
+
+                for index, meta in enumerate(metas):
+                    media_id = self._catalog_meta_identity(meta)
+                    if media_id is None:
+                        unidentified_count += 1
+                        continue
+                    if media_id in rank:
+                        continue
+                    rank[media_id] = index
+                    ordered_ids.append(media_id)
+
+                rows.append(
+                    {
+                        "position": position,
+                        "catalog_id": catalog_id,
+                        "name": catalog.get("name") or catalog_id,
+                        "data": data,
+                        "metas": metas,
+                        "ordered_ids": ordered_ids,
+                        "rank": rank,
+                        "unidentified_count": unidentified_count,
+                        "source_revision": source_revision,
+                    }
+                )
+
+            owners: dict[str, list[int]] = {}
+            for row_index, row in enumerate(rows):
+                for media_id in row["ordered_ids"]:
+                    owners.setdefault(media_id, []).append(row_index)
+
+            duplicates = {
+                media_id: indexes
+                for media_id, indexes in owners.items()
+                if len(indexes) > 1
+            }
+            if not duplicates:
+                continue
+
+            retained: list[set[str]] = [set() for _ in rows]
+            for media_id, indexes in owners.items():
+                if len(indexes) == 1:
+                    retained[indexes[0]].add(media_id)
+
+            def current_size(row_index: int) -> int:
+                return len(retained[row_index]) + rows[row_index]["unidentified_count"]
+
+            # Allocate row-first rather than duplicate-first. Picking a fixed duplicate
+            # order can strand a genuinely small row: each of its shared titles may be
+            # awarded elsewhere early, even though those other rows later grow larger.
+            # Water-filling from the currently smallest row makes "smallest row wins"
+            # true across the allocation as a whole, not merely for each title in an
+            # arbitrary processing order.
+            unassigned = dict(duplicates)
+
+            while unassigned:
+                eligible_rows: dict[int, list[str]] = {}
+                for media_id, indexes in unassigned.items():
+                    for row_index in indexes:
+                        eligible_rows.setdefault(row_index, []).append(media_id)
+
+                winner = min(
+                    eligible_rows,
+                    key=lambda i: (
+                        current_size(i),
+                        len(rows[i]["ordered_ids"]),
+                        rows[i]["position"],
+                    ),
+                )
+
+                media_id = min(
+                    eligible_rows[winner],
+                    key=lambda mid: (
+                        len(unassigned[mid]),
+                        rows[winner]["rank"][mid],
+                        mid,
+                    ),
+                )
+                retained[winner].add(media_id)
+                unassigned.pop(media_id)
+
+            total_removed = 0
+            for row_index, row in enumerate(rows):
+                new_metas = []
+                seen_local: set[str] = set()
+
+                for meta in row["metas"]:
+                    media_id = self._catalog_meta_identity(meta)
+                    if media_id is None:
+                        new_metas.append(meta)
+                        continue
+                    if media_id in seen_local:
+                        continue
+                    seen_local.add(media_id)
+                    if media_id in retained[row_index]:
+                        new_metas.append(meta)
+
+                removed = len(row["metas"]) - len(new_metas)
+
+                # Always rewrite from the undeduped raw snapshot. A previous
+                # balancing pass may have removed titles that this allocation
+                # now awards back to the row; skipping a zero-removal row would
+                # leave that older, smaller visible cache in place.
+                rewritten = dict(row["data"])
+                rewritten["metas"] = new_metas
+                await user_cache.set_catalog(
+                    token,
+                    content_type,
+                    row["catalog_id"],
+                    rewritten,
+                    ttl=None,
+                    source_revision=row["source_revision"],
+                )
+                total_removed += max(removed, 0)
+                if removed > 0:
+                    logger.info(
+                        f"[{redact_token(token)}...] [Dedupe] {content_type} "
+                        f"'{row['name']}' {len(row['metas'])} -> {len(new_metas)} "
+                        f"(removed {removed} duplicate placements)"
+                    )
+
+            logger.info(
+                f"[{redact_token(token)}...] [Dedupe] {content_type}: "
+                f"{len(duplicates)} duplicated titles balanced across {len(rows)} rows; "
+                f"removed {total_removed} duplicate placements"
+            )
+
     async def _manifest_catalogs_are_cached(
         self,
         token: str,
@@ -293,6 +486,7 @@ class ManifestService:
                 raise RuntimeError("Candidate manifest unexpectedly contained no catalogs")
 
             await self._prewarm_manifest_catalogs(token, candidate)
+            await self._dedupe_prewarmed_catalogs(token, candidate)
             await user_cache.set_prepared_manifest(token, candidate)
             logger.info(
                 f"[{redact_token(token)}...] Next Watchly manifest is fully "
