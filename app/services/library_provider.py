@@ -96,8 +96,8 @@ def make_library_item(
         "name": title,
         "year": year,
         "state": {
-            "timesWatched": max(plays, 1),
-            "flaggedWatched": 1,
+            "timesWatched": max(plays, 0),
+            "flaggedWatched": 1 if plays > 0 else 0,
             "lastWatched": watched_at or "",
         },
         "temp": False,

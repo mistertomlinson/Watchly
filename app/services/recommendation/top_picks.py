@@ -341,6 +341,12 @@ class TopPicksService:
             loved = [i for i in library_items.get("loved", []) if i.get("type") == content_type]
             liked = [i for i in library_items.get("liked", []) if i.get("type") == content_type]
             watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
+            plan_to_watch = [
+                i
+                for i in library_items.get("added", [])
+                if i.get("type") == content_type
+                and str(i.get("_provider_status") or "").lower() in {"plantowatch", "planning"}
+            ]
 
             # Sort watched by last watched date
             watched.sort(key=lambda x: x.get("state", {}).get("lastWatched", ""), reverse=True)
@@ -348,6 +354,7 @@ class TopPicksService:
             # Build loved/liked section separately
             loved_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in loved[:20]]
             liked_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in liked[:20]]
+            plan_to_watch_lines = ["- {} ({})".format(i.get("name"), i.get("year", "N/A")) for i in plan_to_watch]
             watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
 
             # Top genres from profile
@@ -381,26 +388,30 @@ class TopPicksService:
             }.get(popularity, "Include a mix of well-known titles and lesser-known quality titles.")
 
             gemini_request_limit = limit * 3
-            all_watched_lines = list(dict.fromkeys(loved_lines + liked_lines + watched_lines))
 
             prompt = f"""You are an expert {content_type} recommendation engine.
 
 User Interest Summary: {interest_summary}
 
-Content they LOVED (10/10 — strongest signal, prioritize similarity to these above all else):
+Content they LOVED (3.0 — strongest positive signal, prioritize similarity to these above all else):
 {chr(10).join(loved_lines) if loved_lines else "None recorded"}
 
-Content they LIKED (7-9/10 — secondary signal):
+Content they LIKED (2.0 — second strongest positive signal):
 {chr(10).join(liked_lines) if liked_lines else "None recorded"}
 
-COMPLETE watch history — DO NOT recommend ANY of these titles:
-{chr(10).join(all_watched_lines) if all_watched_lines else "None recorded"}
+Content they PLAN TO WATCH (1.0 — positive signal; stronger than ordinary watched history, weaker than liked):
+{chr(10).join(plan_to_watch_lines) if plan_to_watch_lines else "None recorded"}
+
+Content they WATCHED (0.5 — weakest positive signal; use as supporting evidence):
+{chr(10).join(watched_lines) if watched_lines else "None recorded"}
+
+DO NOT recommend any title appearing in ANY of the four sections above.
 
 TASK: Recommend exactly {gemini_request_limit} {content_type}s this person has NOT watched yet.
 - Strongly reflect their taste profile and interest summary
 - {popularity_instruction}
 - Prioritize quality and relevance
-- DO NOT recommend ANYTHING from the watch history above — check every title before including it
+- DO NOT recommend ANY title appearing in the LOVED, LIKED, PLAN TO WATCH, or WATCHED sections above
 - Lean toward their strongest preferences but include some variety{year_constraint}
 
 RESPONSE FORMAT (one per line, no other text):

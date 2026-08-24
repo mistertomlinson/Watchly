@@ -89,8 +89,24 @@ class ItemBasedService:
             gemini_results = await self._fetch_gemini_item_recommendations(
                 item_id, content_type, library_items, gemini_api_key, limit
             )
+            gemini_results = self._deduplicate_candidates(gemini_results)
+            excluded_imdb = set(watched_imdb or set())
+            if item_id.startswith("tt"):
+                excluded_imdb.add(item_id)
+            gemini_results = filter_watched_by_imdb(gemini_results, excluded_imdb)
+
+            excluded_tmdb = set(watched_tmdb or set())
+            source_tmdb_id = await resolve_tmdb_id(item_id, self.tmdb_service)
+            if source_tmdb_id:
+                excluded_tmdb.add(source_tmdb_id)
+            if excluded_tmdb:
+                gemini_results = [
+                    item
+                    for item in gemini_results
+                    if item.get("_tmdb_id") not in excluded_tmdb
+                ]
+
             if len(gemini_results) >= limit // 2:
-                gemini_results = self._deduplicate_candidates(gemini_results)
                 logger.info(f"Using Gemini recommendations for {item_id}: {len(gemini_results)} results")
                 return gemini_results
             logger.info(f"Gemini returned only {len(gemini_results)} for {item_id}, falling back to TMDB")
@@ -163,8 +179,20 @@ class ItemBasedService:
             from app.services.tmdb.genre import movie_genres, series_genres
             genre_map = movie_genres if mtype == "movie" else series_genres
             seed_genres = ", ".join([genre_map.get(gid, "") for gid in genre_ids if genre_map.get(gid)])
+            loved = [i for i in library_items.get("loved", []) if i.get("type") == content_type]
+            liked = [i for i in library_items.get("liked", []) if i.get("type") == content_type]
             watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
-            watched_lines = [f"- {i.get('name')} ({i.get('year', 'N/A')})" for i in watched]
+            plan_to_watch = [
+                i
+                for i in library_items.get("added", [])
+                if i.get("type") == content_type
+                and str(i.get("_provider_status") or "").lower() in {"plantowatch", "planning"}
+            ]
+            excluded_items = loved + liked + plan_to_watch + watched
+            excluded_lines = list(dict.fromkeys(
+                "- {} ({})".format(i.get("name"), i.get("year", "N/A"))
+                for i in excluded_items
+            ))
 
             year_min = getattr(self.user_settings, "year_min", None)
             year_max = getattr(self.user_settings, "year_max", None)
@@ -189,13 +217,13 @@ The user just watched: {seed_title} ({seed_year})
 About this title: {seed_overview}
 Genres: {seed_genres}
 
-COMPLETE watch history — DO NOT recommend ANY of these titles:
-{chr(10).join(watched_lines) if watched_lines else "None recorded"}
+LIBRARY TITLES ALREADY SEEN OR SAVED — DO NOT recommend ANY of these titles:
+{chr(10).join(excluded_lines) if excluded_lines else "None recorded"}
 
 TASK: Recommend exactly {gemini_limit} {content_type}s that are similar to "{seed_title}" in theme, tone, style, AND genre. If the seed title is a documentary, only recommend documentaries. If it is a horror film, recommend horror films. Match the genre closely.
 - Focus on similarity to the seed title
 - {popularity_instruction}
-- DO NOT recommend ANYTHING from the watch history above — check every title before including it{year_constraint}
+- DO NOT recommend ANY title from the library exclusion list above — check every title before including it{year_constraint}
 
 RESPONSE FORMAT (one per line, no other text):
 {content_type}|Title|Year"""

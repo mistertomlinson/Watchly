@@ -4,7 +4,6 @@ import httpx
 
 from app.models.scoring import ScoredItem
 from app.services.content_preferences import filter_profile_keyword_ids
-from app.services.cinemeta_service import CinemetaService, cinemeta_service
 from app.services.profile.constants import (
     CAST_POSITION_LEAD,
     CAST_POSITION_MINOR,
@@ -93,7 +92,6 @@ class ItemVectorizer:
             tmdb_service: TMDB service for fetching metadata
         """
         self.tmdb_service: TMDBService = tmdb_service
-        self.cinemeta_service: CinemetaService = cinemeta_service
 
     async def extract_features(self, item: ScoredItem) -> dict[str, Any] | None:
         """
@@ -169,17 +167,14 @@ class ItemVectorizer:
         if features["year"]:
             features["era"] = self._year_to_era(features["year"])
 
-        imdb_id = metadata.get("external_ids", {}).get("imdb_id")
-        cinemeta_metadata = await self.cinemeta_service.get_metadata(imdb_id, content_type)
-
-        # Extract runtime bucket
-        runtime_bucket = await self._extract_runtime_bucket(cinemeta_metadata)
+        # Extract runtime directly from the TMDB details already fetched above.
+        runtime_bucket = await self._extract_runtime_bucket(metadata, content_type)
         if runtime_bucket:
             features["runtime_bucket"] = runtime_bucket
 
-        # Extract number of episodes (for series only)
+        # TMDB TV details include the total number of episodes.
         if content_type == "series":
-            num_episodes = self._extract_episode_count(cinemeta_metadata)
+            num_episodes = self._extract_episode_count(metadata)
             if num_episodes:
                 features["episode_count"] = num_episodes
 
@@ -266,26 +261,20 @@ class ItemVectorizer:
 
         return crew_list
 
-    async def _extract_runtime_bucket(self, cinemeta_metadata: dict[str, Any]) -> str | None:
-        """
-        Extract runtime and convert to bucket.
-
-        Args:
-            metadata: Full metadata dict
-
-        Returns:
-            Runtime bucket string (short/medium/long) or None
-        """
-
-        # fetch metadata from cinemeta for runtime.
+    async def _extract_runtime_bucket(self, metadata: dict[str, Any], content_type: str) -> str | None:
+        """Extract a runtime bucket from TMDB details."""
         runtime = 0
-        content_type = cinemeta_metadata.get("type")
+        if content_type == "movie":
+            runtime = metadata.get("runtime") or 0
+        else:
+            runtimes = metadata.get("episode_run_time") or []
+            runtime = next((r for r in runtimes if isinstance(r, (int, float)) and r > 0), 0)
+            if not runtime:
+                runtime = (metadata.get("last_episode_to_air") or {}).get("runtime") or 0
+            if not runtime:
+                runtime = (metadata.get("next_episode_to_air") or {}).get("runtime") or 0
 
-        runtime_str = cinemeta_metadata.get("runtime", "0 min")
-        if runtime_str:
-            runtime = int(runtime_str.split(" ")[0])
-
-        if not runtime or not isinstance(runtime, (int, float)):
+        if not isinstance(runtime, (int, float)) or runtime <= 0:
             return None
 
         short_runtime_max = (
@@ -297,25 +286,15 @@ class ItemVectorizer:
 
         if runtime < short_runtime_max:
             return "short"
-        elif runtime < medium_runtime_max:
+        if runtime < medium_runtime_max:
             return "medium"
-        else:
-            return "long"
+        return "long"
 
     @staticmethod
-    def _extract_episode_count(cinemeta_metadata: dict[str, Any]) -> int | None:
-        """
-        Extract number of episodes for series.
-
-        Args:
-            metadata: Full metadata dict
-
-        Returns:
-            Number of episodes or None
-        """
-        episodes = [v for v in cinemeta_metadata.get("videos", []) if v.get("season") != 0]  # remove specials
-        num_episodes = len(episodes)
-        return num_episodes
+    def _extract_episode_count(metadata: dict[str, Any]) -> int | None:
+        """Extract total episode count from TMDB TV details."""
+        count = metadata.get("number_of_episodes")
+        return count if isinstance(count, int) and count > 0 else None
 
     @staticmethod
     def _year_to_era(year: int) -> str:

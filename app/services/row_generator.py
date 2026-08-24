@@ -347,6 +347,8 @@ GENERIC_KEYWORD_BLACKLIST = {
     2964,    # future               - too broad; overlaps the sci-fi genre
     179430,  # aftercreditsstinger  - technical credits metadata, not a theme
     179431,  # duringcreditsstinger - technical credits metadata, not a theme
+    9663,    # sequel              - structural franchise metadata, not a taste subject
+    325765,  # amused              - subjective reaction tag, not a useful taste axis
 }
 
 # Previously blacklisted by mistake, now allowed:

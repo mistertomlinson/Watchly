@@ -256,12 +256,28 @@ class CatalogService:
         # cancel the shared build that another request is awaiting.
         return await asyncio.shield(task)
 
+    async def build_staged_catalog(
+        self,
+        token: str,
+        content_type: str,
+        catalog_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build one candidate catalog without touching the published namespace."""
+        return await self._get_catalog_impl(
+            token,
+            content_type,
+            catalog_id,
+            force_refresh=True,
+            stage_only=True,
+        )
+
     async def _get_catalog_impl(
         self,
         token: str,
         content_type: str,
         catalog_id: str,
         force_refresh: bool = False,
+        stage_only: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """
         Get catalog recommendations.
@@ -372,14 +388,9 @@ class CatalogService:
                         logger.info(
                             f"[{redact_token(token)}...] "
                             "Serving published catalog immediately; "
-                            "replacement will build in background "
+                            "coordinated manifest preparation will replace it "
                             f"({reason}) for "
                             f"{content_type}/{catalog_id}"
-                        )
-                        self._schedule_background_catalog_refresh(
-                            token,
-                            content_type,
-                            catalog_id,
                         )
                     else:
                         logger.debug(
@@ -390,19 +401,30 @@ class CatalogService:
 
                     return response_data, headers
 
-                # A forced background build keeps the published payload as its
-                # failure fallback. It is never removed before replacement.
-                stale_data = data
-                logger.info(
-                    f"[{redact_token(token)}...] "
-                    "Building replacement snapshot in background for "
-                    f"{content_type}/{catalog_id}"
-                )
+                if stage_only:
+                    logger.info(
+                        f"[{redact_token(token)}...] "
+                        "Building isolated staged candidate for "
+                        f"{content_type}/{catalog_id}"
+                    )
+                else:
+                    # A forced background build keeps the published payload as its
+                    # failure fallback. It is never removed before replacement.
+                    stale_data = data
+                    logger.info(
+                        f"[{redact_token(token)}...] "
+                        "Building replacement snapshot in background for "
+                        f"{content_type}/{catalog_id}"
+                    )
             else:
                 logger.info(
                     f"[{redact_token(token)}...] "
                     f"Catalog not cached for {content_type}/{catalog_id}, "
-                    "building from scratch"
+                    + (
+                        "building isolated staged candidate"
+                        if stage_only
+                        else "building from scratch"
+                    )
                 )
 
             # Resolve auth and settings
@@ -483,7 +505,7 @@ class CatalogService:
                 if gemini_key and token:
                     try:
                         from app.services.interest_summary import interest_summary_service
-                        summary = await interest_summary_service.generate_summary(profile, gemini_key)
+                        summary = await interest_summary_service.generate_summary(profile, gemini_key, tmdb_service=services["tmdb"])
                         if summary:
                             profile.interest_summary = summary
                             await user_cache.set_profile(token, content_type, profile)
@@ -548,37 +570,50 @@ class CatalogService:
                 )
             )
 
-            # Atomic promotion: Redis is replaced only after a complete,
-            # non-empty build whose source revision is still current.
+            # A staged candidate is isolated from the currently published
+            # generation. Ordinary builds retain the existing live-cache path.
             if cleaned and not build_superseded:
-                await user_cache.set_catalog(
-                    token,
-                    content_type,
-                    catalog_id,
-                    data,
-                    # Published snapshots must survive indefinitely until a
-                    # successful replacement or an explicit profile reset.
-                    # Freshness is tracked separately by created_at and the
-                    # token-scoped source/dirty revisions.
-                    ttl=None,
-                    source_revision=build_revision,
-                )
-                # Keep an undeduped source snapshot. The manifest-level balancing
-                # pass may rewrite the visible cache, but future generations must
-                # always be able to rebalance from the complete row again.
-                await user_cache.set_raw_catalog(
-                    token,
-                    content_type,
-                    catalog_id,
-                    data,
-                    ttl=None,
-                    source_revision=build_revision,
-                )
+                if stage_only:
+                    await user_cache.set_staged_catalog(
+                        token,
+                        content_type,
+                        catalog_id,
+                        data,
+                        source_revision=build_revision,
+                    )
+                    await user_cache.set_staged_raw_catalog(
+                        token,
+                        content_type,
+                        catalog_id,
+                        data,
+                        source_revision=build_revision,
+                    )
+                else:
+                    await user_cache.set_catalog(
+                        token,
+                        content_type,
+                        catalog_id,
+                        data,
+                        ttl=None,
+                        source_revision=build_revision,
+                    )
+                    await user_cache.set_raw_catalog(
+                        token,
+                        content_type,
+                        catalog_id,
+                        data,
+                        ttl=None,
+                        source_revision=build_revision,
+                    )
             elif cleaned and build_superseded:
                 logger.info(
                     f"[{redact_token(token)}...] "
-                    "Discarding superseded catalog replacement for "
-                    f"{content_type}/{catalog_id}; profile/library "
+                    + (
+                        "Discarding superseded staged candidate for "
+                        if stage_only
+                        else "Discarding superseded catalog replacement for "
+                    )
+                    + f"{content_type}/{catalog_id}; profile/library "
                     "changed while the build was running"
                 )
 
@@ -605,6 +640,11 @@ class CatalogService:
 
         except Exception as e:
             logger.error(f"[{redact_token(token)}...] Failed to generate catalog: {e}")
+
+            # Candidate preparation must fail closed. Never treat an old published
+            # payload as a successfully rebuilt staged catalog.
+            if stage_only:
+                return {"metas": []}, headers
 
             # Fallback 1: Return Stale Data if available
             if stale_data:

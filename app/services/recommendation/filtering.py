@@ -51,11 +51,18 @@ class RecommendationFiltering:
 
         library_data = library_data or {}
 
+        plan_to_watch = [
+            item
+            for item in library_data.get("added", [])
+            if str(item.get("_provider_status") or "").lower() in {"plantowatch", "planning"}
+        ]
+
         all_items = (
             library_data.get("loved", [])
             + library_data.get("watched", [])
             + library_data.get("removed", [])
             + library_data.get("liked", [])
+            + plan_to_watch
         )
 
         # Filter by content_type if specified to prevent cross-contamination

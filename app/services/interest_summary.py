@@ -1,3 +1,5 @@
+import asyncio
+
 from loguru import logger
 
 from app.models.taste_profile import TasteProfile
@@ -36,7 +38,9 @@ class InterestSummaryService:
         if genre_names:
             parts.append(f"[Primary] Top Genres (strongest first): {', '.join(genre_names)}")
 
-        top_keywords = profile.get_top_keywords(limit=15)
+        from app.services.row_generator import GENERIC_KEYWORD_BLACKLIST
+
+        top_keywords = [x for x in profile.get_top_keywords(limit=25) if x[0] not in GENERIC_KEYWORD_BLACKLIST][:15]
         if top_keywords:
             keyword_ids = [str(k_id) for k_id, _ in top_keywords]
             parts.append(f"[Primary] Top Keyword IDs (higher = more watched): {', '.join(keyword_ids)}")
@@ -48,11 +52,16 @@ class InterestSummaryService:
 
         return "\n".join(parts)
 
+    def profile_signature(self, profile: TasteProfile) -> str:
+        """Return the exact profile-derived input used to decide summary freshness."""
+        return self._format_profile_data(profile)
+
     async def generate_summary(
         self,
         profile: TasteProfile,
         api_key: str,
         keyword_names: dict[int, str] | None = None,
+        tmdb_service=None,
     ) -> str:
         """Generate a text summary of the user's interest profile using Gemini.
 
@@ -72,9 +81,25 @@ class InterestSummaryService:
             if not profile_text:
                 return ""
 
+            # Resolve strongest TMDB keyword IDs to readable names.
+            if keyword_names is None and tmdb_service is not None:
+                from app.services.row_generator import GENERIC_KEYWORD_BLACKLIST
+
+                top_keywords = [x for x in profile.get_top_keywords(limit=25) if x[0] not in GENERIC_KEYWORD_BLACKLIST][:15]
+                keyword_ids = [k_id for k_id, _ in top_keywords]
+                results = await asyncio.gather(
+                    *[tmdb_service.get_keyword_details(k_id) for k_id in keyword_ids],
+                    return_exceptions=True,
+                )
+                keyword_names = {
+                    k_id: result.get("name")
+                    for k_id, result in zip(keyword_ids, results)
+                    if isinstance(result, dict) and result.get("name")
+                }
+
             # Enrich with resolved keyword names if available
             if keyword_names:
-                top_keywords = profile.get_top_keywords(limit=12)
+                top_keywords = [x for x in profile.get_top_keywords(limit=20) if x[0] not in GENERIC_KEYWORD_BLACKLIST][:12]
                 resolved = [keyword_names[k_id] for k_id, _ in top_keywords if k_id in keyword_names]
                 if resolved:
                     # Replace the keyword IDs line with actual names

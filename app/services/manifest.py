@@ -98,9 +98,17 @@ class ManifestService:
         )
         for content_type in ["movie", "series"]:
             try:
+                previous_profile = await user_cache.get_profile(token, content_type)
                 profile, watched_tmdb, watched_imdb = await integration_service.build_profile_from_library(
                     library_items, content_type
                 )
+
+                if profile and previous_profile and previous_profile.interest_summary:
+                    from app.services.interest_summary import interest_summary_service
+                    if interest_summary_service.profile_signature(previous_profile) == interest_summary_service.profile_signature(profile):
+                        profile.interest_summary = previous_profile.interest_summary
+                        logger.info(f"[{redact_token(token)}] Preserved unchanged {content_type} interest summary")
+
                 await user_cache.set_profile_and_watched_sets(
                     token, content_type, profile, watched_tmdb, watched_imdb
                 )
@@ -248,22 +256,24 @@ class ManifestService:
             content_type = catalog.get("type")
             catalog_id = catalog.get("id")
             if not content_type or not catalog_id:
-                raise RuntimeError(f"Candidate manifest contained invalid catalog definition: {catalog!r}")
-
-            cached = await user_cache.get_catalog(token, content_type, catalog_id)
-            if cached is not None:
-                continue
+                raise RuntimeError(
+                    f"Candidate manifest contained invalid catalog definition: {catalog!r}"
+                )
 
             logger.info(
-                f"[{redact_token(token)}...] Prewarming next manifest "
+                f"[{redact_token(token)}...] Prewarming isolated next manifest "
                 f"catalog {index}/{total}: {content_type}/{catalog_id}"
             )
-            await builder.get_catalog(token, content_type, catalog_id)
+            await builder.build_staged_catalog(token, content_type, catalog_id)
 
-            cached = await user_cache.get_catalog(token, content_type, catalog_id)
-            if cached is None:
+            staged = await user_cache.get_staged_catalog(
+                token,
+                content_type,
+                catalog_id,
+            )
+            if staged is None or not (staged[0] or {}).get("metas"):
                 raise RuntimeError(
-                    "Catalog build completed without publishing a cache entry for "
+                    "Catalog build completed without staging a non-empty candidate for "
                     f"{content_type}/{catalog_id}"
                 )
 
@@ -305,28 +315,26 @@ class ManifestService:
                 if not catalog_id:
                     continue
 
-                cached = await user_cache.get_catalog(token, content_type, catalog_id)
+                cached = await user_cache.get_staged_catalog(token, content_type, catalog_id)
                 if cached is None:
                     raise RuntimeError(
-                        "Cannot dedupe candidate manifest because a prewarmed catalog "
+                        "Cannot dedupe candidate manifest because a staged catalog "
                         f"is missing: {content_type}/{catalog_id}"
                     )
 
                 visible_data, _created_at, source_revision = cached
-                raw_cached = await user_cache.get_raw_catalog(token, content_type, catalog_id)
+                raw_cached = await user_cache.get_staged_raw_catalog(token, content_type, catalog_id)
                 if raw_cached is not None and raw_cached[2] == source_revision:
                     data = raw_cached[0]
                 else:
-                    # First run after this feature is deployed, or a raw snapshot
-                    # from a different source revision: seed it from the complete
-                    # visible build before any coordinated dedupe rewrite occurs.
+                    # A staged raw snapshot should normally exist. If it is missing or from
+                    # another source revision, seed it from this complete staged build.
                     data = visible_data
-                    await user_cache.set_raw_catalog(
+                    await user_cache.set_staged_raw_catalog(
                         token,
                         content_type,
                         catalog_id,
                         data,
-                        ttl=None,
                         source_revision=source_revision,
                     )
 
@@ -432,18 +440,15 @@ class ManifestService:
 
                 removed = len(row["metas"]) - len(new_metas)
 
-                # Always rewrite from the undeduped raw snapshot. A previous
-                # balancing pass may have removed titles that this allocation
-                # now awards back to the row; skipping a zero-removal row would
-                # leave that older, smaller visible cache in place.
+                # Always rewrite the isolated staged snapshot from its undeduped source.
+                # The live generation remains untouched until atomic promotion.
                 rewritten = dict(row["data"])
                 rewritten["metas"] = new_metas
-                await user_cache.set_catalog(
+                await user_cache.set_staged_catalog(
                     token,
                     content_type,
                     row["catalog_id"],
                     rewritten,
-                    ttl=None,
                     source_revision=row["source_revision"],
                 )
                 total_removed += max(removed, 0)
@@ -460,7 +465,7 @@ class ManifestService:
                 f"removed {total_removed} duplicate placements"
             )
 
-    async def _manifest_catalogs_are_cached(
+    async def _prepared_manifest_catalogs_are_staged(
         self,
         token: str,
         manifest: dict[str, Any],
@@ -470,7 +475,9 @@ class ManifestService:
             catalog_id = catalog.get("id")
             if not content_type or not catalog_id:
                 return False
-            if await user_cache.get_catalog(token, content_type, catalog_id) is None:
+            if await user_cache.get_staged_catalog(token, content_type, catalog_id) is None:
+                return False
+            if await user_cache.get_staged_raw_catalog(token, content_type, catalog_id) is None:
                 return False
         return True
 
@@ -478,6 +485,10 @@ class ManifestService:
         try:
             if await user_cache.get_prepared_manifest(token):
                 return
+
+            # A new candidate must start from an empty isolated namespace so
+            # leftovers from an interrupted or failed preparation cannot leak in.
+            await user_cache.clear_staged_catalogs(token)
 
             candidate = await self._build_candidate_manifest_for_token(token)
             active = await user_cache.get_active_manifest(token)
@@ -493,8 +504,10 @@ class ManifestService:
                 "prewarmed and waiting for the next manifest request"
             )
         except asyncio.CancelledError:
+            await user_cache.clear_staged_catalogs(token)
             raise
         except Exception as exc:
+            await user_cache.clear_staged_catalogs(token)
             logger.exception(
                 f"[{redact_token(token)}...] Failed to prepare next Watchly "
                 f"manifest; keeping current published generation: {exc}"
@@ -534,20 +547,27 @@ class ManifestService:
         # promoted before the ordinary fresh-cache check.
         prepared = await user_cache.get_prepared_manifest(token)
         if prepared:
-            if await self._manifest_catalogs_are_cached(token, prepared):
-                await user_cache.set_manifest(token, prepared)
-                await user_cache.clear_prepared_manifest(token)
-                logger.info(f"[{redact_token(token)}] Promoted fully prewarmed Watchly manifest generation")
-                self._schedule_next_manifest_prepare(token)
-                return prepared
+            if await self._prepared_manifest_catalogs_are_staged(token, prepared):
+                promoted = await user_cache.promote_prepared_generation(token, prepared)
+                if promoted:
+                    logger.info(f"[{redact_token(token)}] Promoted fully prewarmed Watchly manifest generation")
+                    self._schedule_next_manifest_prepare(token)
+                    return prepared
 
-            # A prepared generation may outlive one of its catalog cache entries
-            # if the user does not launch for a long time. Never promote it cold.
-            logger.warning(
-                f"[{redact_token(token)}] Prepared manifest lost one or more "
-                "catalog cache entries; discarding it instead of publishing cold IDs"
-            )
-            await user_cache.clear_prepared_manifest(token)
+                logger.info(
+                    f"[{redact_token(token)}] Prepared generation was not promoted; "
+                    "continuing with the current published generation"
+                )
+                prepared = None
+
+            if prepared is not None:
+                # Never publish a prepared manifest whose isolated payloads are incomplete.
+                logger.warning(
+                    f"[{redact_token(token)}] Prepared manifest lost one or more "
+                    "staged catalog payloads; discarding it instead of publishing cold IDs"
+                )
+                await user_cache.clear_prepared_manifest(token)
+                await user_cache.clear_staged_catalogs(token)
 
         cached = await user_cache.get_manifest(token)
         if cached:

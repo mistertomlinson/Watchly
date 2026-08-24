@@ -185,7 +185,7 @@ class SimklLibraryProvider:
                 year=media.get("year") or raw.get("year"),
                 provider="simkl",
                 watched_at=watched_at,
-                plays=max(int(watched_count or 0), 1),
+                plays=max(int(watched_count or 0), 0),
                 rating=rating,
                 status=status,
             )

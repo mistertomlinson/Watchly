@@ -2,10 +2,9 @@ from typing import Final
 
 # Evidence Weights (how much each interaction type contributes)
 EVIDENCE_WEIGHT_LOVED: Final[float] = 3.0
-EVIDENCE_WEIGHT_LIKED: Final[float] = 1.5
-EVIDENCE_WEIGHT_WATCHED_HIGH: Final[float] = 1.0  # Completion ≥80%
-EVIDENCE_WEIGHT_WATCHED_MEDIUM: Final[float] = 0.5  # Completion 40-79%
-EVIDENCE_WEIGHT_ADDED: Final[float] = 0.3
+EVIDENCE_WEIGHT_LIKED: Final[float] = 2.0
+EVIDENCE_WEIGHT_WATCHED: Final[float] = 0.5
+EVIDENCE_WEIGHT_PLAN_TO_WATCH: Final[float] = 1.0
 
 # Feature Weights (relative importance of different feature types)
 FEATURE_WEIGHT_GENRE: Final[float] = 0.9  # Most important
@@ -34,11 +33,9 @@ CAP_RUNTIME: Final[float] = 25.0
 CAP_COUNTRY: Final[float] = 20.0
 
 # Recency Decay (exponential decay parameters)
-RECENCY_HALF_LIFE_DAYS: Final[float] = 30.0
-RECENCY_DECAY_RATE: Final[float] = 0.98  # Daily decay multiplier (soft decay)
 
 # Smart Sampling
-SMART_SAMPLING_MAX_ITEMS: Final[int] = 30
+SMART_SAMPLING_MAX_ITEMS: Final[int] = 100
 
 # Frequency Multiplier (optional, subtle boost for repeated patterns)
 FREQUENCY_ENABLED: Final[bool] = True

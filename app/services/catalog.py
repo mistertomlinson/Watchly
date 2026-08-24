@@ -187,7 +187,7 @@ class DynamicCatalogService:
             if gemini_api_key and token and not profile.interest_summary:
                 try:
                     logger.info(f"Generating interest summary for {media_type}...")
-                    summary = await interest_summary_service.generate_summary(profile, gemini_api_key)
+                    summary = await interest_summary_service.generate_summary(profile, gemini_api_key, tmdb_service=self.tmdb_service)
                     if summary:
                         profile.interest_summary = summary
                         logger.info(f"Interest summary generated for {media_type}: {summary[:80]}...")

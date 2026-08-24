@@ -42,7 +42,7 @@ class SmartSampler:
         except (TypeError, ValueError):
             return not bool(item.get("_is_disliked"))
 
-        return numeric_rating >= 7
+        return numeric_rating > 2
 
     def sample_items(
         self,
@@ -77,11 +77,8 @@ class SmartSampler:
         if not typed_items:
             return []
 
-        if len(typed_items) <= max_items:
-            # score all typed items and return
-            return [self.scoring_service.process_item(it) for it in typed_items]
-
-        # De-duplicate by ID
+        # De-duplicate by ID before applying the item limit. A title may appear
+        # in multiple library buckets (loved/liked/watched/added).
         unique_items = {}
         for it in typed_items:
             item_id = it.get("_id")
@@ -92,10 +89,8 @@ class SmartSampler:
         if len(unique_items) <= max_items:
             return [self.scoring_service.process_item(it) for it in unique_items.values()]
 
-        # Get set of added item IDs for classification
-        added_item_ids = {it.get("_id") for it in library_items.get("added", [])}
-
-        # Separate items into pools and score them
+        # Separate items into pools and score them. Only explicit provider
+        # plan-to-watch states belong in the added/plan-to-watch pool.
         loved_liked_pool = []
         added_pool = []
         watched_pool = []
@@ -104,7 +99,7 @@ class SmartSampler:
             scored = self.scoring_service.process_item(it)
             if scored.source_type in ["loved", "liked"]:
                 loved_liked_pool.append(scored)
-            elif it.get("_id") in added_item_ids:
+            elif (it.get("_provider_status") or "").lower() in {"plantowatch", "planning"}:
                 added_pool.append(scored)
             else:
                 watched_pool.append(scored)
@@ -138,7 +133,7 @@ class SmartSampler:
         # Step 2: Backfill if we have remaining slots
         remaining_slots = max_items - len(final_scored_items)
         if remaining_slots > 0:
-            # Priority for backfill: Loved > Added > Watched
+            # Priority for backfill: Loved/Liked > Plan to Watch > Watched
             for pool in [loved_liked_pool, added_pool, watched_pool]:
                 for scored in pool:
                     if remaining_slots <= 0:

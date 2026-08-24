@@ -4,11 +4,14 @@ import time
 from typing import Any
 
 from loguru import logger
+from redis.exceptions import WatchError
 
 from app.core.config import settings
 from app.core.constants import CATALOG_KEY, LIBRARY_ITEMS_KEY, PROFILE_KEY, WATCHED_SETS_KEY
 
 RAW_CATALOG_KEY = "watchly:catalog_raw:{token}:{type}:{id}"
+STAGED_CATALOG_KEY = "watchly:catalog_staged:{token}:{type}:{id}"
+STAGED_RAW_CATALOG_KEY = "watchly:catalog_staged_raw:{token}:{type}:{id}"
 from app.core.security import redact_token
 from app.models.taste_profile import TasteProfile
 from app.services.redis_service import redis_service
@@ -506,6 +509,236 @@ class UserCacheService:
         await redis_service.set(key, json.dumps(wrapped_data), ttl)
         logger.debug(f"[{redact_token(token)}...] Cached catalog for {type}/{id}")
 
+    async def get_staged_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+    ) -> tuple[dict[str, Any], int, int | None] | None:
+        """Get a candidate-generation catalog without exposing it to clients."""
+        key = STAGED_CATALOG_KEY.format(token=token, type=type, id=id)
+        cached = await redis_service.get(key)
+        if not cached:
+            return None
+        try:
+            data = json.loads(cached)
+            if "data" in data and "created_at" in data:
+                return (
+                    data["data"],
+                    data["created_at"],
+                    data.get("source_revision"),
+                )
+            return data, 0, None
+        except json.JSONDecodeError:
+            return None
+
+    async def set_staged_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+        catalog: dict[str, Any],
+        source_revision: int | None = None,
+    ) -> None:
+        """Store a candidate-generation catalog outside the published namespace."""
+        key = STAGED_CATALOG_KEY.format(token=token, type=type, id=id)
+        wrapped_data = {
+            "data": catalog,
+            "created_at": int(time.time()),
+            "source_revision": source_revision,
+        }
+        await redis_service.set(
+            key,
+            json.dumps(wrapped_data),
+            30 * 24 * 60 * 60,
+        )
+
+    async def get_staged_raw_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+    ) -> tuple[dict[str, Any], int, int | None] | None:
+        """Get the undeduped candidate-generation source snapshot."""
+        key = STAGED_RAW_CATALOG_KEY.format(token=token, type=type, id=id)
+        cached = await redis_service.get(key)
+        if not cached:
+            return None
+        try:
+            data = json.loads(cached)
+            if "data" in data and "created_at" in data:
+                return (
+                    data["data"],
+                    data["created_at"],
+                    data.get("source_revision"),
+                )
+            return data, 0, None
+        except json.JSONDecodeError:
+            return None
+
+    async def set_staged_raw_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+        catalog: dict[str, Any],
+        source_revision: int | None = None,
+    ) -> None:
+        """Store an undeduped candidate source snapshot outside the live namespace."""
+        key = STAGED_RAW_CATALOG_KEY.format(token=token, type=type, id=id)
+        wrapped_data = {
+            "data": catalog,
+            "created_at": int(time.time()),
+            "source_revision": source_revision,
+        }
+        await redis_service.set(
+            key,
+            json.dumps(wrapped_data),
+            30 * 24 * 60 * 60,
+        )
+
+    async def clear_staged_catalogs(self, token: str) -> None:
+        """Remove all unpublished candidate catalog payloads for one token."""
+        await redis_service.delete_by_pattern(
+            f"watchly:catalog_staged:{token}:*"
+        )
+        await redis_service.delete_by_pattern(
+            f"watchly:catalog_staged_raw:{token}:*"
+        )
+
+    async def promote_prepared_generation(
+        self,
+        token: str,
+        manifest: dict[str, Any],
+        _watch_retry: int = 0,
+    ) -> bool:
+        """Atomically publish one complete staged generation if it is still current."""
+        prepared_key = f"watchly:manifest:prepared:{token}"
+        dirty_key = self._catalog_dirty_key(token)
+        staged = []
+        watch_keys = [prepared_key, dirty_key]
+
+        for catalog in manifest.get("catalogs", []):
+            content_type = catalog.get("type")
+            catalog_id = catalog.get("id")
+            if not content_type or not catalog_id:
+                return False
+            staged_key = STAGED_CATALOG_KEY.format(token=token, type=content_type, id=catalog_id)
+            staged_raw_key = STAGED_RAW_CATALOG_KEY.format(token=token, type=content_type, id=catalog_id)
+            staged.append((
+                CATALOG_KEY.format(token=token, type=content_type, id=catalog_id),
+                RAW_CATALOG_KEY.format(token=token, type=content_type, id=catalog_id),
+                staged_key,
+                staged_raw_key,
+            ))
+            watch_keys.extend((staged_key, staged_raw_key))
+
+        client = await redis_service.get_client()
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                await pipe.watch(*watch_keys)
+
+                prepared_value = await pipe.get(prepared_key)
+                if prepared_value is None:
+                    return False
+                try:
+                    current_prepared = json.loads(prepared_value)
+                except (TypeError, json.JSONDecodeError):
+                    current_prepared = None
+                if current_prepared != manifest:
+                    return False
+
+                dirty_value = await pipe.get(dirty_key)
+                dirty_valid = True
+                try:
+                    current_revision = int(dirty_value) if dirty_value is not None else None
+                except (TypeError, ValueError):
+                    dirty_valid = False
+                    current_revision = None
+
+                payloads = []
+                revisions = set()
+                generation_valid = dirty_valid
+                for live_key, live_raw_key, staged_key, staged_raw_key in staged:
+                    staged_value = await pipe.get(staged_key)
+                    staged_raw_value = await pipe.get(staged_raw_key)
+                    if staged_value is None or staged_raw_value is None:
+                        generation_valid = False
+                        continue
+                    try:
+                        staged_wrapped = json.loads(staged_value)
+                        staged_raw_wrapped = json.loads(staged_raw_value)
+                        staged_revision = staged_wrapped.get("source_revision")
+                        staged_raw_revision = staged_raw_wrapped.get("source_revision")
+                    except (AttributeError, TypeError, json.JSONDecodeError):
+                        generation_valid = False
+                        continue
+                    if staged_revision != staged_raw_revision:
+                        generation_valid = False
+                    revisions.add(staged_revision)
+                    payloads.append((
+                        live_key, live_raw_key, staged_key, staged_raw_key,
+                        staged_value, staged_raw_value,
+                    ))
+
+                if len(revisions) != 1 or next(iter(revisions), None) != current_revision:
+                    generation_valid = False
+
+                pipe.multi()
+                if not generation_valid or len(payloads) != len(staged):
+                    pipe.delete(prepared_key)
+                    for _, _, staged_key, staged_raw_key in staged:
+                        pipe.delete(staged_key, staged_raw_key)
+                    await pipe.execute()
+                    logger.info(
+                        f"[{redact_token(token)}...] Discarded stale/incomplete prepared "
+                        "generation without changing published catalogs"
+                    )
+                    return False
+
+                for (
+                    live_key, live_raw_key, staged_key, staged_raw_key,
+                    staged_value, staged_raw_value,
+                ) in payloads:
+                    pipe.set(live_key, staged_value)
+                    pipe.set(live_raw_key, staged_raw_value)
+                    pipe.delete(staged_key, staged_raw_key)
+
+                wrapped_manifest = json.dumps({
+                    "manifest": manifest,
+                    "created_at": int(time.time()),
+                })
+                pipe.setex(
+                    f"watchly:manifest:{token}",
+                    settings.MANIFEST_CACHE_TTL_SECONDS,
+                    wrapped_manifest,
+                )
+                pipe.set(
+                    f"watchly:manifest:active:{token}",
+                    json.dumps(manifest),
+                    ex=30 * 24 * 60 * 60,
+                )
+                pipe.delete(prepared_key)
+                await pipe.execute()
+                return True
+        except WatchError:
+            if _watch_retry < 2:
+                logger.info(
+                    f"[{redact_token(token)}...] Prepared generation changed during "
+                    "atomic promotion; retrying guarded validation"
+                )
+                return await self.promote_prepared_generation(
+                    token,
+                    manifest,
+                    _watch_retry + 1,
+                )
+
+            logger.warning(
+                f"[{redact_token(token)}...] Prepared generation kept changing during "
+                "atomic promotion; published generation left untouched"
+            )
+            return False
+
     async def get_manifest(self, token: str) -> dict | None:
         """Return cached manifest if still within the manifest cache TTL."""
         key = f"watchly:manifest:{token}"
@@ -574,6 +807,7 @@ class UserCacheService:
         try:
             await redis_service.delete(key)
             await self.clear_prepared_manifest(token)
+            await self.clear_staged_catalogs(token)
             logger.debug(f"[{redact_token(token)}...] Invalidated manifest cache")
         except Exception as e:
             logger.warning(f"[{redact_token(token)}...] Failed to invalidate manifest: {e}")
@@ -589,8 +823,12 @@ class UserCacheService:
         """
         key = CATALOG_KEY.format(token=token, type=type, id=id)
         raw_key = RAW_CATALOG_KEY.format(token=token, type=type, id=id)
+        staged_key = STAGED_CATALOG_KEY.format(token=token, type=type, id=id)
+        staged_raw_key = STAGED_RAW_CATALOG_KEY.format(token=token, type=type, id=id)
         await redis_service.delete(key)
         await redis_service.delete(raw_key)
+        await redis_service.delete(staged_key)
+        await redis_service.delete(staged_raw_key)
         logger.debug(f"[{redact_token(token)}...] Invalidated catalog cache for {type}/{id}")
 
     async def invalidate_all_catalogs(self, token: str) -> None:
@@ -605,8 +843,12 @@ class UserCacheService:
         """
         pattern = f"watchly:catalog:{token}:*"
         raw_pattern = f"watchly:catalog_raw:{token}:*"
+        staged_pattern = f"watchly:catalog_staged:{token}:*"
+        staged_raw_pattern = f"watchly:catalog_staged_raw:{token}:*"
         deleted_count = await redis_service.delete_by_pattern(pattern)
         deleted_count += await redis_service.delete_by_pattern(raw_pattern)
+        deleted_count += await redis_service.delete_by_pattern(staged_pattern)
+        deleted_count += await redis_service.delete_by_pattern(staged_raw_pattern)
         # This remains the explicit destructive-reset path, so clear this
         # profile's dirty marker as part of the same token-scoped reset.
         await redis_service.delete(self._catalog_dirty_key(token))

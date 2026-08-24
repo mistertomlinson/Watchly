@@ -46,6 +46,7 @@ class StremioLibraryItem(BaseModel):
     is_loved: bool = Field(default=False, alias="_is_loved")
     is_liked: bool = Field(default=False, alias="_is_liked")
     interest_score: float = Field(default=0.0, alias="_interest_score")
+    provider_status: str | None = Field(default=None, alias="_provider_status")
 
     class Config:
         populate_by_name = True
