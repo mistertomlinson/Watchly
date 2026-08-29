@@ -40,7 +40,7 @@ class DynamicCatalogService:
     def build_catalog_entry(self, item, label, config_id, display_at_home: bool = True):
         item_id = item.get("_id", "")
         # Use watchly.{config_id}.{item_id} format for better organization
-        if config_id in ["watchly.item", "watchly.loved", "watchly.watched"]:
+        if config_id in ["watchly.item", "watchly.loved", "watchly.morelike", "watchly.watched"]:
             # New Item-based catalog format
             catalog_id = f"{config_id}.{item_id}"
         elif item_id.startswith("tt") and config_id in ["watchly.loved", "watchly.watched"]:
@@ -289,7 +289,7 @@ class DynamicCatalogService:
 
         # 3. Add Item-Based Catalogs (Movies & Series)
         for mtype in ["movie", "series"]:
-            await self._add_item_based_rows(catalogs, library_items, mtype, loved_cfg, watched_cfg)
+            await self._add_item_based_rows(catalogs, library_items, mtype, loved_cfg, watched_cfg, token)
 
         # 4. Add watchly.rec catalog
         catalogs.extend(get_catalogs_from_config(user_settings, "watchly.rec", "Top Picks for You", True, True, movie_name="Top Movies for You", series_name="Top Series for You"))
@@ -385,6 +385,7 @@ class DynamicCatalogService:
         content_type: str,
         loved_config,
         watched_config,
+        token: str | None = None,
     ):
         # Check if this content type is enabled for the configs
         def is_type_enabled(config, content_type: str) -> bool:
@@ -396,32 +397,73 @@ class DynamicCatalogService:
                 return getattr(config, "enabled_series", True)
             return True
 
-        # 1. More Like <Loved Item>
-        last_loved = None  # Initialize for the watched check
+        # 1. More Like <Positive Item>
+        # Loved and liked are both strong positive signals. Rotate through the
+        # complete positive pool before repeating an anchor; Loved receives the
+        # stronger selection weight within each cycle.
+        more_like_item = None
         if loved_config and loved_config.enabled and is_type_enabled(loved_config, content_type):
-            loved = [i for i in library_items.get("loved", []) if i.get("type") == content_type]
-            loved.sort(key=self._parse_item_last_watched, reverse=True)
+            positive_by_id: dict[str, dict] = {}
+            positive_weights: dict[str, float] = {}
 
-            # gather random last loved from last 3 items
-            last_loved = random.choice(loved[:5]) if loved else None
-            if last_loved:
+            for item in library_items.get("liked", []):
+                if item.get("type") != content_type:
+                    continue
+                item_id = item.get("_id")
+                if item_id:
+                    positive_by_id[item_id] = item
+                    positive_weights[item_id] = 2.0
+
+            for item in library_items.get("loved", []):
+                if item.get("type") != content_type:
+                    continue
+                item_id = item.get("_id")
+                if item_id:
+                    positive_by_id[item_id] = item
+                    positive_weights[item_id] = 3.0
+
+            chosen_id = await user_cache.select_rotation_anchor(
+                token,
+                "morelike",
+                content_type,
+                list(positive_by_id),
+                positive_weights,
+            )
+            more_like_item = positive_by_id.get(chosen_id) if chosen_id else None
+
+            if more_like_item:
                 label = loved_config.name if loved_config.name else "More like"
                 loved_config_display_at_home = getattr(loved_config, "display_at_home", True)
                 catalogs.append(
-                    self.build_catalog_entry(last_loved, label, "watchly.loved", loved_config_display_at_home)
+                    self.build_catalog_entry(
+                        more_like_item,
+                        label,
+                        "watchly.morelike",
+                        loved_config_display_at_home,
+                    )
                 )
 
-        # 2. Because you watched <Watched Item>
+        # 2. Because You Watched <Watched Item>
+        # Rotate through the complete watched pool before repeating. Avoid using
+        # the same title as the More Like anchor in the same manifest.
         if watched_config and watched_config.enabled and is_type_enabled(watched_config, content_type):
-            watched = [i for i in library_items.get("watched", []) if i.get("type") == content_type]
-            watched.sort(key=self._parse_item_last_watched, reverse=True)
-
-            # watched cannot be similar to loved
-            if last_loved:
-                watched = [i for i in watched if i.get("_id") != last_loved.get("_id")]
-
-            # gather random last watched from last 3 items
-            last_watched = random.choice(watched[:5]) if watched else None
+            watched_by_id = {
+                item.get("_id"): item
+                for item in library_items.get("watched", [])
+                if item.get("type") == content_type and item.get("_id")
+            }
+            chosen_id = await user_cache.select_rotation_anchor(
+                token,
+                "watched",
+                content_type,
+                list(watched_by_id),
+                excluded_ids=(
+                    {more_like_item.get("_id")}
+                    if more_like_item and more_like_item.get("_id")
+                    else None
+                ),
+            )
+            last_watched = watched_by_id.get(chosen_id) if chosen_id else None
 
             if last_watched:
                 label = watched_config.name if watched_config.name else "Because You Watched"

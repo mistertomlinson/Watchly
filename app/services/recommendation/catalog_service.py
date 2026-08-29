@@ -682,7 +682,7 @@ class CatalogService:
             "watchly.all.loved",
             "watchly.liked.all",
         ]
-        supported_prefixes = ("watchly.theme.", "watchly.loved.", "watchly.watched.")
+        supported_prefixes = ("watchly.theme.", "watchly.loved.", "watchly.morelike.", "watchly.watched.")
         if catalog_id not in supported_base and not any(catalog_id.startswith(p) for p in supported_prefixes):
             logger.warning(f"Invalid id: {catalog_id}")
             raise HTTPException(
@@ -824,11 +824,12 @@ class CatalogService:
             catalog_id.startswith(p)
             for p in (
                 "watchly.loved.",
+                "watchly.morelike.",
                 "watchly.watched.",
             )
         ):
             # Extract item ID
-            item_id = re.sub(r"^watchly\.(loved|watched)\.", "", catalog_id)
+            item_id = re.sub(r"^watchly\.(loved|morelike|watched)\.", "", catalog_id)
 
             item_service: ItemBasedService = services["item"]
 

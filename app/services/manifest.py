@@ -264,17 +264,29 @@ class ManifestService:
                 f"[{redact_token(token)}...] Prewarming isolated next manifest "
                 f"catalog {index}/{total}: {content_type}/{catalog_id}"
             )
-            await builder.build_staged_catalog(token, content_type, catalog_id)
+            staged = None
+            for attempt in range(1, 4):
+                await builder.build_staged_catalog(token, content_type, catalog_id)
 
-            staged = await user_cache.get_staged_catalog(
-                token,
-                content_type,
-                catalog_id,
-            )
+                staged = await user_cache.get_staged_catalog(
+                    token,
+                    content_type,
+                    catalog_id,
+                )
+                if staged is not None and (staged[0] or {}).get("metas"):
+                    break
+
+                if attempt < 3:
+                    logger.info(
+                        f"[{redact_token(token)}...] Staged candidate was not published for "
+                        f"{content_type}/{catalog_id}; retrying against the latest "
+                        f"profile/library revision ({attempt}/3)"
+                    )
+
             if staged is None or not (staged[0] or {}).get("metas"):
                 raise RuntimeError(
                     "Catalog build completed without staging a non-empty candidate for "
-                    f"{content_type}/{catalog_id}"
+                    f"{content_type}/{catalog_id} after 3 attempts"
                 )
 
     @staticmethod

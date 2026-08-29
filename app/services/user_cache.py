@@ -1,5 +1,6 @@
 import hashlib
 import json
+import random
 import time
 from typing import Any
 
@@ -20,6 +21,7 @@ from app.services.redis_service import redis_service
 # from the upstream provider, so they do not need to live forever. Without a TTL
 # these keys accumulate indefinitely for deleted or abandoned tokens.
 DERIVED_CACHE_TTL_SECONDS = 2592000  # 30 days
+ANCHOR_HISTORY_TTL_SECONDS = 90 * 24 * 60 * 60  # 90 days
 
 
 class UserCacheService:
@@ -738,6 +740,111 @@ class UserCacheService:
                 "atomic promotion; published generation left untouched"
             )
             return False
+
+    async def select_rotation_anchor(
+        self,
+        token: str,
+        row_type: str,
+        content_type: str,
+        candidate_ids: list[str],
+        weights: dict[str, float] | None = None,
+        excluded_ids: set[str] | None = None,
+        _watch_retry: int = 0,
+    ) -> str | None:
+        # Atomically choose an anchor without repeating until the current pool is exhausted.
+        candidates = list(dict.fromkeys(item_id for item_id in candidate_ids if item_id))
+        if not candidates:
+            return None
+
+        excluded = set(excluded_ids or ())
+        eligible = [item_id for item_id in candidates if item_id not in excluded]
+        if not eligible:
+            return None
+
+        if not token:
+            if weights:
+                return random.choices(
+                    eligible,
+                    weights=[max(float(weights.get(item_id, 1.0)), 0.0) for item_id in eligible],
+                    k=1,
+                )[0]
+            return random.choice(eligible)
+
+        key = f"watchly:anchor_history:{token}:{row_type}:{content_type}"
+        client = await redis_service.get_client()
+
+        try:
+            async with client.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                raw_history = await pipe.get(key)
+                try:
+                    history = json.loads(raw_history) if raw_history else []
+                except (TypeError, json.JSONDecodeError):
+                    history = []
+
+                if not isinstance(history, list):
+                    history = []
+
+                candidate_set = set(candidates)
+                used = [item_id for item_id in history if item_id in candidate_set]
+                used_set = set(used)
+                unseen = [item_id for item_id in candidates if item_id not in used_set]
+                available = [item_id for item_id in unseen if item_id not in excluded]
+
+                if not unseen:
+                    used = []
+                    available = eligible
+                elif not available:
+                    # All remaining unseen anchors are temporarily excluded by another
+                    # row in this manifest. Preserve the cycle and try again next time.
+                    await pipe.unwatch()
+                    return None
+
+                if weights:
+                    chosen = random.choices(
+                        available,
+                        weights=[max(float(weights.get(item_id, 1.0)), 0.0) for item_id in available],
+                        k=1,
+                    )[0]
+                else:
+                    chosen = random.choice(available)
+
+                pipe.multi()
+                pipe.set(
+                    key,
+                    json.dumps(used + [chosen]),
+                    ex=ANCHOR_HISTORY_TTL_SECONDS,
+                )
+                await pipe.execute()
+                return chosen
+        except WatchError:
+            if _watch_retry < 4:
+                return await self.select_rotation_anchor(
+                    token,
+                    row_type,
+                    content_type,
+                    candidates,
+                    weights,
+                    excluded,
+                    _watch_retry + 1,
+                )
+            logger.warning(
+                f"[{redact_token(token)}...] Anchor history kept changing for "
+                f"{row_type}/{content_type}; falling back to an untracked selection"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{redact_token(token)}...] Failed to update anchor history for "
+                f"{row_type}/{content_type}: {exc}"
+            )
+
+        if weights:
+            return random.choices(
+                eligible,
+                weights=[max(float(weights.get(item_id, 1.0)), 0.0) for item_id in eligible],
+                k=1,
+            )[0]
+        return random.choice(eligible)
 
     async def get_manifest(self, token: str) -> dict | None:
         """Return cached manifest if still within the manifest cache TTL."""
