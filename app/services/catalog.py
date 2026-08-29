@@ -398,7 +398,7 @@ class DynamicCatalogService:
                     self.build_catalog_entry(
                         more_like_item,
                         label,
-                        "watchly.morelike",
+                        "watchly.loved",
                         loved_config_display_at_home,
                     )
                 )
