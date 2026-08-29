@@ -63,6 +63,8 @@ def get_config_id(catalog) -> str | None:
         return "watchly.theme"
     if catalog_id.startswith("watchly.loved."):
         return "watchly.loved"
+    if catalog_id.startswith("watchly.morelike."):
+        return "watchly.loved"
     if catalog_id.startswith("watchly.watched."):
         return "watchly.watched"
     return catalog_id

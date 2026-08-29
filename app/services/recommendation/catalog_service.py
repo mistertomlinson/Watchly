@@ -14,7 +14,6 @@ from app.core.settings import UserSettings, get_default_settings, resolve_tmdb_a
 from app.models.taste_profile import TasteProfile
 from app.services.catalog_updater import catalog_updater
 from app.services.profile.integration import ProfileIntegration
-from app.services.recommendation.all_based import AllBasedService
 from app.services.recommendation.creators import CreatorsService
 from app.services.recommendation.item_based import ItemBasedService
 from app.services.recommendation.theme_based import ThemeBasedService
@@ -679,8 +678,6 @@ class CatalogService:
         supported_base = [
             "watchly.rec",
             "watchly.creators",
-            "watchly.all.loved",
-            "watchly.liked.all",
         ]
         supported_prefixes = ("watchly.theme.", "watchly.loved.", "watchly.morelike.", "watchly.watched.")
         if catalog_id not in supported_base and not any(catalog_id.startswith(p) for p in supported_prefixes):
@@ -689,7 +686,7 @@ class CatalogService:
                 status_code=400,
                 detail=(
                     "Invalid id. Supported: 'watchly.rec', 'watchly.creators', "
-                    "'watchly.theme.<params>', 'watchly.all.loved', 'watchly.liked.all'"
+                    "'watchly.theme.<params>'"
                 ),
             )
 
@@ -802,7 +799,6 @@ class CatalogService:
             "theme": ThemeBasedService(tmdb_service, user_settings),
             "top_picks": TopPicksService(tmdb_service, user_settings),
             "creators": CreatorsService(tmdb_service, user_settings),
-            "all_based": AllBasedService(tmdb_service, user_settings),
         }
 
     async def _get_recommendations(
@@ -898,24 +894,6 @@ class CatalogService:
                 logger.info(f"No profile for top picks, showing trending {content_type}")
                 recommendations = await self._get_trending_fallback(content_type, limit, user_settings)
             logger.info(f"Found {len(recommendations)} top picks for {content_type}")
-
-        # Based on what you loved
-        elif catalog_id in ("watchly.all.loved", "watchly.liked.all"):
-            item_type = "loved" if catalog_id == "watchly.all.loved" else "liked"
-            all_based_service: AllBasedService = services["all_based"]
-            gemini_key = getattr(user_settings, 'openrouter_api_key', None) if user_settings else None
-            recommendations = await all_based_service.get_recommendations_from_all_items(
-                library_items=library_items,
-                content_type=content_type,
-                watched_tmdb=watched_tmdb,
-                watched_imdb=watched_imdb,
-                whitelist=whitelist,
-                limit=limit,
-                item_type=item_type,
-                profile=profile,
-                gemini_api_key=gemini_key,
-            )
-            logger.info(f"Found {len(recommendations)} recommendations based on all {item_type} items")
 
         else:
             logger.warning(f"Unknown catalog ID: {catalog_id}")

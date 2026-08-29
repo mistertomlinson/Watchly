@@ -12,16 +12,12 @@ from loguru import logger
 _STATIC_TRANSLATIONS: dict[tuple[str, str], str] = {
     ("de", "Top Picks for You"): "Top Picks für dich",
     ("de", "From Your Favorite Creators"): "Von deinen Lieblingsschöpfern",
-    ("de", "Based on What You Loved"): "Basierend auf dem, was du geliebt hast",
-    ("de", "Based on What You Liked"): "Basierend auf dem, was du gemocht hast",
     ("fr", "Top Picks for You"): "Sélectionnés pour vous",
     ("fr", "More Like"): "Titres similaires à",
     ("fr", "More like"): "Titres similaires à",
     ("fr", "Because You Watched"): "Parce que vous avez regardé",
     ("fr", "Genre & Keyword Catalogs"): "Genres et mots-clés",
     ("fr", "From Your Favorite Creators"): "De vos créateurs préférés",
-    ("fr", "Based on What You Loved"): "D'après vos coups de cœur",
-    ("fr", "Based on What You Liked"): "D'après ce que vous avez aimé",
 }
 
 
