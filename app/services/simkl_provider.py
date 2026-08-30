@@ -171,12 +171,25 @@ class SimklLibraryProvider:
                 or raw.get("watched_date")
                 or raw.get("last_watched")
             )
-            watched_count = (
-                raw.get("watched_episodes_count")
-                or raw.get("episodes_watched")
-                or raw.get("plays")
-                or (1 if watched_at or status == "completed" else 0)
-            )
+            # Recommendation evidence must come from completed viewing only.
+            # Movies qualify only when Simkl marks the movie completed.
+            # Series/anime qualify only when Simkl reports at least one
+            # completed/watched episode. In-progress/list status alone is never
+            # recommendation evidence.
+            if content_type == "movie":
+                has_completed_viewing = status == "completed"
+                watched_count = 1 if has_completed_viewing else 0
+            else:
+                watched_count = (
+                    raw.get("watched_episodes_count")
+                    or raw.get("episodes_watched")
+                    or 0
+                )
+                watched_count = max(int(watched_count or 0), 0)
+                has_completed_viewing = watched_count > 0
+
+            if not has_completed_viewing:
+                continue
 
             item = make_library_item(
                 ids=ids,
@@ -193,11 +206,7 @@ class SimklLibraryProvider:
                 continue
 
             item_id = item["_id"]
-            is_watched = bool(
-                watched_at
-                or watched_count
-                or status in {"watching", "completed", "hold", "onhold", "dropped"}
-            )
+            is_watched = True
             is_added = status in {
                 "plantowatch", "planning", "watching", "completed", "hold", "onhold", "dropped"
             }
