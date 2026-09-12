@@ -172,6 +172,25 @@ class RecommendationMetadata:
 
         successful_details = [d for d in details_list if d]
 
+        # Exclude short films from movie recommendation output.
+        # Runtime is taken from full TMDB movie details. Titles with unknown
+        # runtime are retained rather than excluded.
+        if query_type == "movie":
+            runtime_filtered_details = []
+            for details in successful_details:
+                runtime = details.get("runtime")
+                if isinstance(runtime, (int, float)) and 0 < runtime <= 40:
+                    logger.info(
+                        "[ShortFilmFilter] Excluding recommendation "
+                        f"tmdb={details.get('id')} "
+                        f"title={details.get('title') or details.get('name') or ''!r} "
+                        f"runtime={runtime}"
+                    )
+                    continue
+                runtime_filtered_details.append(details)
+
+            successful_details = runtime_filtered_details
+
         # Global content-preference gate. Full TMDB details include keyword names,
         # allowing the same corroboration threshold used by Seasonal Spotlight.
         # Run before image requests so excluded titles incur no extra artwork calls.
