@@ -5,6 +5,7 @@ from typing import Any
 
 from loguru import logger
 
+from app.core.config import settings
 from app.core.constants import DISCOVER_ONLY_EXTRA
 from app.core.settings import CatalogConfig, UserSettings
 from app.services.interest_summary import interest_summary_service
@@ -146,7 +147,10 @@ class DynamicCatalogService:
             excluded_movie_genres = [int(g) for g in user_settings.excluded_movie_genres]
             excluded_series_genres = [int(g) for g in user_settings.excluded_series_genres]
             gemini_api_key = getattr(user_settings, 'openrouter_api_key', None)
-            google_api_key = getattr(user_settings, 'gemini_api_key', None)
+            google_api_key = (
+                getattr(user_settings, 'gemini_api_key', None)
+                or settings.GEMINI_API_KEY
+            )
 
         logger.info(
             f"[Theme Catalogs] gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
