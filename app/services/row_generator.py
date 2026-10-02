@@ -432,7 +432,7 @@ class RowGeneratorService:
             getattr(self.user_settings, "gemini_api_key", None)
             if self.user_settings
             else None
-        )
+        ) or settings.GEMINI_API_KEY
 
         if api_key or google_api_key:
             # Reuse a recent set rather than spending a request to regenerate one.
@@ -825,13 +825,16 @@ class RowGeneratorService:
                 prompt,
                 api_key=api_key,
                 google_api_key=(
-                    getattr(
-                        self.user_settings,
-                        "gemini_api_key",
-                        None,
+                    (
+                        getattr(
+                            self.user_settings,
+                            "gemini_api_key",
+                            None,
+                        )
+                        if self.user_settings
+                        else None
                     )
-                    if self.user_settings
-                    else None
+                    or settings.GEMINI_API_KEY
                 ),
             )
             for prompt in prompts
@@ -909,13 +912,16 @@ class RowGeneratorService:
                 prompt,
                 api_key=api_key,
                 google_api_key=(
-                    getattr(
-                        self.user_settings,
-                        "gemini_api_key",
-                        None,
+                    (
+                        getattr(
+                            self.user_settings,
+                            "gemini_api_key",
+                            None,
+                        )
+                        if self.user_settings
+                        else None
                     )
-                    if self.user_settings
-                    else None
+                    or settings.GEMINI_API_KEY
                 ),
             )
             for prompt in prompts
@@ -3213,13 +3219,16 @@ class RowGeneratorService:
                 system_instruction=system_instruction,
                 api_key=api_key,
                 google_api_key=(
-                    getattr(
-                        self.user_settings,
-                        "gemini_api_key",
-                        None,
+                    (
+                        getattr(
+                            self.user_settings,
+                            "gemini_api_key",
+                            None,
+                        )
+                        if self.user_settings
+                        else None
                     )
-                    if self.user_settings
-                    else None
+                    or settings.GEMINI_API_KEY
                 ),
             )
 
