@@ -1117,6 +1117,121 @@ class RowGeneratorService:
         await self._retitle_repaired_rows(retitle_rows, features)
         return rows
 
+    async def _get_v2_rotation_history(
+        self,
+        token: str | None,
+        content_type: str,
+    ) -> list[dict[str, Any]]:
+        """Return V2 history, bootstrapping from current legacy rows once.
+
+        A brand-new V2 namespace has no memory of the rows the user is already
+        seeing under the legacy algorithm. Without this bootstrap, the first V2
+        generation can immediately recycle those same themes.
+
+        Once V2 has successful history of its own, that history takes precedence
+        and the legacy row cache is no longer consulted.
+        """
+        if not token:
+            return []
+
+        try:
+            from app.services.user_cache import user_cache
+
+            history = await user_cache.get_theme_rotation_history(
+                token,
+                content_type,
+            )
+
+            if history:
+                return history
+
+        except Exception as exc:
+            logger.warning(
+                f"[ThemeRotationV2] failed to read V2 history for "
+                f"{content_type}: {exc}"
+            )
+
+        # Generation-zero bootstrap only. Read the legacy cache directly rather
+        # than through _llm_rows_key(), because V2 deliberately uses a separate
+        # cache namespace.
+        try:
+            from app.services.redis_service import redis_service
+
+            legacy_key = (
+                f"watchly:llm_rows:{token}:{content_type}"
+            )
+
+            raw = await redis_service.get(
+                legacy_key
+            )
+
+            if not raw:
+                return []
+
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+
+            data = json.loads(raw)
+
+            if isinstance(data, list):
+                rows = data
+            elif isinstance(data, dict):
+                rows = data.get("rows") or []
+            else:
+                return []
+
+            bootstrap_rows = []
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+
+                keyword_ids = []
+
+                for axis in row.get("axes") or []:
+                    if not isinstance(axis, dict):
+                        continue
+
+                    if axis.get("name") != AXIS_KEYWORD:
+                        continue
+
+                    try:
+                        keyword_id = int(
+                            axis.get("value")
+                        )
+                    except (TypeError, ValueError):
+                        continue
+
+                    keyword_ids.append(
+                        keyword_id
+                    )
+
+                if keyword_ids:
+                    bootstrap_rows.append({
+                        "title": row.get("title"),
+                        "keyword_ids": keyword_ids,
+                    })
+
+            if not bootstrap_rows:
+                return []
+
+            logger.info(
+                f"[ThemeRotationV2] bootstrapping {content_type} cooldown "
+                f"from {len(bootstrap_rows)} current legacy rows"
+            )
+
+            return [{
+                "source": "legacy_bootstrap",
+                "rows": bootstrap_rows,
+            }]
+
+        except Exception as exc:
+            logger.warning(
+                f"[ThemeRotationV2] failed to bootstrap legacy "
+                f"{content_type} rows: {exc}"
+            )
+            return []
+
     @staticmethod
     def _recent_v2_keyword_ids(
         history: list[dict[str, Any]],
@@ -1275,23 +1390,10 @@ class RowGeneratorService:
             valid_genre_list = ", ".join([f"{name} (ID: {gid})" for gid, name in current_genre_map.items()])
 
             if settings.THEME_ROTATION_V2_ENABLED:
-                history: list[dict[str, Any]] = []
-
-                if token:
-                    try:
-                        from app.services.user_cache import user_cache
-
-                        history = await user_cache.get_theme_rotation_history(
-                            token,
-                            content_type,
-                        )
-                    except Exception as exc:
-                        # Rotation history is advisory. A Redis problem must never
-                        # prevent row generation.
-                        logger.warning(
-                            f"[ThemeRotationV2] failed to read history for "
-                            f"{content_type}: {exc}"
-                        )
+                history = await self._get_v2_rotation_history(
+                    token,
+                    content_type,
+                )
 
                 keyword_window = self._select_v2_prompt_keyword_window(
                     features,
