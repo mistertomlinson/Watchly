@@ -2231,6 +2231,10 @@ class RowGeneratorService:
         Candidate 1 gets one narrow exemption: the user's strongest usable profile
         keyword may repeat as the stable core signal. Every other recent keyword is
         blocked, and candidates 2+ receive no recent-keyword exemption.
+
+        The core exemption applies only to the underlying taste signal. It never
+        permits an exact previously published row recipe or visible row title to
+        repeat. Exact row/title identity rotates across all recent generations.
         """
         if history is None:
             history = await self._get_v2_rotation_history(
@@ -2272,6 +2276,91 @@ class RowGeneratorService:
             return " ".join(
                 normalized.split()
             )
+
+        #
+        # Published V2 history records the final visible title and the final
+        # build_row_id recipe. Legacy bootstrap rows predate the V2 writer and
+        # therefore may have titles without IDs; title protection still applies.
+        #
+        recent_row_ids: set[str] = set()
+        recent_title_keys: set[str] = set()
+
+        for generation in history or []:
+            if not isinstance(
+                generation,
+                dict,
+            ):
+                continue
+
+            previous_rows = (
+                generation.get("rows")
+                or []
+            )
+
+            if not isinstance(
+                previous_rows,
+                list,
+            ):
+                continue
+
+            for previous_row in previous_rows:
+                if not isinstance(
+                    previous_row,
+                    dict,
+                ):
+                    continue
+
+                previous_id = str(
+                    previous_row.get("id")
+                    or ""
+                )
+
+                if previous_id:
+                    recent_row_ids.add(
+                        previous_id
+                    )
+
+                previous_title = (
+                    normalize_theme_text(
+                        previous_row.get("title")
+                    )
+                )
+
+                if previous_title:
+                    recent_title_keys.add(
+                        previous_title
+                    )
+
+        def recent_identity_conflict(
+            candidate_row: RowDefinition,
+        ) -> str | None:
+            """Return the cross-generation duplicate reason, if any."""
+            candidate_id = str(
+                candidate_row.id
+                or ""
+            )
+
+            if (
+                candidate_id
+                and candidate_id
+                in recent_row_ids
+            ):
+                return "recipe"
+
+            title_key = (
+                normalize_theme_text(
+                    candidate_row.title
+                )
+            )
+
+            if (
+                title_key
+                and title_key
+                in recent_title_keys
+            ):
+                return "title"
+
+            return None
 
         def blocked_recent_themes(
             candidate_index: int,
@@ -2371,6 +2460,21 @@ class RowGeneratorService:
             rows,
             start=1,
         ):
+            history_duplicate_before = (
+                recent_identity_conflict(
+                    row
+                )
+            )
+
+            if history_duplicate_before:
+                logger.info(
+                    f"[ThemeRotationV2] candidate {candidate_index} "
+                    f"'{row.title}' rejected as recent cross-generation "
+                    f"duplicate {history_duplicate_before}: {row.id}"
+                )
+
+                continue
+
             blocked_before = (
                 blocked_recent_themes(
                     candidate_index,
@@ -2445,6 +2549,26 @@ class RowGeneratorService:
                     features,
                 )
 
+            #
+            # Repair and retitling can both change cross-generation identity.
+            # Validate the ACTUAL final row before cooldown and acceptance.
+            #
+            history_duplicate_after = (
+                recent_identity_conflict(
+                    final_row
+                )
+            )
+
+            if history_duplicate_after:
+                logger.warning(
+                    f"[ThemeRotationV2] candidate {candidate_index} "
+                    f"'{final_row.title}' rejected after repair/retitle "
+                    f"as recent cross-generation duplicate "
+                    f"{history_duplicate_after}: {final_row.id}"
+                )
+
+                continue
+
             # Enforce cooldown again against the actual final recipe AND title.
             blocked_after = (
                 blocked_recent_themes(
@@ -2478,9 +2602,9 @@ class RowGeneratorService:
             )
 
             title_key = (
-                str(final_row.title)
-                .strip()
-                .casefold()
+                normalize_theme_text(
+                    final_row.title
+                )
             )
 
             if row_id in seen_row_ids:
