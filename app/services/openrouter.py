@@ -34,6 +34,12 @@ PREFERRED_FREE_MODELS = (
 FREE_MODEL_MIN_CONTEXT = 64_000
 FREE_MODEL_CATALOG_TTL_SECONDS = 15 * 60
 
+# Avoid repeatedly paying the same retry delay when a provider has already
+# confirmed that a model is temporarily rate limited. Cooldowns are deliberately
+# process-local and short-lived: a restart clears them, and the preferred model
+# automatically re-enters the chain after five minutes.
+MODEL_RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60
+
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -202,12 +208,91 @@ class OpenRouterService:
             float,
             list[str],
         ] | None = None
+        self._rate_limit_cooldowns: dict[
+            tuple[str, str],
+            float,
+        ] = {}
 
     def _get_api_key(
         self,
         api_key: str | None = None,
     ) -> str | None:
         return api_key or self.api_key
+
+    def _mark_rate_limited_model(
+        self,
+        provider: str,
+        model: str,
+    ) -> None:
+        until = (
+            time.monotonic()
+            + MODEL_RATE_LIMIT_COOLDOWN_SECONDS
+        )
+        self._rate_limit_cooldowns[
+            (provider, model)
+        ] = until
+
+        logger.info(
+            "AI model cooldown set "
+            f"provider={provider} "
+            f"model={model} "
+            f"cooldown="
+            f"{MODEL_RATE_LIMIT_COOLDOWN_SECONDS:.0f}s"
+        )
+
+    def _clear_rate_limited_model(
+        self,
+        provider: str,
+        model: str,
+    ) -> None:
+        self._rate_limit_cooldowns.pop(
+            (provider, model),
+            None,
+        )
+
+    def _filter_rate_limited_models(
+        self,
+        provider: str,
+        models: list[str],
+    ) -> list[str]:
+        now = time.monotonic()
+        available: list[str] = []
+        skipped: list[str] = []
+
+        for model in models:
+            key = (provider, model)
+            until = self._rate_limit_cooldowns.get(
+                key
+            )
+
+            if (
+                until is not None
+                and until > now
+            ):
+                skipped.append(
+                    f"{model} "
+                    f"({until - now:.0f}s remaining)"
+                )
+                continue
+
+            if until is not None:
+                self._rate_limit_cooldowns.pop(
+                    key,
+                    None,
+                )
+
+            available.append(
+                model
+            )
+
+        if skipped:
+            logger.info(
+                "Skipping temporarily rate-limited "
+                f"{provider} model(s): "
+                + ", ".join(skipped)
+            )
+
+        return available
 
     @staticmethod
     def _openrouter_headers(key: str) -> dict[str, str]:
@@ -639,6 +724,18 @@ class OpenRouterService:
             )
             return ""
 
+        models = self._filter_rate_limited_models(
+            "google-ai",
+            models,
+        )
+
+        if not models:
+            logger.info(
+                "All direct Google AI fallback models "
+                "are temporarily rate limited."
+            )
+            return ""
+
         errors: list[str] = []
 
         # Match Seasonal Spotlight's bounded provider fallback: at most two
@@ -700,6 +797,11 @@ class OpenRouterService:
                                 504,
                             }
                         ):
+                            self._mark_rate_limited_model(
+                                "google-ai",
+                                attempt_model,
+                            )
+
                             if http_attempt < 2:
                                 retry_after_raw = (
                                     response.headers.get(
@@ -784,6 +886,11 @@ class OpenRouterService:
                                 validate_content(
                                     content
                                 )
+
+                            self._clear_rate_limited_model(
+                                "google-ai",
+                                attempt_model,
+                            )
 
                             logger.info(
                                 "Google AI fallback completed "
@@ -883,6 +990,27 @@ class OpenRouterService:
         )
         models = list(dict.fromkeys(models))
 
+        cooldown_provider = (
+            "openrouter"
+            if effective_base_url
+            == self.base_url
+            else None
+        )
+
+        if cooldown_provider:
+            models = self._filter_rate_limited_models(
+                cooldown_provider,
+                models,
+            )
+
+        if not models:
+            logger.info(
+                "All candidate models are temporarily "
+                "rate limited; skipping this provider "
+                "for the current AI job."
+            )
+            return ""
+
         errors: list[str] = []
 
         for attempt, attempt_model in enumerate(models, 1):
@@ -972,6 +1100,12 @@ class OpenRouterService:
                             == 429
                             or wrapped_rate_limit
                         ):
+                            if cooldown_provider:
+                                self._mark_rate_limited_model(
+                                    cooldown_provider,
+                                    attempt_model,
+                                )
+
                             if http_attempt < 2:
                                 retry_after_raw = (
                                     response.headers.get(
@@ -1049,6 +1183,12 @@ class OpenRouterService:
 
                         if validate_content is not None:
                             validate_content(content)
+
+                        if cooldown_provider:
+                            self._clear_rate_limited_model(
+                                cooldown_provider,
+                                attempt_model,
+                            )
 
                         logger.info(
                             "LLM call completed "
