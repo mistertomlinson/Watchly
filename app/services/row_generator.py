@@ -2258,28 +2258,86 @@ class RowGeneratorService:
             else None
         )
 
-        def blocked_recent_keywords(
+        @staticmethod
+        def normalize_theme_text(
+            value: Any,
+        ) -> str:
+            normalized = "".join(
+                char.casefold()
+                if char.isalnum()
+                else " "
+                for char in str(value or "")
+            )
+
+            return " ".join(
+                normalized.split()
+            )
+
+        def blocked_recent_themes(
             candidate_index: int,
             candidate_row: RowDefinition,
         ) -> set[int]:
-            row_keyword_ids: set[int] = set()
+            """Return cooled-down themes present in axes OR visible title."""
+            blocked: set[int] = set()
 
+            #
+            # First enforce the authoritative resolved TMDB keyword IDs.
+            #
             for axis in candidate_row.axes:
                 if axis.name != AXIS_KEYWORD:
                     continue
 
                 try:
-                    row_keyword_ids.add(
-                        int(axis.value)
+                    keyword_id = int(
+                        axis.value
                     )
                 except (TypeError, ValueError):
                     continue
 
-            blocked = (
-                row_keyword_ids
-                & recent_keyword_ids
+                if keyword_id in recent_keyword_ids:
+                    blocked.add(
+                        keyword_id
+                    )
+
+            #
+            # Also prevent a model-generated title from visually recreating a
+            # cooled-down theme while using different/fresh query axes.
+            #
+            normalized_title = normalize_theme_text(
+                candidate_row.title
             )
 
+            padded_title = (
+                f" {normalized_title} "
+            )
+
+            for keyword_id in recent_keyword_ids:
+                keyword_name = (
+                    features.get_keyword_name(
+                        keyword_id
+                    )
+                )
+
+                normalized_keyword = (
+                    normalize_theme_text(
+                        keyword_name
+                    )
+                )
+
+                if not normalized_keyword:
+                    continue
+
+                if (
+                    f" {normalized_keyword} "
+                    in padded_title
+                ):
+                    blocked.add(
+                        keyword_id
+                    )
+
+            #
+            # Candidate 1 alone may repeat the one intentional stable core signal.
+            #
             if (
                 candidate_index == 1
                 and core_keyword_id is not None
@@ -2305,7 +2363,6 @@ class RowGeneratorService:
             return None
 
         accepted: list[RowDefinition] = []
-        changed_rows: list[RowDefinition] = []
 
         seen_row_ids: set[str] = set()
         seen_titles: set[str] = set()
@@ -2315,7 +2372,7 @@ class RowGeneratorService:
             start=1,
         ):
             blocked_before = (
-                blocked_recent_keywords(
+                blocked_recent_themes(
                     candidate_index,
                     row,
                 )
@@ -2377,11 +2434,20 @@ class RowGeneratorService:
             if final_row is None:
                 continue
 
-            # Repairs currently only remove constraints, but enforce cooldown a
-            # second time against the actual row about to be accepted so future
-            # repair changes cannot accidentally bypass rotation history.
+            #
+            # Repair can change the recipe, so retitle it before final validation.
+            # This ensures the visible title itself is covered by cooldown and
+            # duplicate checks rather than being changed after acceptance.
+            #
+            if result.get("changed"):
+                await self._retitle_repaired_rows(
+                    [final_row],
+                    features,
+                )
+
+            # Enforce cooldown again against the actual final recipe AND title.
             blocked_after = (
-                blocked_recent_keywords(
+                blocked_recent_themes(
                     candidate_index,
                     final_row,
                 )
@@ -2448,13 +2514,6 @@ class RowGeneratorService:
                 final_row
             )
 
-            if result.get(
-                "changed"
-            ):
-                changed_rows.append(
-                    final_row
-                )
-
             if (
                 len(accepted)
                 >= THEME_ROTATION_V2_PUBLISH_COUNT
@@ -2472,17 +2531,6 @@ class RowGeneratorService:
                 "discarding this generation"
             )
             return None
-
-        #
-        # Unseen-aware repair may change a row's axes. Reuse the existing grounded
-        # AI retitle mechanism so the published title describes the final recipe,
-        # not the pre-repair one.
-        #
-        if changed_rows:
-            await self._retitle_repaired_rows(
-                changed_rows,
-                features,
-            )
 
         accepted = accepted[
             :THEME_ROTATION_V2_PUBLISH_COUNT
@@ -2834,6 +2882,57 @@ class RowGeneratorService:
                 recent_ids = self._recent_v2_keyword_ids(
                     history
                 )
+
+                recent_keyword_names = [
+                    features.get_keyword_name(
+                        keyword_id
+                    )
+                    for keyword_id in sorted(
+                        recent_ids
+                    )
+                ]
+
+                recent_keyword_names = [
+                    name
+                    for name in recent_keyword_names
+                    if name
+                ]
+
+                recent_row_titles = []
+
+                for generation in history:
+                    for previous_row in (
+                        generation.get("rows")
+                        or []
+                    ):
+                        previous_title = (
+                            previous_row.get("title")
+                            if isinstance(
+                                previous_row,
+                                dict,
+                            )
+                            else None
+                        )
+
+                        if previous_title:
+                            recent_row_titles.append(
+                                str(previous_title)
+                            )
+
+                if recent_keyword_names:
+                    keyword_hint += (
+                        " RECENT COOLDOWN: do not recreate these recently used "
+                        "themes or use them in titles or keyword choices: "
+                        f"{', '.join(recent_keyword_names)}. "
+                        "The single strongest-match core row may use its explicitly "
+                        "provided core theme when appropriate; other rows must rotate."
+                    )
+
+                if recent_row_titles:
+                    keyword_hint += (
+                        " Recent row concepts/titles that should not be recreated: "
+                        f"{', '.join(recent_row_titles)}."
+                    )
 
                 logger.info(
                     f"[ThemeRotationV2] {content_type} keyword window: "
