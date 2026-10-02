@@ -235,6 +235,98 @@ async def test_primary_openrouter_model_is_used_first():
 
 
 @pytest.mark.asyncio
+async def test_catalog_title_system_instruction_override_reaches_provider():
+    calls = []
+    responses = [
+        FakeResponse(
+            model=DEFAULT_MODEL,
+            content="Futures Gone Wrong",
+        )
+    ]
+    service = OpenRouterService()
+    custom_instruction = (
+        "Use expressive V2 streaming shelf titles."
+    )
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        result = await service.generate_content_async(
+            prompt="Name this row",
+            api_key="sk-or-test",
+            system_instruction=custom_instruction,
+        )
+
+    assert result == "Futures Gone Wrong"
+    assert len(calls) == 1
+    assert (
+        calls[0]["json"]["messages"][0]["content"]
+        == custom_instruction
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_title_default_instruction_remains_legacy_prompt():
+    calls = []
+    responses = [
+        FakeResponse(
+            model=DEFAULT_MODEL,
+            content="Literary Crime",
+        )
+    ]
+    service = OpenRouterService()
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        result = await service.generate_content_async(
+            prompt="Name this row",
+            api_key="sk-or-test",
+        )
+
+    assert result == "Literary Crime"
+    assert len(calls) == 1
+    assert (
+        calls[0]["json"]["messages"][0]["content"]
+        == service.get_catalog_title_prompt()
+    )
+
+
+@pytest.mark.asyncio
 async def test_invalid_primary_output_retries_live_free_fallback():
     calls = []
     responses = [
