@@ -1241,8 +1241,17 @@ class OpenRouterService:
         prompt: str,
         api_key: str | None = None,
         google_api_key: str | None = None,
+        system_instruction: str | None = None,
     ) -> str:
-        """Generate a catalog title with bounded provider fallback."""
+        """Generate a catalog title with bounded provider fallback.
+
+        A caller may supply a specialized naming instruction. Leaving it unset
+        preserves the historical catalog-title prompt exactly.
+        """
+        title_system_instruction = (
+            system_instruction
+            or self.get_catalog_title_prompt()
+        )
         key = self._get_api_key(
             api_key
         )
@@ -1251,9 +1260,7 @@ class OpenRouterService:
         if key and key.startswith("gsk_"):
             result = await self._call(
                 prompt=prompt,
-                system_instruction=(
-                    self.get_catalog_title_prompt()
-                ),
+                system_instruction=title_system_instruction,
                 api_key=api_key,
                 model=GROQ_MODEL,
                 base_url=GROQ_BASE_URL,
@@ -1269,9 +1276,7 @@ class OpenRouterService:
             if attempt_models:
                 result = await self._call(
                     prompt=prompt,
-                    system_instruction=(
-                        self.get_catalog_title_prompt()
-                    ),
+                    system_instruction=title_system_instruction,
                     api_key=api_key,
                     max_tokens=TITLE_MAX_TOKENS,
                     attempt_models=attempt_models,
@@ -1292,9 +1297,7 @@ class OpenRouterService:
 
             return await self._call_google(
                 prompt=prompt,
-                system_instruction=(
-                    self.get_catalog_title_prompt()
-                ),
+                system_instruction=title_system_instruction,
                 google_api_key=google_key,
                 max_tokens=TITLE_MAX_TOKENS,
             )
