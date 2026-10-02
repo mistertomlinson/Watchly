@@ -452,12 +452,21 @@ class OpenRouterService:
             return fallback
 
 
+    def _get_google_api_key(
+        self,
+        api_key: str | None = None,
+    ) -> str | None:
+        return api_key or settings.GEMINI_API_KEY
+
     async def _resolve_google_model_candidates(
         self,
-        api_key: str | None,
+        api_key: str | None = None,
     ) -> list[str]:
         """Resolve approved direct-Google fallback models for this job."""
-        key = str(api_key or "").strip()
+        key = str(
+            self._get_google_api_key(api_key)
+            or ""
+        ).strip()
 
         if not key:
             return []
@@ -607,7 +616,9 @@ class OpenRouterService:
     ) -> str:
         """Use direct Google AI only after the primary provider chain fails."""
         key = str(
-            google_api_key
+            self._get_google_api_key(
+                google_api_key
+            )
             or ""
         ).strip()
 
