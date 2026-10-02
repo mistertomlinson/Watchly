@@ -747,13 +747,12 @@ async def test_server_google_key_is_used_when_user_google_key_is_missing():
     assert result == {
         "rows": []
     }
-    assert (
-        service._get_google_api_key(
-            None
-        )
-        == "server-google-key"
-    )
     google.assert_awaited_once()
+
+    # The patched settings scope has ended here, so do not call
+    # _get_google_api_key() again: that would read the real environment key
+    # and could leak it in pytest assertion output. Verify the routed value
+    # only through the mocked Google call.
     assert google.await_args.kwargs[
         "google_api_key"
     ] == "server-google-key"
