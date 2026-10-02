@@ -18,6 +18,7 @@ from app.services.row_generator import (
 
 
 TEST_FREE_FALLBACK = "google/gemma-4-31b-it:free"
+TEST_APODEX = "apodex/apodex-1.1-mini:free"
 TEST_PAID_MODEL = "openai/gpt-oss-20b"
 
 
@@ -499,6 +500,9 @@ async def test_live_discovery_admits_only_approved_zero_cost_text_models():
             TEST_FREE_FALLBACK
         ),
         free_model(
+            TEST_APODEX
+        ),
+        free_model(
             TEST_PAID_MODEL,
             prompt_price="0.000001",
             completion_price="0.000001",
@@ -540,6 +544,7 @@ async def test_live_discovery_admits_only_approved_zero_cost_text_models():
     assert models == [
         DEFAULT_MODEL,
         TEST_FREE_FALLBACK,
+        TEST_APODEX,
     ]
     assert all(
         model.endswith(":free")
@@ -694,6 +699,107 @@ async def test_free_model_catalog_is_cached():
     ] == ["GET"]
 
 
+
+@pytest.mark.asyncio
+async def test_exhausted_openrouter_chain_falls_back_to_direct_google():
+    service = OpenRouterService()
+    primary = AsyncMock(
+        return_value=""
+    )
+    google = AsyncMock(
+        return_value='{"rows": []}'
+    )
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                    TEST_APODEX,
+                ]
+            ),
+        ),
+        patch.object(
+            service,
+            "_call",
+            new=primary,
+        ),
+        patch.object(
+            service,
+            "_call_google",
+            new=google,
+        ),
+    ):
+        result = await service.generate_structured_async(
+            prompt="Prompt",
+            response_schema=dict,
+            system_instruction="System",
+            api_key="sk-or-test",
+            google_api_key="google-test",
+        )
+
+    assert result == {
+        "rows": []
+    }
+    primary.assert_awaited_once()
+    google.assert_awaited_once()
+    assert google.await_args.kwargs[
+        "google_api_key"
+    ] == "google-test"
+    assert google.await_args.kwargs[
+        "structured"
+    ] is True
+
+
+@pytest.mark.asyncio
+async def test_successful_openrouter_call_does_not_spend_google_fallback():
+    service = OpenRouterService()
+    primary = AsyncMock(
+        return_value='{"rows": []}'
+    )
+    google = AsyncMock(
+        return_value='{"rows": ["unexpected"]}'
+    )
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                    TEST_APODEX,
+                ]
+            ),
+        ),
+        patch.object(
+            service,
+            "_call",
+            new=primary,
+        ),
+        patch.object(
+            service,
+            "_call_google",
+            new=google,
+        ),
+    ):
+        result = await service.generate_structured_async(
+            prompt="Prompt",
+            response_schema=dict,
+            system_instruction="System",
+            api_key="sk-or-test",
+            google_api_key="google-test",
+        )
+
+    assert result == {
+        "rows": []
+    }
+    google.assert_not_awaited()
+
 @pytest.mark.asyncio
 async def test_groq_keys_keep_direct_groq_routing():
     calls = []
@@ -752,6 +858,7 @@ async def test_tiered_row_titles_forward_users_key():
         tmdb_service=object(),
         user_settings=SimpleNamespace(
             openrouter_api_key="sk-or-user-key",
+            gemini_api_key="google-user-key",
         ),
     )
     row = RowComponents(
@@ -773,6 +880,7 @@ async def test_tiered_row_titles_forward_users_key():
     title_mock.assert_awaited_once_with(
         "British + Crime + Thriller",
         api_key="sk-or-user-key",
+        google_api_key="google-user-key",
     )
     assert result[0].title == (
         "British Crime Thrillers"

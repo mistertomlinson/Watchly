@@ -426,8 +426,15 @@ class RowGeneratorService:
         # 1. Extract all features from profile
         features = await self._extract_features(profile, content_type)
 
-        # 2. Try LLM generation if key is present
-        if api_key:
+        # 2. Try LLM generation if either primary BYOK or direct Google BYOK
+        # is present. OpenRouter/Groq remains primary; Google is provider fallback.
+        google_api_key = (
+            getattr(self.user_settings, "gemini_api_key", None)
+            if self.user_settings
+            else None
+        )
+
+        if api_key or google_api_key:
             # Reuse a recent set rather than spending a request to regenerate one.
             fresh = await self._get_cached_llm_rows(
                 token, content_type, max_age=ROW_SET_MAX_AGE_SECONDS
@@ -817,6 +824,15 @@ class RowGeneratorService:
             gemini_service.generate_content_async(
                 prompt,
                 api_key=api_key,
+                google_api_key=(
+                    getattr(
+                        self.user_settings,
+                        "gemini_api_key",
+                        None,
+                    )
+                    if self.user_settings
+                    else None
+                ),
             )
             for prompt in prompts
         ]
@@ -889,7 +905,19 @@ class RowGeneratorService:
             )
 
         tasks = [
-            gemini_service.generate_content_async(prompt, api_key=api_key)
+            gemini_service.generate_content_async(
+                prompt,
+                api_key=api_key,
+                google_api_key=(
+                    getattr(
+                        self.user_settings,
+                        "gemini_api_key",
+                        None,
+                    )
+                    if self.user_settings
+                    else None
+                ),
+            )
             for prompt in prompts
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3184,6 +3212,15 @@ class RowGeneratorService:
                 response_schema=list[LLMRowTheme],
                 system_instruction=system_instruction,
                 api_key=api_key,
+                google_api_key=(
+                    getattr(
+                        self.user_settings,
+                        "gemini_api_key",
+                        None,
+                    )
+                    if self.user_settings
+                    else None
+                ),
             )
 
             if isinstance(data, list):

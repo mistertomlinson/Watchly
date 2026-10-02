@@ -59,8 +59,9 @@ class InterestSummaryService:
     async def generate_summary(
         self,
         profile: TasteProfile,
-        api_key: str,
+        api_key: str | None,
         keyword_names: dict[int, str] | None = None,
+        google_api_key: str | None = None,
         tmdb_service=None,
     ) -> str:
         """Generate a text summary of the user's interest profile using Gemini.
@@ -73,7 +74,7 @@ class InterestSummaryService:
         Returns:
             Generated summary string, or empty string on failure.
         """
-        if not api_key:
+        if not api_key and not google_api_key:
             return ""
 
         try:
@@ -122,6 +123,7 @@ class InterestSummaryService:
                 prompt=prompt,
                 system_instruction=self._get_system_prompt(),
                 api_key=api_key,
+                google_api_key=google_api_key,
             )
 
             return summary

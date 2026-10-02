@@ -25,9 +25,11 @@ DEFAULT_MODEL = os.getenv(
 APPROVED_FREE_MODEL_PREFIXES = (
     "google/gemma-",
     "openai/gpt-oss-",
+    "apodex/apodex-",
 )
 PREFERRED_FREE_MODELS = (
     "google/gemma-4-31b-it:free",
+    "apodex/apodex-1.1-mini:free",
 )
 FREE_MODEL_MIN_CONTEXT = 64_000
 FREE_MODEL_CATALOG_TTL_SECONDS = 15 * 60
@@ -35,6 +37,27 @@ FREE_MODEL_CATALOG_TTL_SECONDS = 15 * 60
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+GOOGLE_MODELS_URL = (
+    "https://generativelanguage.googleapis.com/"
+    "v1beta/models?pageSize=1000"
+)
+GOOGLE_OPENAI_CHAT = (
+    "https://generativelanguage.googleapis.com/"
+    "v1beta/openai/chat/completions"
+)
+GOOGLE_MODEL_PREFERENCES = (
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+)
+GOOGLE_MIN_CONTEXT = 64_000
+GOOGLE_MIN_OUTPUT = 1_800
+
 TIMEOUT = 60.0
 
 DEFAULT_MAX_TOKENS = 4000
@@ -46,7 +69,10 @@ RECOMMENDATION_MAX_TOKENS = 1200
 STRUCTURED_MAX_TOKENS_GROQ = 1200
 STRUCTURED_MAX_TOKENS_OPENROUTER = 8000
 STRUCTURED_MAX_TOKENS = STRUCTURED_MAX_TOKENS_OPENROUTER
-TITLE_MAX_TOKENS = 60
+# Some free reasoning models spend part of the completion budget internally.
+# 60 tokens was enough for Gemma but caused Apodex title calls to terminate
+# with finish_reason=length before emitting visible content.
+TITLE_MAX_TOKENS = 256
 
 
 def _content_to_text(content) -> str:
@@ -425,6 +451,379 @@ class OpenRouterService:
 
             return fallback
 
+
+    async def _resolve_google_model_candidates(
+        self,
+        api_key: str | None,
+    ) -> list[str]:
+        """Resolve approved direct-Google fallback models for this job."""
+        key = str(api_key or "").strip()
+
+        if not key:
+            return []
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=TIMEOUT,
+            ) as client:
+                response = await client.get(
+                    GOOGLE_MODELS_URL,
+                    headers={
+                        "x-goog-api-key": key,
+                    },
+                )
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    "HTTP "
+                    f"{response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+
+            catalog = (
+                response.json().get("models")
+                or []
+            )
+
+            eligible: set[str] = set()
+
+            for item in catalog:
+                if not isinstance(
+                    item,
+                    dict,
+                ):
+                    continue
+
+                model_id = (
+                    item.get("baseModelId")
+                    or str(
+                        item.get("name")
+                        or ""
+                    ).removeprefix("models/")
+                )
+
+                if (
+                    model_id
+                    not in GOOGLE_MODEL_PREFERENCES
+                ):
+                    continue
+
+                methods = set(
+                    item.get(
+                        "supportedGenerationMethods"
+                    )
+                    or []
+                )
+
+                if (
+                    methods
+                    and "generateContent"
+                    not in methods
+                ):
+                    continue
+
+                try:
+                    input_limit = int(
+                        item.get(
+                            "inputTokenLimit"
+                        )
+                        or 0
+                    )
+                    output_limit = int(
+                        item.get(
+                            "outputTokenLimit"
+                        )
+                        or 0
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if (
+                    input_limit
+                    and input_limit
+                    < GOOGLE_MIN_CONTEXT
+                ):
+                    continue
+
+                if (
+                    output_limit
+                    and output_limit
+                    < GOOGLE_MIN_OUTPUT
+                ):
+                    continue
+
+                eligible.add(
+                    model_id
+                )
+
+            models = [
+                model_id
+                for model_id in GOOGLE_MODEL_PREFERENCES
+                if model_id in eligible
+            ]
+
+            logger.info(
+                "Google AI approved fallback chain: "
+                f"{models}"
+            )
+
+            return models
+
+        except Exception as exc:
+            # Discovery failure should not create an unbounded provider storm.
+            # Keep the same small, known-safe set Seasonal Spotlight uses.
+            fallback = list(
+                GOOGLE_MODEL_PREFERENCES[:3]
+            )
+
+            logger.warning(
+                "Google AI model discovery failed; "
+                f"using bounded fallback {fallback}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            return fallback
+
+    @staticmethod
+    def _google_headers(
+        key: str,
+    ) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+
+    async def _call_google(
+        self,
+        prompt: str,
+        system_instruction: str,
+        google_api_key: str | None,
+        max_tokens: int,
+        validate_content: Callable[[str], None] | None = None,
+        structured: bool = False,
+    ) -> str:
+        """Use direct Google AI only after the primary provider chain fails."""
+        key = str(
+            google_api_key
+            or ""
+        ).strip()
+
+        if not key:
+            return ""
+
+        models = (
+            await self
+            ._resolve_google_model_candidates(
+                key
+            )
+        )
+
+        if not models:
+            logger.warning(
+                "No approved direct Google AI "
+                "fallback models are available."
+            )
+            return ""
+
+        errors: list[str] = []
+
+        # Match Seasonal Spotlight's bounded provider fallback: at most two
+        # direct-Google models, with one retry per model.
+        for attempt, attempt_model in enumerate(
+            models[:2],
+            1,
+        ):
+            payload = {
+                "model": attempt_model,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_instruction,
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+            }
+
+            if structured:
+                payload["response_format"] = {
+                    "type": "json_object",
+                }
+
+            logger.info(
+                "Google AI fallback attempt starting "
+                f"attempt={attempt}/{min(len(models), 2)} "
+                f"model={attempt_model} "
+                f"max_tokens={max_tokens}"
+            )
+
+            started_at = time.monotonic()
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=TIMEOUT,
+                ) as client:
+                    for http_attempt in range(
+                        1,
+                        3,
+                    ):
+                        response = await client.post(
+                            GOOGLE_OPENAI_CHAT,
+                            headers=self._google_headers(
+                                key
+                            ),
+                            json=payload,
+                        )
+
+                        if (
+                            response.status_code
+                            in {
+                                429,
+                                503,
+                                504,
+                            }
+                        ):
+                            if http_attempt < 2:
+                                retry_after_raw = (
+                                    response.headers.get(
+                                        "retry-after",
+                                        "",
+                                    )
+                                )
+
+                                try:
+                                    retry_after = float(
+                                        retry_after_raw
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                ):
+                                    retry_after = 0.0
+
+                                wait_seconds = min(
+                                    max(
+                                        retry_after,
+                                        30.0,
+                                    ),
+                                    120.0,
+                                )
+
+                                logger.warning(
+                                    "Google AI model rate limited "
+                                    f"model={attempt_model} "
+                                    f"http_attempt={http_attempt}/2 "
+                                    f"waiting={wait_seconds:.1f}s"
+                                )
+
+                                await asyncio.sleep(
+                                    wait_seconds
+                                )
+                                continue
+
+                        if response.status_code != 200:
+                            raise RuntimeError(
+                                "HTTP "
+                                f"{response.status_code}: "
+                                f"{response.text[:500]}"
+                            )
+
+                        try:
+                            data = response.json()
+                            choices = (
+                                data.get("choices")
+                                or []
+                            )
+
+                            if not choices:
+                                raise ValueError(
+                                    "Google AI response had no choices"
+                                )
+
+                            choice = choices[0]
+                            message = (
+                                choice.get("message")
+                                or {}
+                            )
+                            content = (
+                                _content_to_text(
+                                    message.get(
+                                        "content"
+                                    )
+                                ).strip()
+                            )
+
+                            if not content:
+                                raise ValueError(
+                                    "Google AI returned empty content "
+                                    f"(finish_reason="
+                                    f"{choice.get('finish_reason')})"
+                                )
+
+                            if (
+                                validate_content
+                                is not None
+                            ):
+                                validate_content(
+                                    content
+                                )
+
+                            logger.info(
+                                "Google AI fallback completed "
+                                f"attempt={attempt}/"
+                                f"{min(len(models), 2)} "
+                                f"requested_model={attempt_model} "
+                                f"resolved_model="
+                                f"{data.get('model') or attempt_model} "
+                                f"finish_reason="
+                                f"{choice.get('finish_reason')} "
+                                f"duration="
+                                f"{time.monotonic() - started_at:.2f}s "
+                                f"content_chars={len(content)}"
+                            )
+
+                            return content
+
+                        except Exception as exc:
+                            if http_attempt >= 2:
+                                raise
+
+                            logger.warning(
+                                "Google AI response unusable "
+                                f"model={attempt_model} "
+                                f"http_attempt={http_attempt}/2 "
+                                f"error={type(exc).__name__}: {exc}; "
+                                "retrying same model"
+                            )
+
+            except Exception as exc:
+                error = (
+                    f"attempt {attempt} "
+                    f"model={attempt_model}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                errors.append(
+                    error
+                )
+
+                logger.warning(
+                    "Google AI fallback attempt failed "
+                    + error
+                )
+
+        logger.error(
+            "Google AI fallback failed after all attempts: "
+            + " | ".join(errors)
+        )
+
+        return ""
+
     @staticmethod
     def get_catalog_title_prompt():
         return """
@@ -688,12 +1087,16 @@ class OpenRouterService:
         self,
         prompt: str,
         api_key: str | None = None,
+        google_api_key: str | None = None,
     ) -> str:
-        """Generate a catalog title using BYOK when supplied."""
-        key = self._get_api_key(api_key)
+        """Generate a catalog title with bounded provider fallback."""
+        key = self._get_api_key(
+            api_key
+        )
+        result = ""
 
         if key and key.startswith("gsk_"):
-            return await self._call(
+            result = await self._call(
                 prompt=prompt,
                 system_instruction=(
                     self.get_catalog_title_prompt()
@@ -703,47 +1106,68 @@ class OpenRouterService:
                 base_url=GROQ_BASE_URL,
                 max_tokens=TITLE_MAX_TOKENS,
             )
-
-        attempt_models = (
-            await self._resolve_free_model_candidates(
-                api_key
+        elif key:
+            attempt_models = (
+                await self._resolve_free_model_candidates(
+                    api_key
+                )
             )
-        )
 
-        if not attempt_models:
-            logger.warning(
-                "No approved zero-cost OpenRouter "
-                "models are currently available."
+            if attempt_models:
+                result = await self._call(
+                    prompt=prompt,
+                    system_instruction=(
+                        self.get_catalog_title_prompt()
+                    ),
+                    api_key=api_key,
+                    max_tokens=TITLE_MAX_TOKENS,
+                    attempt_models=attempt_models,
+                )
+
+        if result:
+            return result
+
+        if google_api_key:
+            logger.info(
+                "Primary AI provider chain exhausted; "
+                "switching_provider=google-ai"
             )
-            return ""
 
-        return await self._call(
-            prompt=prompt,
-            system_instruction=(
-                self.get_catalog_title_prompt()
-            ),
-            api_key=api_key,
-            max_tokens=TITLE_MAX_TOKENS,
-            attempt_models=attempt_models,
-        )
+            return await self._call_google(
+                prompt=prompt,
+                system_instruction=(
+                    self.get_catalog_title_prompt()
+                ),
+                google_api_key=google_api_key,
+                max_tokens=TITLE_MAX_TOKENS,
+            )
+
+        return ""
 
     async def generate_flash_content_async(
         self,
         prompt: str,
         system_instruction: str,
-        api_key: str,
+        api_key: str | None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         minimum_pipe_lines: int = 0,
+        google_api_key: str | None = None,
     ) -> str:
-        """Generate recommendations or summaries using BYOK."""
+        """Generate recommendations or summaries with provider fallback."""
         validator = (
-            _pipe_list_validator(minimum_pipe_lines)
+            _pipe_list_validator(
+                minimum_pipe_lines
+            )
             if minimum_pipe_lines > 0
             else None
         )
+        key = self._get_api_key(
+            api_key
+        )
+        result = ""
 
-        if api_key and api_key.startswith("gsk_"):
-            return await self._call(
+        if key and key.startswith("gsk_"):
+            result = await self._call(
                 prompt=prompt,
                 system_instruction=system_instruction,
                 api_key=api_key,
@@ -752,44 +1176,71 @@ class OpenRouterService:
                 max_tokens=max_tokens,
                 validate_content=validator,
             )
-
-        attempt_models = (
-            await self._resolve_free_model_candidates(
-                api_key
+        elif key:
+            attempt_models = (
+                await self._resolve_free_model_candidates(
+                    api_key
+                )
             )
-        )
 
-        if not attempt_models:
+            if attempt_models:
+                result = await self._call(
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    api_key=api_key,
+                    max_tokens=max_tokens,
+                    attempt_models=attempt_models,
+                    validate_content=validator,
+                )
+
+        if result:
+            return result
+
+        if google_api_key:
+            logger.info(
+                "Primary AI provider chain exhausted; "
+                "switching_provider=google-ai"
+            )
+
+            return await self._call_google(
+                prompt=prompt,
+                system_instruction=system_instruction,
+                google_api_key=google_api_key,
+                max_tokens=max_tokens,
+                validate_content=validator,
+            )
+
+        if not key:
             logger.warning(
-                "No approved zero-cost OpenRouter "
-                "models are currently available."
+                "No primary AI API key available."
             )
-            return ""
+        else:
+            logger.warning(
+                "Primary AI provider chain exhausted "
+                "and no Google AI fallback key is configured."
+            )
 
-        return await self._call(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            api_key=api_key,
-            max_tokens=max_tokens,
-            attempt_models=attempt_models,
-            validate_content=validator,
-        )
+        return ""
 
     async def generate_structured_async(
         self,
         prompt: str,
         response_schema: type | dict,
         system_instruction: str,
-        api_key: str,
+        api_key: str | None,
+        google_api_key: str | None = None,
     ) -> dict | list | None:
-        """Generate and validate a structured JSON response."""
+        """Generate and validate JSON with bounded provider fallback."""
         structured_instruction = (
             system_instruction
             + "\n\nRespond ONLY with valid JSON matching "
             "the requested schema. No other text."
         )
 
-        key = self._get_api_key(api_key)
+        key = self._get_api_key(
+            api_key
+        )
+        result = ""
 
         if key and key.startswith("gsk_"):
             result = await self._call(
@@ -801,42 +1252,61 @@ class OpenRouterService:
                 max_tokens=STRUCTURED_MAX_TOKENS_GROQ,
                 validate_content=_json_validator,
             )
-        else:
+        elif key:
             attempt_models = (
                 await self._resolve_free_model_candidates(
                     api_key
                 )
             )
 
-            if not attempt_models:
-                logger.warning(
-                    "No approved zero-cost OpenRouter "
-                    "models are currently available."
+            if attempt_models:
+                result = await self._call(
+                    prompt=prompt,
+                    system_instruction=structured_instruction,
+                    api_key=api_key,
+                    max_tokens=(
+                        STRUCTURED_MAX_TOKENS_OPENROUTER
+                    ),
+                    attempt_models=attempt_models,
+                    validate_content=_json_validator,
                 )
-                return None
 
-            result = await self._call(
+        if (
+            not result
+            and google_api_key
+        ):
+            logger.info(
+                "Primary AI provider chain exhausted; "
+                "switching_provider=google-ai"
+            )
+
+            result = await self._call_google(
                 prompt=prompt,
                 system_instruction=structured_instruction,
-                api_key=api_key,
+                google_api_key=google_api_key,
                 max_tokens=(
                     STRUCTURED_MAX_TOKENS_OPENROUTER
                 ),
-                attempt_models=attempt_models,
                 validate_content=_json_validator,
+                structured=True,
             )
 
         if not result:
             return None
 
         try:
-            parsed = _parse_json(result)
+            parsed = _parse_json(
+                result
+            )
 
-            if isinstance(parsed, (dict, list)):
+            if isinstance(
+                parsed,
+                (dict, list),
+            ):
                 return parsed
         except Exception as exc:
             logger.error(
-                "Failed to parse validated OpenRouter "
+                "Failed to parse validated AI "
                 f"response: {exc}"
             )
 

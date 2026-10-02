@@ -501,10 +501,16 @@ class CatalogService:
             # Generate interest summary if missing (needed for Gemini top picks)
             if profile and not profile.interest_summary and user_settings:
                 gemini_key = getattr(user_settings, 'openrouter_api_key', None)
-                if gemini_key and token:
+                google_key = getattr(user_settings, 'gemini_api_key', None)
+                if (gemini_key or google_key) and token:
                     try:
                         from app.services.interest_summary import interest_summary_service
-                        summary = await interest_summary_service.generate_summary(profile, gemini_key, tmdb_service=services["tmdb"])
+                        summary = await interest_summary_service.generate_summary(
+                            profile,
+                            gemini_key,
+                            tmdb_service=services["tmdb"],
+                            google_api_key=google_key,
+                        )
                         if summary:
                             profile.interest_summary = summary
                             await user_cache.set_profile(token, content_type, profile)

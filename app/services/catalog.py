@@ -137,6 +137,7 @@ class DynamicCatalogService:
         excluded_movie_genres = []
         excluded_series_genres = []
         gemini_api_key = None
+        google_api_key = None
         # Inventory probes need these to count titles the user will actually see
         # rather than TMDB's unfiltered total, and settings only exist per-request.
         self.row_generator.user_settings = user_settings
@@ -145,6 +146,7 @@ class DynamicCatalogService:
             excluded_movie_genres = [int(g) for g in user_settings.excluded_movie_genres]
             excluded_series_genres = [int(g) for g in user_settings.excluded_series_genres]
             gemini_api_key = getattr(user_settings, 'openrouter_api_key', None)
+            google_api_key = getattr(user_settings, 'gemini_api_key', None)
 
         logger.info(
             f"[Theme Catalogs] gemini_api_key={'SET' if gemini_api_key else 'NONE'},"
@@ -173,7 +175,7 @@ class DynamicCatalogService:
             # hours -- and regenerating it was costing 40-70s per content type on
             # every rebuild, which is the bulk of cold-start latency and 2 of the
             # 4 LLM requests per manifest.
-            if gemini_api_key and token and not profile.interest_summary:
+            if (gemini_api_key or google_api_key) and token and not profile.interest_summary:
                 cached_profile = await user_cache.get_profile(token, media_type)
                 cached_summary = getattr(cached_profile, "interest_summary", None)
                 if cached_summary:
@@ -187,7 +189,12 @@ class DynamicCatalogService:
             if gemini_api_key and token and not profile.interest_summary:
                 try:
                     logger.info(f"Generating interest summary for {media_type}...")
-                    summary = await interest_summary_service.generate_summary(profile, gemini_api_key, tmdb_service=self.tmdb_service)
+                    summary = await interest_summary_service.generate_summary(
+                        profile,
+                        gemini_api_key,
+                        tmdb_service=self.tmdb_service,
+                        google_api_key=google_api_key,
+                    )
                     if summary:
                         profile.interest_summary = summary
                         logger.info(f"Interest summary generated for {media_type}: {summary[:80]}...")
