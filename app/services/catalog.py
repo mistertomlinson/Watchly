@@ -172,7 +172,7 @@ class DynamicCatalogService:
             )
             if not profile:
                 logger.warning(f"Failed to build profile for {media_type}")
-                return media_type, []
+                return media_type, [], None
 
             # Reuse a previously generated summary. This is a description of the
             # user's taste -- it changes when the library changes, not every six
@@ -230,7 +230,7 @@ class DynamicCatalogService:
                 )
                 for _row in catalogs or []:
                     claimed_titles.add(_row.title.strip().casefold())
-                return media_type, catalogs
+                return media_type, catalogs, profile
             except Exception as e:
                 logger.error(f"Failed to generate thematic rows for {media_type}: {e}")
                 raise e
@@ -261,18 +261,422 @@ class DynamicCatalogService:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 4. Assembly with error handling
-        catalogs = []
-
-        extra = DISCOVER_ONLY_EXTRA if not display_at_home else []
-        # Always add skip support for pagination
-        extra = extra + [{"name": "skip", "isRequired": False}]
+        completed_results = []
 
         for result in results:
             if isinstance(result, Exception):
                 continue
-            media_type, rows = result
+
+            media_type, rows, profile = result
+            completed_results.append(
+                [media_type, rows, profile]
+            )
+
+        # V2 lexical diversity is cosmetic only. It operates AFTER both movie
+        # and series have five accepted rows, so repetition can never cost a
+        # valid catalog. A word-family must occur in at least three neighboring
+        # shelves before we touch it. The first occurrence stays; later uses are
+        # offered a grounded retitle from the exact same final row filters.
+        if (
+            settings.THEME_ROTATION_V2_ENABLED
+            and completed_results
+        ):
+            from collections import Counter
+
+            def title_identity(value: str) -> str:
+                normalized = "".join(
+                    char.casefold()
+                    if char.isalnum()
+                    else " "
+                    for char in str(value or "")
+                )
+                return " ".join(normalized.split())
+
+            family_counts = Counter()
+
+            for _, rows, _ in completed_results:
+                for row in rows:
+                    family_counts.update(
+                        self.row_generator
+                        ._title_content_word_families(
+                            row.title
+                        )
+                    )
+
+            overused_families = {
+                family
+                for family, count in family_counts.items()
+                if (
+                    count
+                    >= self.row_generator
+                    .TITLE_WORD_OVERUSE_THRESHOLD
+                )
+            }
+
+            if overused_families:
+                logger.info(
+                    "[TitleDiversity] overused word families "
+                    f"across final shelves: "
+                    f"{sorted(overused_families)}"
+                )
+
+                reserved_titles = {
+                    title_identity(row.title)
+                    for _, rows, _ in completed_results
+                    for row in rows
+                    if title_identity(row.title)
+                }
+
+                seen_overused: set[str] = set()
+                feature_cache = {}
+                history_title_cache = {}
+                changed_types: set[str] = set()
+
+                async def recent_title_keys(
+                    media_type: str,
+                ) -> set[str]:
+                    if media_type in history_title_cache:
+                        return history_title_cache[
+                            media_type
+                        ]
+
+                    keys: set[str] = set()
+
+                    try:
+                        history = await (
+                            self.row_generator
+                            ._get_v2_rotation_history(
+                                token,
+                                media_type,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[TitleDiversity] failed to read "
+                            f"{media_type} title history: {exc}"
+                        )
+                        history = []
+
+                    for generation in history or []:
+                        if not isinstance(
+                            generation,
+                            dict,
+                        ):
+                            continue
+
+                        for previous_row in (
+                            generation.get("rows") or []
+                        ):
+                            if not isinstance(
+                                previous_row,
+                                dict,
+                            ):
+                                continue
+
+                            key = title_identity(
+                                previous_row.get("title")
+                            )
+
+                            if key:
+                                keys.add(key)
+
+                    history_title_cache[
+                        media_type
+                    ] = keys
+                    return keys
+
+                for (
+                    media_type,
+                    rows,
+                    profile,
+                ) in completed_results:
+                    for row in rows:
+                        original_families = (
+                            self.row_generator
+                            ._title_content_word_families(
+                                row.title
+                            )
+                        )
+
+                        active_families = (
+                            original_families
+                            & overused_families
+                        )
+
+                        repeated_families = (
+                            active_families
+                            & seen_overused
+                        )
+
+                        if not repeated_families:
+                            seen_overused.update(
+                                active_families
+                            )
+                            continue
+
+                        # No profile means we cannot reconstruct the
+                        # authoritative filter vocabulary. Keep the
+                        # valid row unchanged.
+                        if profile is None:
+                            seen_overused.update(
+                                active_families
+                            )
+                            continue
+
+                        old_title = row.title
+                        old_key = title_identity(
+                            old_title
+                        )
+
+                        reserved_titles.discard(
+                            old_key
+                        )
+
+                        try:
+                            if (
+                                media_type
+                                not in feature_cache
+                            ):
+                                feature_cache[
+                                    media_type
+                                ] = await (
+                                    self.row_generator
+                                    ._extract_features(
+                                        profile,
+                                        media_type,
+                                    )
+                                )
+
+                            features = feature_cache[
+                                media_type
+                            ]
+
+                            replacement = await (
+                                self.row_generator
+                                ._retitle_for_word_diversity(
+                                    row,
+                                    features,
+                                    repeated_families,
+                                )
+                            )
+
+                            valid_replacement = bool(
+                                replacement
+                            )
+
+                            new_key = (
+                                title_identity(
+                                    replacement
+                                )
+                                if replacement
+                                else ""
+                            )
+
+                            if (
+                                valid_replacement
+                                and (
+                                    not new_key
+                                    or new_key
+                                    in reserved_titles
+                                )
+                            ):
+                                valid_replacement = False
+                                logger.warning(
+                                    "[TitleDiversity] proposed "
+                                    "duplicate title rejected: "
+                                    f"'{replacement}'"
+                                )
+
+                            if valid_replacement:
+                                recent_titles = await (
+                                    recent_title_keys(
+                                        media_type
+                                    )
+                                )
+
+                                if (
+                                    new_key
+                                    in recent_titles
+                                ):
+                                    valid_replacement = False
+                                    logger.warning(
+                                        "[TitleDiversity] proposed "
+                                        "recent-history title rejected: "
+                                        f"'{replacement}'"
+                                    )
+
+                            replacement_families = (
+                                self.row_generator
+                                ._title_content_word_families(
+                                    replacement
+                                )
+                                if replacement
+                                else set()
+                            )
+
+                            if (
+                                valid_replacement
+                                and (
+                                    replacement_families
+                                    & overused_families
+                                    & seen_overused
+                                )
+                            ):
+                                valid_replacement = False
+                                logger.warning(
+                                    "[TitleDiversity] replacement "
+                                    "introduced another already-used "
+                                    "overused family: "
+                                    f"'{replacement}'"
+                                )
+
+                            # Anthology is viewer-critical. If it is a
+                            # surviving keyword, no cosmetic pass may
+                            # hide that format.
+                            anthology_required = False
+
+                            if valid_replacement:
+                                for axis in row.axes:
+                                    if (
+                                        axis.name
+                                        != "keyword"
+                                    ):
+                                        continue
+
+                                    try:
+                                        keyword_name = (
+                                            features
+                                            .get_keyword_name(
+                                                int(
+                                                    axis.value
+                                                )
+                                            )
+                                            or ""
+                                        )
+                                    except (
+                                        TypeError,
+                                        ValueError,
+                                    ):
+                                        keyword_name = ""
+
+                                    if (
+                                        "anthology"
+                                        in keyword_name
+                                        .casefold()
+                                    ):
+                                        anthology_required = True
+                                        break
+
+                                if (
+                                    anthology_required
+                                    and "antholog"
+                                    not in replacement
+                                    .casefold()
+                                ):
+                                    valid_replacement = False
+                                    logger.warning(
+                                        "[TitleDiversity] anthology "
+                                        "replacement hid explicit "
+                                        "format; keeping original"
+                                    )
+
+                            if valid_replacement:
+                                row.title = replacement
+                                changed_types.add(
+                                    media_type
+                                )
+
+                                logger.info(
+                                    "[TitleDiversity] "
+                                    f"'{old_title}' -> "
+                                    f"'{row.title}' "
+                                    f"(avoided "
+                                    f"{sorted(repeated_families)})"
+                                )
+                            else:
+                                logger.info(
+                                    "[TitleDiversity] keeping "
+                                    f"original valid title "
+                                    f"'{old_title}'"
+                                )
+
+                        except Exception as exc:
+                            logger.warning(
+                                "[TitleDiversity] cosmetic pass "
+                                f"failed for '{old_title}': "
+                                f"{exc}; keeping original"
+                            )
+
+                        finally:
+                            reserved_titles.add(
+                                title_identity(
+                                    row.title
+                                )
+                            )
+
+                            # Once the first occurrence has claimed an
+                            # overused family, later rows continue to
+                            # avoid it even if one cosmetic retitle
+                            # happened to fail.
+                            seen_overused.update(
+                                active_families
+                            )
+
+                # Persist successful cosmetic names so a fresh manifest
+                # does not repeatedly spend AI calls to make the same
+                # substitutions. Only complete five-row V2 sets are
+                # written back.
+                if token:
+                    for (
+                        media_type,
+                        rows,
+                        _,
+                    ) in completed_results:
+                        if (
+                            media_type in changed_types
+                            and len(rows) == 5
+                        ):
+                            await (
+                                self.row_generator
+                                ._cache_llm_rows(
+                                    token,
+                                    media_type,
+                                    rows,
+                                )
+                            )
+
+                            logger.info(
+                                "[TitleDiversity] persisted "
+                                f"diversified {media_type} "
+                                "V2 titles"
+                            )
+
+        catalogs = []
+
+        extra = (
+            DISCOVER_ONLY_EXTRA
+            if not display_at_home
+            else []
+        )
+
+        # Always add skip support for pagination
+        extra = extra + [{
+            "name": "skip",
+            "isRequired": False,
+        }]
+
+        for (
+            media_type,
+            rows,
+            _,
+        ) in completed_results:
             for row in rows:
-                catalogs.append({"type": media_type, "id": row.id, "name": row.title, "extra": extra})
+                catalogs.append({
+                    "type": media_type,
+                    "id": row.id,
+                    "name": row.title,
+                    "extra": extra,
+                })
 
         return catalogs
 

@@ -89,11 +89,9 @@ THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE = (
     "picks, favorites, selection, collection, essentials, hits, vibes, core, "
     "mixed, rising, deep cut, or mood. A playful, idiomatic, or metaphorical "
     "title is welcome only when every implied concept is grounded in the row's "
-    "surviving genre/keyword filters. Style examples: dystopian sci-fi -> "
-    "'Futures Gone Wrong'; space adventure -> 'Beyond the Stars'; graphic-novel "
-    "adaptations -> 'From Panels to Screen'; crime + investigation -> 'Cracking "
-    "the Case'; dark comedy -> 'Laughing in the Dark'. These are style examples, "
-    "not fixed titles; do not copy them unless they naturally fit. Never invent "
+    "surviving genre/keyword filters. Use varied imagery, structure, and wording "
+    "across neighboring shelves rather than treating any example phrase as a "
+    "reusable title template. Never invent "
     "geography, nationality, language, production country, franchise, era, or "
     "subject matter that is not supported by the filters."
 )
@@ -457,6 +455,49 @@ class RowGeneratorService:
     # Strong references to in-flight background refreshes; asyncio only holds a
     # weak reference to a bare create_task() result.
     _bg_tasks: set = set()
+
+    # Only intervene when a meaningful title word-family has become a real
+    # batch-level pattern. Two uses can be natural; three or more across the
+    # movie + series shelves is treated as overuse.
+    TITLE_WORD_OVERUSE_THRESHOLD = 3
+
+    # These words describe genre, format, or ordinary shelf grammar. Repeating
+    # them can be necessary for clarity and must never trigger cosmetic retitles.
+    TITLE_WORD_DIVERSITY_PROTECTED = frozenset({
+        "movie",
+        "movies",
+        "series",
+        "show",
+        "shows",
+        "anthology",
+        "anthologies",
+        "miniseries",
+        "action",
+        "adventure",
+        "animation",
+        "animated",
+        "comedy",
+        "crime",
+        "documentary",
+        "documentaries",
+        "drama",
+        "family",
+        "fantasy",
+        "history",
+        "historical",
+        "horror",
+        "music",
+        "musical",
+        "mystery",
+        "mysteries",
+        "reality",
+        "romance",
+        "science",
+        "fiction",
+        "scifi",
+        "thriller",
+        "western",
+    })
 
     """Generates dynamic, personalized row definitions from a User Taste Profile."""
 
@@ -1015,6 +1056,169 @@ class RowGeneratorService:
             logger.info(
                 f"[RowRepair] AI retitle '{old_title}' -> '{row.title}'"
             )
+
+    @classmethod
+    def _title_content_word_families(
+        cls,
+        title: str,
+    ) -> set[str]:
+        """Return meaningful lexical families used by a visible shelf title.
+
+        This is intentionally conservative. Short grammar words and explicit
+        genre/format terms are ignored. Simple plural variants collapse into the
+        same family so Future/Futures, World/Worlds, Story/Stories, etc. can be
+        recognized as the same repeated wording.
+        """
+        normalized = "".join(
+            char.casefold()
+            if char.isalnum()
+            else " "
+            for char in str(title or "")
+        )
+
+        families: set[str] = set()
+
+        for token in normalized.split():
+            if len(token) < 5:
+                continue
+
+            if token in cls.TITLE_WORD_DIVERSITY_PROTECTED:
+                continue
+
+            family = token
+
+            if (
+                token.endswith("ies")
+                and len(token) > 5
+                and token != "series"
+            ):
+                family = token[:-3] + "y"
+            elif (
+                token.endswith("s")
+                and len(token) > 5
+                and not token.endswith(("ss", "us", "is"))
+            ):
+                family = token[:-1]
+
+            if (
+                len(family) < 5
+                or family in cls.TITLE_WORD_DIVERSITY_PROTECTED
+            ):
+                continue
+
+            families.add(family)
+
+        return families
+
+    async def _retitle_for_word_diversity(
+        self,
+        row: RowDefinition,
+        features: ExtractedFeatures,
+        avoid_families: set[str],
+    ) -> str | None:
+        """Cosmetically rename a valid row without changing its recipe.
+
+        Failure is deliberately non-destructive: the caller keeps the existing
+        title and the row itself is never rejected because of lexical repetition.
+        """
+        if not avoid_families:
+            return None
+
+        builder = RowBuilder(features)
+
+        for axis in row.axes:
+            builder.add_axis(
+                axis.name,
+                axis.value,
+                axis.role,
+                axis.weight,
+            )
+
+        final_filters = builder.components.build_prompt()
+        avoid_text = ", ".join(sorted(avoid_families))
+
+        prompt = (
+            f"Existing title: {row.title}\n"
+            f"Final row filters:\n{final_filters}\n\n"
+            "This shelf is already valid. Rename ONLY to remove repeated wording "
+            "that is overused across neighboring shelves. Do not change what the "
+            "shelf means and do not change or imply any filters. "
+            f"Avoid these overused word families: {avoid_text}. "
+            "Do not use those words or simple singular/plural variants of them. "
+            "Find fresh wording genuinely supported by the FINAL filters. "
+            "Every concrete idea in the replacement must be grounded in those "
+            "filters. Return one title only, with no explanation. "
+            + THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE
+        )
+
+        api_key = (
+            getattr(
+                self.user_settings,
+                "openrouter_api_key",
+                None,
+            )
+            if self.user_settings
+            else None
+        )
+
+        try:
+            result = await gemini_service.generate_content_async(
+                prompt,
+                api_key=api_key,
+                google_api_key=(
+                    (
+                        getattr(
+                            self.user_settings,
+                            "gemini_api_key",
+                            None,
+                        )
+                        if self.user_settings
+                        else None
+                    )
+                    or settings.GEMINI_API_KEY
+                ),
+                system_instruction=(
+                    THEME_ROTATION_V2_RETITLE_SYSTEM_INSTRUCTION
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[TitleDiversity] retitle failed for "
+                f"'{row.title}': {exc}"
+            )
+            return None
+
+        if not result:
+            logger.warning(
+                f"[TitleDiversity] empty retitle for "
+                f"'{row.title}'; keeping original"
+            )
+            return None
+
+        replacement = self._clean_title(result)
+
+        if (
+            not replacement
+            or replacement.strip().casefold()
+            == row.title.strip().casefold()
+        ):
+            return None
+
+        replacement_families = (
+            self._title_content_word_families(
+                replacement
+            )
+        )
+
+        if replacement_families & avoid_families:
+            logger.warning(
+                f"[TitleDiversity] replacement still used "
+                f"overused wording for '{row.title}': "
+                f"'{replacement}'"
+            )
+            return None
+
+        return replacement
 
     async def _resolve_keyword_to_id(self, kw_name: str, profile_kw_map: dict[str, int]) -> int | None:
         """Resolve a keyword name to TMDB ID: profile first, then TMDB search (for discovery)."""
