@@ -701,6 +701,29 @@ async def test_free_model_catalog_is_cached():
 
 
 @pytest.mark.asyncio
+async def test_server_google_key_is_used_when_user_google_key_is_missing():
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.settings,
+        "GEMINI_API_KEY",
+        "server-google-key",
+    ):
+        assert (
+            service._get_google_api_key(
+                None
+            )
+            == "server-google-key"
+        )
+        assert (
+            service._get_google_api_key(
+                "user-google-key"
+            )
+            == "user-google-key"
+        )
+
+
+@pytest.mark.asyncio
 async def test_exhausted_openrouter_chain_falls_back_to_direct_google():
     service = OpenRouterService()
     primary = AsyncMock(
