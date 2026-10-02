@@ -490,7 +490,17 @@ class RowGeneratorService:
 
     @staticmethod
     def _llm_rows_key(token: str, content_type: str) -> str:
-        return f"watchly:llm_rows:{token}:{content_type}"
+        # Keep Theme Rotation V2 completely isolated from the legacy row cache.
+        #
+        # This is essential for the runtime kill switch: disabling V2 must
+        # immediately return to the exact legacy cache namespace rather than
+        # continuing to serve a previously generated V2 row set.
+        namespace = (
+            "watchly:llm_rows_v2"
+            if settings.THEME_ROTATION_V2_ENABLED
+            else "watchly:llm_rows"
+        )
+        return f"{namespace}:{token}:{content_type}"
 
     async def _cache_llm_rows(self, token: str | None, content_type: str, rows: list) -> None:
         """Persist the most recent successful LLM row set as a fallback."""
