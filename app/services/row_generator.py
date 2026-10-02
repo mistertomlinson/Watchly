@@ -2212,6 +2212,7 @@ class RowGeneratorService:
         features: "ExtractedFeatures",
         content_type: str,
         token: str | None,
+        history: list[dict[str, Any]] | None = None,
     ) -> list[RowDefinition] | None:
         """Validate V2 candidates and return exactly five publishable rows.
 
@@ -2221,7 +2222,74 @@ class RowGeneratorService:
 
         A generation is accepted only when five rows survive. We never cache a
         partial V2 generation merely because some candidates were rejected.
+
+        Cooldown is enforced against the FINAL resolved TMDB keyword axes, not
+        merely the prompt hint. This prevents the model from independently
+        reintroducing a recently used concept that was intentionally omitted from
+        the rotating prompt window.
+
+        Candidate 1 gets one narrow exemption: the user's strongest usable profile
+        keyword may repeat as the stable core signal. Every other recent keyword is
+        blocked, and candidates 2+ receive no recent-keyword exemption.
         """
+        if history is None:
+            history = await self._get_v2_rotation_history(
+                token,
+                content_type,
+            )
+
+        recent_keyword_ids = (
+            self._recent_v2_keyword_ids(
+                history
+            )
+        )
+
+        core_window = (
+            self._select_v2_prompt_keyword_window(
+                features,
+                history,
+                limit=1,
+            )
+        )
+
+        core_keyword_id = (
+            int(core_window[0][0])
+            if core_window
+            else None
+        )
+
+        def blocked_recent_keywords(
+            candidate_index: int,
+            candidate_row: RowDefinition,
+        ) -> set[int]:
+            row_keyword_ids: set[int] = set()
+
+            for axis in candidate_row.axes:
+                if axis.name != AXIS_KEYWORD:
+                    continue
+
+                try:
+                    row_keyword_ids.add(
+                        int(axis.value)
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            blocked = (
+                row_keyword_ids
+                & recent_keyword_ids
+            )
+
+            if (
+                candidate_index == 1
+                and core_keyword_id is not None
+            ):
+                blocked.discard(
+                    core_keyword_id
+                )
+
+            return blocked
+
         watched_tmdb = (
             await self._get_v2_normalized_watched_tmdb(
                 token,
@@ -2246,6 +2314,33 @@ class RowGeneratorService:
             rows,
             start=1,
         ):
+            blocked_before = (
+                blocked_recent_keywords(
+                    candidate_index,
+                    row,
+                )
+            )
+
+            if blocked_before:
+                blocked_names = [
+                    (
+                        features.get_keyword_name(
+                            keyword_id
+                        )
+                        or str(keyword_id)
+                    )
+                    for keyword_id
+                    in sorted(blocked_before)
+                ]
+
+                logger.info(
+                    f"[ThemeRotationV2] candidate {candidate_index} "
+                    f"'{row.title}' rejected by final-axis cooldown: "
+                    f"{blocked_names}"
+                )
+
+                continue
+
             result = (
                 await self._v2_repair_row_for_unseen(
                     row,
@@ -2280,6 +2375,36 @@ class RowGeneratorService:
             )
 
             if final_row is None:
+                continue
+
+            # Repairs currently only remove constraints, but enforce cooldown a
+            # second time against the actual row about to be accepted so future
+            # repair changes cannot accidentally bypass rotation history.
+            blocked_after = (
+                blocked_recent_keywords(
+                    candidate_index,
+                    final_row,
+                )
+            )
+
+            if blocked_after:
+                blocked_names = [
+                    (
+                        features.get_keyword_name(
+                            keyword_id
+                        )
+                        or str(keyword_id)
+                    )
+                    for keyword_id
+                    in sorted(blocked_after)
+                ]
+
+                logger.warning(
+                    f"[ThemeRotationV2] candidate {candidate_index} "
+                    f"'{final_row.title}' rejected after repair by "
+                    f"final-axis cooldown: {blocked_names}"
+                )
+
                 continue
 
             row_id = str(
@@ -2955,6 +3080,7 @@ class RowGeneratorService:
                         features,
                         content_type,
                         token,
+                        history=history,
                     )
 
                 # Exact legacy raw-inventory repair path.
