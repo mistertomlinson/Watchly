@@ -23,6 +23,7 @@ from app.models.taste_profile import TasteProfile
 from app.services.openrouter import gemini_service
 from app.services.tmdb.countries import COUNTRY_ADJECTIVES
 from app.services.tmdb.genre import movie_genres, series_genres
+from app.services.recommendation.filtering import RecommendationFiltering
 from app.services.recommendation.utils import apply_discover_filters
 from app.services.tmdb.service import TMDBService, get_tmdb_service
 
@@ -42,6 +43,18 @@ THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 # change.
 THEME_ROTATION_V2_WATCHED_TMDB_TTL_SECONDS = 30 * 24 * 60 * 60
 THEME_ROTATION_V2_WATCHED_RESOLVE_CONCURRENCY = 12
+
+# A normal themed shelf shows about 20 titles. V2 aims for substantially more
+# unseen inventory so a row remains useful as the user keeps watching.
+THEME_ROTATION_V2_UNSEEN_TARGET = 35
+THEME_ROTATION_V2_UNSEEN_HARD_FLOOR = 25
+THEME_ROTATION_V2_INVENTORY_MAX_PAGES = 10
+
+# ThemeBasedService already relaxes a narrow row's vote-count floor to 10 when
+# the normal quality floor leaves fewer than 40 candidates. Mirror that here so
+# V2 validates the inventory the production theme service can actually surface.
+THEME_ROTATION_V2_NARROW_POOL_THRESHOLD = 40
+THEME_ROTATION_V2_RELAXED_VOTE_FLOOR = 10
 
 # Available axes for row generation
 AXIS_GENRE = "genre"
@@ -1176,6 +1189,364 @@ class RowGeneratorService:
         )
 
         return normalized
+
+    def _v2_inventory_params(
+        self,
+        axes: list,
+        content_type: str,
+    ) -> dict[str, Any]:
+        """Build the effective discover query for a V2 inventory check."""
+        genres = [
+            str(axis.value)
+            for axis in axes
+            if axis.name == AXIS_GENRE
+        ]
+
+        keywords = [
+            str(axis.value)
+            for axis in axes
+            if axis.name == AXIS_KEYWORD
+        ]
+
+        countries = [
+            str(axis.value)
+            for axis in axes
+            if axis.name == AXIS_COUNTRY
+        ]
+
+        params: dict[str, Any] = {}
+
+        if genres:
+            params["with_genres"] = ",".join(
+                genres
+            )
+
+        if keywords:
+            params["with_keywords"] = ",".join(
+                keywords
+            )
+
+        if countries:
+            params["with_origin_country"] = (
+                countries[0]
+            )
+
+        if not params:
+            return {}
+
+        if self.user_settings is not None:
+            params = apply_discover_filters(
+                params,
+                self.user_settings,
+            )
+
+            excluded_ids = (
+                RecommendationFiltering
+                .get_excluded_genre_ids(
+                    self.user_settings,
+                    content_type,
+                )
+            )
+
+            if excluded_ids:
+                included_genres = set()
+
+                for value in (
+                    params.get(
+                        "with_genres",
+                        "",
+                    )
+                    or ""
+                ).replace("|", ",").split(","):
+                    if not value:
+                        continue
+
+                    try:
+                        included_genres.add(
+                            int(value)
+                        )
+                    except ValueError:
+                        continue
+
+                without = [
+                    genre_id
+                    for genre_id
+                    in excluded_ids
+                    if genre_id
+                    not in included_genres
+                ]
+
+                if without:
+                    params["without_genres"] = (
+                        "|".join(
+                            str(genre_id)
+                            for genre_id
+                            in without
+                        )
+                    )
+
+        return params
+
+    async def _v2_row_unseen_inventory(
+        self,
+        axes: list,
+        content_type: str,
+        watched_tmdb: set[int],
+        target: int = THEME_ROTATION_V2_UNSEEN_TARGET,
+        hard_floor: int = THEME_ROTATION_V2_UNSEEN_HARD_FLOOR,
+    ) -> dict[str, Any]:
+        """Measure genuinely unseen inventory for one proposed V2 row.
+
+        The probe uses the actual discover constraints and user filters, removes
+        watched TMDB IDs, and stops early once the healthy target is proven.
+
+        A transient TMDB failure returns validated=False rather than pretending
+        the row has zero inventory. Later acceptance logic can then fail open to
+        the existing legacy/raw behavior instead of destroying a good row during
+        an upstream outage.
+        """
+        params = self._v2_inventory_params(
+            axes,
+            content_type,
+        )
+
+        empty_result = {
+            "validated": True,
+            "raw_total": 0,
+            "unseen_count": 0,
+            "watched_removed": 0,
+            "candidates_scanned": 0,
+            "target_met": False,
+            "hard_floor_met": False,
+            "complete": True,
+            "vote_floor_relaxed": False,
+        }
+
+        if not params:
+            return empty_result
+
+        watched = set()
+
+        for value in watched_tmdb or set():
+            try:
+                watched.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        try:
+            first_page = (
+                await self.tmdb_service.get_discover(
+                    content_type,
+                    page=1,
+                    **params,
+                )
+            )
+
+            raw_total = int(
+                first_page.get(
+                    "total_results",
+                    0,
+                )
+                or 0
+            )
+
+            vote_floor_relaxed = False
+
+            floor = params.get(
+                "vote_count.gte"
+            )
+
+            try:
+                floor_int = int(floor)
+            except (
+                TypeError,
+                ValueError,
+            ):
+                floor_int = 0
+
+            if (
+                raw_total
+                < THEME_ROTATION_V2_NARROW_POOL_THRESHOLD
+                and floor_int
+                > THEME_ROTATION_V2_RELAXED_VOTE_FLOOR
+            ):
+                relaxed_params = dict(
+                    params
+                )
+
+                relaxed_params[
+                    "vote_count.gte"
+                ] = (
+                    THEME_ROTATION_V2_RELAXED_VOTE_FLOOR
+                )
+
+                wider_first = (
+                    await self.tmdb_service.get_discover(
+                        content_type,
+                        page=1,
+                        **relaxed_params,
+                    )
+                )
+
+                wider_total = int(
+                    wider_first.get(
+                        "total_results",
+                        0,
+                    )
+                    or 0
+                )
+
+                if wider_total > raw_total:
+                    params = relaxed_params
+                    first_page = wider_first
+                    raw_total = wider_total
+                    vote_floor_relaxed = True
+
+            total_pages = int(
+                first_page.get(
+                    "total_pages",
+                    0,
+                )
+                or 0
+            )
+
+            seen_ids: set[int] = set()
+            unseen_ids: set[int] = set()
+
+            watched_removed = 0
+            scanned = 0
+
+            async def consume(
+                data: dict[str, Any],
+            ) -> None:
+                nonlocal watched_removed
+                nonlocal scanned
+
+                for item in (
+                    data.get("results")
+                    or []
+                ):
+                    try:
+                        tmdb_id = int(
+                            item.get("id")
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+                        continue
+
+                    if tmdb_id in seen_ids:
+                        continue
+
+                    seen_ids.add(tmdb_id)
+                    scanned += 1
+
+                    if tmdb_id in watched:
+                        watched_removed += 1
+                        continue
+
+                    unseen_ids.add(
+                        tmdb_id
+                    )
+
+                    if len(unseen_ids) >= target:
+                        return
+
+            await consume(
+                first_page
+            )
+
+            last_page_scanned = 1
+
+            page_limit = min(
+                max(
+                    total_pages,
+                    1,
+                ),
+                THEME_ROTATION_V2_INVENTORY_MAX_PAGES,
+            )
+
+            for page in range(
+                2,
+                page_limit + 1,
+            ):
+                if len(unseen_ids) >= target:
+                    break
+
+                data = (
+                    await self.tmdb_service.get_discover(
+                        content_type,
+                        page=page,
+                        **params,
+                    )
+                )
+
+                last_page_scanned = page
+
+                results = (
+                    data.get("results")
+                    or []
+                )
+
+                if not results:
+                    break
+
+                await consume(data)
+
+            target_met = (
+                len(unseen_ids) >= target
+            )
+
+            complete = (
+                not target_met
+                and (
+                    total_pages <= last_page_scanned
+                    or last_page_scanned
+                    >= THEME_ROTATION_V2_INVENTORY_MAX_PAGES
+                )
+            )
+
+            return {
+                "validated": True,
+                "raw_total": raw_total,
+                "unseen_count": len(
+                    unseen_ids
+                ),
+                "watched_removed":
+                    watched_removed,
+                "candidates_scanned":
+                    scanned,
+                "target_met":
+                    target_met,
+                "hard_floor_met":
+                    (
+                        len(unseen_ids)
+                        >= hard_floor
+                    ),
+                "complete":
+                    complete,
+                "vote_floor_relaxed":
+                    vote_floor_relaxed,
+            }
+
+        except Exception as exc:
+            logger.warning(
+                f"[ThemeRotationV2] unseen inventory probe failed "
+                f"for {content_type}: {exc}"
+            )
+
+            return {
+                "validated": False,
+                "raw_total": None,
+                "unseen_count": None,
+                "watched_removed": None,
+                "candidates_scanned": None,
+                "target_met": None,
+                "hard_floor_met": None,
+                "complete": False,
+                "vote_floor_relaxed": False,
+            }
 
     async def _row_inventory(self, axes: list, content_type: str) -> int:
         """Return TMDB's total_results for the discover query a row will run."""
