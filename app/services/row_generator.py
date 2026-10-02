@@ -431,7 +431,12 @@ class RowGeneratorService:
 
             try:
                 llm_rows = await self._generate_rows_with_llm(
-                    profile, features, content_type, api_key, avoid_titles
+                    profile,
+                    features,
+                    content_type,
+                    api_key,
+                    avoid_titles,
+                    token=token,
                 )
                 if llm_rows:
                     logger.info(f"Generated {len(llm_rows)} LLM-driven rows for {content_type}")
@@ -1112,6 +1117,121 @@ class RowGeneratorService:
         await self._retitle_repaired_rows(retitle_rows, features)
         return rows
 
+    @staticmethod
+    def _recent_v2_keyword_ids(
+        history: list[dict[str, Any]],
+    ) -> set[int]:
+        """Collect keyword axes used by recent successful V2 generations.
+
+        The reader accepts both a generation-level ``keyword_ids`` summary
+        and per-row ``keyword_ids`` so the stored history can remain useful
+        if its representation becomes more detailed later.
+        """
+        recent: set[int] = set()
+
+        def add_ids(values: Any) -> None:
+            if not isinstance(values, (list, tuple, set)):
+                return
+
+            for value in values:
+                try:
+                    recent.add(int(value))
+                except (TypeError, ValueError):
+                    continue
+
+        for generation in history or []:
+            if not isinstance(generation, dict):
+                continue
+
+            add_ids(generation.get("keyword_ids"))
+
+            rows = generation.get("rows")
+            if not isinstance(rows, list):
+                continue
+
+            for row in rows:
+                if isinstance(row, dict):
+                    add_ids(row.get("keyword_ids"))
+
+        return recent
+
+    @classmethod
+    def _select_v2_prompt_keyword_window(
+        cls,
+        features: "ExtractedFeatures",
+        history: list[dict[str, Any]],
+        limit: int = THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT,
+    ) -> list[tuple[int, float]]:
+        """Choose one familiar signal plus fresh rotating profile keywords.
+
+        Slot 1 intentionally keeps the user's strongest usable profile keyword
+        available for the strongest-match row.
+
+        The remaining slots prefer ranked profile keywords that have not appeared
+        in the recent successful V2 generations. Recent signals are only reused
+        when the deeper profile pool cannot fill the requested window.
+        """
+        if limit <= 0:
+            return []
+
+        pool: list[tuple[int, float]] = []
+        seen_ids: set[int] = set()
+
+        for keyword_id, score in features.keywords:
+            try:
+                keyword_id = int(keyword_id)
+            except (TypeError, ValueError):
+                continue
+
+            if keyword_id in seen_ids:
+                continue
+
+            # A keyword without a resolved name cannot be useful in the LLM hint.
+            if not features.get_keyword_name(keyword_id):
+                continue
+
+            seen_ids.add(keyword_id)
+            pool.append((keyword_id, score))
+
+        if not pool:
+            return []
+
+        recent_ids = cls._recent_v2_keyword_ids(history)
+
+        # Keep one strong familiar signal even if it was used recently.
+        selected = [pool[0]]
+
+        if limit == 1:
+            return selected
+
+        fresh = [
+            item
+            for item in pool[1:]
+            if item[0] not in recent_ids
+        ]
+
+        selected.extend(
+            fresh[: max(0, limit - len(selected))]
+        )
+
+        if len(selected) < limit:
+            selected_ids = {
+                keyword_id
+                for keyword_id, _ in selected
+            }
+
+            fallback = [
+                item
+                for item in pool[1:]
+                if item[0] not in selected_ids
+            ]
+
+            selected.extend(
+                fallback[: max(0, limit - len(selected))]
+            )
+
+        return selected[:limit]
+
     async def _regenerate_in_background(
         self,
         profile: TasteProfile,
@@ -1122,7 +1242,13 @@ class RowGeneratorService:
     ) -> None:
         """Refresh a stale row set without blocking the request that noticed it."""
         try:
-            rows = await self._generate_rows_with_llm(profile, features, content_type, api_key)
+            rows = await self._generate_rows_with_llm(
+                profile,
+                features,
+                content_type,
+                api_key,
+                token=token,
+            )
             if rows:
                 rows = await self._repair_thin_rows(rows, features, content_type)
                 await self._cache_llm_rows(token, content_type, rows)
@@ -1139,6 +1265,7 @@ class RowGeneratorService:
         content_type: str,
         api_key: str,
         avoid_titles: set[str] | None = None,
+        token: str | None = None,
     ) -> list[RowDefinition] | None:
         """Generate rows from the user's interest summary; balance personalization with discovery."""
         try:
@@ -1147,16 +1274,98 @@ class RowGeneratorService:
             current_genre_map = movie_genres if content_type == "movie" else series_genres
             valid_genre_list = ", ".join([f"{name} (ID: {gid})" for gid, name in current_genre_map.items()])
 
-            profile_keywords = [name for k_id, _ in features.keywords[:12] if (name := features.get_keyword_name(k_id))]
-            keyword_hint = (
-                (
-                    f"Themes they already like (you can use these): {', '.join(profile_keywords)}. "
-                    if profile_keywords
-                    else ""
+            if settings.THEME_ROTATION_V2_ENABLED:
+                history: list[dict[str, Any]] = []
+
+                if token:
+                    try:
+                        from app.services.user_cache import user_cache
+
+                        history = await user_cache.get_theme_rotation_history(
+                            token,
+                            content_type,
+                        )
+                    except Exception as exc:
+                        # Rotation history is advisory. A Redis problem must never
+                        # prevent row generation.
+                        logger.warning(
+                            f"[ThemeRotationV2] failed to read history for "
+                            f"{content_type}: {exc}"
+                        )
+
+                keyword_window = self._select_v2_prompt_keyword_window(
+                    features,
+                    history,
                 )
-                + "You can also suggest new themes for discovery—especially for Rising Star—"
-                "e.g. adjacent genres or topics they might not have tried yet. We will resolve keywords."
-            )
+
+                keyword_names = [
+                    features.get_keyword_name(keyword_id)
+                    for keyword_id, _ in keyword_window
+                ]
+                keyword_names = [
+                    name
+                    for name in keyword_names
+                    if name
+                ]
+
+                core_keyword = (
+                    keyword_names[0]
+                    if keyword_names
+                    else None
+                )
+                rotating_keywords = keyword_names[1:]
+
+                keyword_hint_parts = []
+
+                if core_keyword:
+                    keyword_hint_parts.append(
+                        "Strong familiar profile theme for the strongest-match "
+                        f"row: {core_keyword}. "
+                        "Do not let this one familiar theme dominate the other rows."
+                    )
+
+                if rotating_keywords:
+                    keyword_hint_parts.append(
+                        "Fresh rotation themes from the user's actual profile; "
+                        "prioritize these across the variety, discovery, "
+                        "lesser-known and mood rows: "
+                        f"{', '.join(rotating_keywords)}."
+                    )
+
+                keyword_hint_parts.append(
+                    "You can also suggest adjacent discovery themes they would "
+                    "likely enjoy. We will resolve keywords."
+                )
+
+                keyword_hint = " ".join(keyword_hint_parts)
+
+                recent_ids = self._recent_v2_keyword_ids(
+                    history
+                )
+
+                logger.info(
+                    f"[ThemeRotationV2] {content_type} keyword window: "
+                    f"core={core_keyword!r} "
+                    f"rotating={rotating_keywords} "
+                    f"recent_keyword_count={len(recent_ids)}"
+                )
+
+            else:
+                # Legacy prompt construction must remain exactly unchanged.
+                profile_keywords = [
+                    name
+                    for k_id, _ in features.keywords[:12]
+                    if (name := features.get_keyword_name(k_id))
+                ]
+                keyword_hint = (
+                    (
+                        f"Themes they already like (you can use these): {', '.join(profile_keywords)}. "
+                        if profile_keywords
+                        else ""
+                    )
+                    + "You can also suggest new themes for discovery—especially for Rising Star—"
+                    "e.g. adjacent genres or topics they might not have tried yet. We will resolve keywords."
+                )
 
             avoid_clause = ""
             if avoid_titles:
