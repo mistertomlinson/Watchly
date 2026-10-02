@@ -1319,6 +1319,7 @@ class RowGeneratorService:
             "target_met": False,
             "hard_floor_met": False,
             "complete": True,
+            "scan_capped": False,
             "vote_floor_relaxed": False,
         }
 
@@ -1500,11 +1501,14 @@ class RowGeneratorService:
 
             complete = (
                 not target_met
-                and (
-                    total_pages <= last_page_scanned
-                    or last_page_scanned
-                    >= THEME_ROTATION_V2_INVENTORY_MAX_PAGES
-                )
+                and total_pages <= last_page_scanned
+            )
+
+            scan_capped = (
+                not target_met
+                and total_pages > last_page_scanned
+                and last_page_scanned
+                >= THEME_ROTATION_V2_INVENTORY_MAX_PAGES
             )
 
             return {
@@ -1526,6 +1530,8 @@ class RowGeneratorService:
                     ),
                 "complete":
                     complete,
+                "scan_capped":
+                    scan_capped,
                 "vote_floor_relaxed":
                     vote_floor_relaxed,
             }
@@ -1545,8 +1551,442 @@ class RowGeneratorService:
                 "target_met": None,
                 "hard_floor_met": None,
                 "complete": False,
+                "scan_capped": False,
                 "vote_floor_relaxed": False,
             }
+
+    @staticmethod
+    def _v2_axes_signature(
+        axes: list[RowAxis],
+    ) -> tuple[tuple[str, str], ...]:
+        """Inventory-equivalent signature for deduplicating repair attempts."""
+        return tuple(
+            sorted({
+                (
+                    str(axis.name),
+                    str(axis.value),
+                )
+                for axis in axes
+            })
+        )
+
+    async def _v2_repair_row_for_unseen(
+        self,
+        row: RowDefinition,
+        content_type: str,
+        watched_tmdb: set[int],
+    ) -> dict[str, Any]:
+        """Try to make one V2 theme healthy without replacing its concept.
+
+        Policy:
+        - >=35 unseen: accept unchanged.
+        - 25-34 unseen: try to broaden to >=35; if no better repair exists,
+          keep the original because it remains above the hard floor.
+        - <25 unseen: repair is mandatory. If no grounded repair reaches 25,
+          reject the theme.
+        - Probe/network uncertainty fails open; never destroy a row because
+          TMDB was temporarily unavailable.
+
+        Repairs only remove constraints already present in the row. They never
+        inject an unrelated profile keyword.
+        """
+        working = row.model_copy(
+            deep=True
+        )
+
+        working.axes = (
+            self._normalize_row_axes(
+                list(working.axes)
+            )
+        )
+
+        working.id = build_row_id(
+            working.axes
+        )
+
+        original_probe = (
+            await self._v2_row_unseen_inventory(
+                working.axes,
+                content_type,
+                watched_tmdb,
+            )
+        )
+
+        base = {
+            "row": working,
+            "probe": original_probe,
+            "changed": False,
+            "original_probe":
+                original_probe,
+            "attempts": [],
+        }
+
+        if not original_probe.get(
+            "validated"
+        ):
+            return {
+                **base,
+                "status": "unvalidated-keep",
+            }
+
+        if original_probe.get(
+            "target_met"
+        ):
+            return {
+                **base,
+                "status": "healthy",
+            }
+
+        # If the probe hit our page safety cap before proving even the hard
+        # floor, the result is uncertain rather than a valid rejection.
+        if (
+            original_probe.get(
+                "scan_capped"
+            )
+            and not original_probe.get(
+                "hard_floor_met"
+            )
+        ):
+            return {
+                **base,
+                "status":
+                    "scan-capped-keep",
+            }
+
+        original_floor_met = bool(
+            original_probe.get(
+                "hard_floor_met"
+            )
+        )
+
+        original_axes = list(
+            working.axes
+        )
+
+        keyword_axes = [
+            axis
+            for axis in original_axes
+            if axis.name == AXIS_KEYWORD
+        ]
+
+        genre_axes = [
+            axis
+            for axis in original_axes
+            if axis.name == AXIS_GENRE
+        ]
+
+        candidates: list[
+            tuple[
+                str,
+                list[RowAxis],
+            ]
+        ] = []
+
+        #
+        # 1. Relax one genre while preserving all of the theme's keywords.
+        #
+        if (
+            keyword_axes
+            and len(genre_axes) > 1
+        ):
+            removable = sorted(
+                genre_axes,
+                key=lambda axis:
+                    0
+                    if axis.role
+                    == AxisRole.FLAVOR
+                    else 1,
+            )
+
+            for genre_axis in removable:
+                candidate = []
+                removed = False
+
+                for axis in original_axes:
+                    if (
+                        not removed
+                        and axis is genre_axis
+                    ):
+                        removed = True
+                        continue
+
+                    candidate.append(
+                        axis.model_copy(
+                            deep=True
+                        )
+                    )
+
+                if candidate:
+                    candidates.append((
+                        "relax-one-genre",
+                        candidate,
+                    ))
+
+        #
+        # 2. If multiple keywords were combined, try each original keyword
+        #    individually while retaining the non-keyword constraints.
+        #
+        if len(keyword_axes) > 1:
+            non_keyword = [
+                axis
+                for axis in original_axes
+                if axis.name
+                != AXIS_KEYWORD
+            ]
+
+            for keyword_axis in keyword_axes:
+                candidates.append((
+                    "single-original-keyword",
+                    [
+                        *[
+                            axis.model_copy(
+                                deep=True
+                            )
+                            for axis
+                            in non_keyword
+                        ],
+                        keyword_axis.model_copy(
+                            deep=True
+                        ),
+                    ],
+                ))
+
+        #
+        # 3. Preserve one original keyword with one original genre.
+        #
+        if keyword_axes and genre_axes:
+            non_genre_non_keyword = [
+                axis
+                for axis in original_axes
+                if axis.name
+                not in (
+                    AXIS_GENRE,
+                    AXIS_KEYWORD,
+                )
+            ]
+
+            for keyword_axis in keyword_axes:
+                for genre_axis in genre_axes:
+                    candidates.append((
+                        "keyword-plus-one-genre",
+                        [
+                            *[
+                                axis.model_copy(
+                                    deep=True
+                                )
+                                for axis
+                                in non_genre_non_keyword
+                            ],
+                            genre_axis.model_copy(
+                                deep=True
+                            ),
+                            keyword_axis.model_copy(
+                                deep=True
+                            ),
+                        ],
+                    ))
+
+        #
+        # 4. Last grounded broadening: keep the original keyword itself and
+        #    discard genre narrowing. This preserves the distinctive theme
+        #    instead of falling back to a generic broad genre shelf.
+        #
+        for keyword_axis in keyword_axes:
+            other_constraints = [
+                axis
+                for axis in original_axes
+                if axis.name
+                not in (
+                    AXIS_GENRE,
+                    AXIS_KEYWORD,
+                )
+            ]
+
+            candidates.append((
+                "keyword-only",
+                [
+                    *[
+                        axis.model_copy(
+                            deep=True
+                        )
+                        for axis
+                        in other_constraints
+                    ],
+                    keyword_axis.model_copy(
+                        deep=True
+                    ),
+                ],
+            ))
+
+        seen_signatures = {
+            self._v2_axes_signature(
+                original_axes
+            )
+        }
+
+        best_floor_row = None
+        best_floor_probe = None
+        best_floor_reason = None
+
+        attempts = []
+
+        for reason, candidate_axes in candidates:
+            candidate_axes = (
+                self._normalize_row_axes(
+                    candidate_axes
+                )
+            )
+
+            signature = (
+                self._v2_axes_signature(
+                    candidate_axes
+                )
+            )
+
+            if (
+                not candidate_axes
+                or signature
+                in seen_signatures
+            ):
+                continue
+
+            seen_signatures.add(
+                signature
+            )
+
+            probe = (
+                await self._v2_row_unseen_inventory(
+                    candidate_axes,
+                    content_type,
+                    watched_tmdb,
+                )
+            )
+
+            attempts.append({
+                "reason": reason,
+                "axes": [
+                    {
+                        "name": axis.name,
+                        "value": axis.value,
+                        "role": axis.role.value,
+                    }
+                    for axis in candidate_axes
+                ],
+                "probe": probe,
+            })
+
+            if not probe.get(
+                "validated"
+            ):
+                continue
+
+            candidate = (
+                working.model_copy(
+                    deep=True
+                )
+            )
+
+            candidate.axes = (
+                candidate_axes
+            )
+
+            candidate.id = build_row_id(
+                candidate_axes
+            )
+
+            if probe.get(
+                "target_met"
+            ):
+                return {
+                    "status":
+                        "repaired-target",
+                    "row": candidate,
+                    "probe": probe,
+                    "changed": True,
+                    "repair_reason":
+                        reason,
+                    "original_probe":
+                        original_probe,
+                    "attempts":
+                        attempts,
+                }
+
+            if probe.get(
+                "hard_floor_met"
+            ):
+                if (
+                    best_floor_probe is None
+                    or int(
+                        probe.get(
+                            "unseen_count"
+                        )
+                        or 0
+                    )
+                    > int(
+                        best_floor_probe.get(
+                            "unseen_count"
+                        )
+                        or 0
+                    )
+                ):
+                    best_floor_row = (
+                        candidate
+                    )
+                    best_floor_probe = (
+                        probe
+                    )
+                    best_floor_reason = (
+                        reason
+                    )
+
+        #
+        # A 25-34 original row remains publishable. We only change it when the
+        # repair actually gets us to the healthy target.
+        #
+        if original_floor_met:
+            return {
+                **base,
+                "status":
+                    "thin-keep",
+                "attempts":
+                    attempts,
+            }
+
+        #
+        # Original was below 25. A grounded repair reaching at least 25 is
+        # acceptable even if it cannot reach 35.
+        #
+        if best_floor_row is not None:
+            return {
+                "status":
+                    "repaired-floor",
+                "row":
+                    best_floor_row,
+                "probe":
+                    best_floor_probe,
+                "changed": True,
+                "repair_reason":
+                    best_floor_reason,
+                "original_probe":
+                    original_probe,
+                "attempts":
+                    attempts,
+            }
+
+        #
+        # No grounded version of this theme has enough confirmed unseen titles.
+        #
+        return {
+            "status": "reject",
+            "row": None,
+            "probe":
+                original_probe,
+            "changed": False,
+            "original_probe":
+                original_probe,
+            "attempts":
+                attempts,
+        }
 
     async def _row_inventory(self, axes: list, content_type: str) -> int:
         """Return TMDB's total_results for the discover query a row will run."""
