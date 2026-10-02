@@ -8,13 +8,17 @@ from app.services import row_generator as row_generator_module
 from app.services.openrouter import (
     DEFAULT_MODEL,
     GROQ_MODEL,
-    OPENROUTER_FALLBACK_MODEL,
     OpenRouterService,
+    _is_approved_free_model_id,
 )
 from app.services.row_generator import (
     RowComponents,
     RowGeneratorService,
 )
+
+
+TEST_FREE_FALLBACK = "google/gemma-4-31b-it:free"
+TEST_PAID_MODEL = "openai/gpt-oss-20b"
 
 
 class FakeResponse:
@@ -46,10 +50,42 @@ class FakeResponse:
         }
 
 
+class FakeCatalogResponse:
+    text = ""
+
+    def __init__(
+        self,
+        data,
+        status_code=200,
+    ):
+        self.data = data
+        self.status_code = status_code
+
+    def json(self):
+        return {
+            "data": self.data,
+        }
+
+
 class FakeAsyncClient:
-    def __init__(self, responses, calls, timeout=None):
-        self.responses = responses
-        self.calls = calls
+    def __init__(
+        self,
+        post_responses=None,
+        get_responses=None,
+        calls=None,
+        timeout=None,
+    ):
+        self.post_responses = list(
+            post_responses or []
+        )
+        self.get_responses = list(
+            get_responses or []
+        )
+        self.calls = (
+            calls
+            if calls is not None
+            else []
+        )
 
     async def __aenter__(self):
         return self
@@ -62,15 +98,75 @@ class FakeAsyncClient:
     ):
         return False
 
-    async def post(self, url, headers, json):
+    async def get(
+        self,
+        url,
+        headers,
+    ):
         self.calls.append(
             {
+                "method": "GET",
+                "url": url,
+                "headers": headers,
+            }
+        )
+
+        response = self.get_responses.pop(0)
+
+        if isinstance(
+            response,
+            Exception,
+        ):
+            raise response
+
+        return response
+
+    async def post(
+        self,
+        url,
+        headers,
+        json,
+    ):
+        self.calls.append(
+            {
+                "method": "POST",
                 "url": url,
                 "headers": headers,
                 "json": json,
             }
         )
-        return self.responses.pop(0)
+        return self.post_responses.pop(0)
+
+
+def free_model(
+    model_id,
+    *,
+    prompt_price="0",
+    completion_price="0",
+    context_length=131072,
+    inputs=None,
+    outputs=None,
+):
+    return {
+        "id": model_id,
+        "pricing": {
+            "prompt": prompt_price,
+            "completion": completion_price,
+        },
+        "context_length": context_length,
+        "architecture": {
+            "input_modalities": (
+                inputs
+                if inputs is not None
+                else ["text"]
+            ),
+            "output_modalities": (
+                outputs
+                if outputs is not None
+                else ["text"]
+            ),
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -83,14 +179,27 @@ async def test_primary_openrouter_model_is_used_first():
         )
     ]
     service = OpenRouterService()
+    resolver = AsyncMock(
+        return_value=[
+            DEFAULT_MODEL,
+            TEST_FREE_FALLBACK,
+        ]
+    )
 
-    with patch.object(
-        openrouter_module.httpx,
-        "AsyncClient",
-        side_effect=lambda timeout: FakeAsyncClient(
-            responses,
-            calls,
-            timeout,
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=resolver,
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
         ),
     ):
         result = (
@@ -104,14 +213,18 @@ async def test_primary_openrouter_model_is_used_first():
         )
 
     assert result
+    resolver.assert_awaited_once_with(
+        "sk-or-test"
+    )
     assert len(calls) == 1
+    assert calls[0]["method"] == "POST"
     assert calls[0]["json"]["model"] == DEFAULT_MODEL
     assert calls[0]["json"]["max_tokens"] == 321
     assert "models" not in calls[0]["json"]
 
 
 @pytest.mark.asyncio
-async def test_invalid_primary_output_retries_fixed_fallback():
+async def test_invalid_primary_output_retries_live_free_fallback():
     calls = []
     responses = [
         FakeResponse(
@@ -119,19 +232,31 @@ async def test_invalid_primary_output_retries_fixed_fallback():
             content="I cannot provide that list.",
         ),
         FakeResponse(
-            model=OPENROUTER_FALLBACK_MODEL,
+            model=TEST_FREE_FALLBACK,
             content="movie|Heat|1995\n" * 5,
         ),
     ]
     service = OpenRouterService()
 
-    with patch.object(
-        openrouter_module.httpx,
-        "AsyncClient",
-        side_effect=lambda timeout: FakeAsyncClient(
-            responses,
-            calls,
-            timeout,
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
         ),
     ):
         result = (
@@ -149,12 +274,12 @@ async def test_invalid_primary_output_retries_fixed_fallback():
         for call in calls
     ] == [
         DEFAULT_MODEL,
-        OPENROUTER_FALLBACK_MODEL,
+        TEST_FREE_FALLBACK,
     ]
 
 
 @pytest.mark.asyncio
-async def test_invalid_primary_json_retries_fallback():
+async def test_invalid_primary_json_retries_live_free_fallback():
     calls = []
     responses = [
         FakeResponse(
@@ -162,19 +287,31 @@ async def test_invalid_primary_json_retries_fallback():
             content='{"rows": [}',
         ),
         FakeResponse(
-            model=OPENROUTER_FALLBACK_MODEL,
+            model=TEST_FREE_FALLBACK,
             content='{"rows": []}',
         ),
     ]
     service = OpenRouterService()
 
-    with patch.object(
-        openrouter_module.httpx,
-        "AsyncClient",
-        side_effect=lambda timeout: FakeAsyncClient(
-            responses,
-            calls,
-            timeout,
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
         ),
     ):
         result = await service.generate_structured_async(
@@ -190,8 +327,214 @@ async def test_invalid_primary_json_retries_fallback():
         for call in calls
     ] == [
         DEFAULT_MODEL,
-        OPENROUTER_FALLBACK_MODEL,
+        TEST_FREE_FALLBACK,
     ]
+
+
+@pytest.mark.asyncio
+async def test_live_discovery_admits_only_approved_zero_cost_text_models():
+    calls = []
+    catalog = [
+        free_model(
+            DEFAULT_MODEL
+        ),
+        free_model(
+            TEST_FREE_FALLBACK
+        ),
+        free_model(
+            TEST_PAID_MODEL,
+            prompt_price="0.000001",
+            completion_price="0.000001",
+        ),
+        free_model(
+            "qwen/qwen-test:free"
+        ),
+        free_model(
+            "google/gemma-tiny:free",
+            context_length=8192,
+        ),
+        free_model(
+            "google/gemma-image:free",
+            outputs=["image"],
+        ),
+    ]
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.httpx,
+        "AsyncClient",
+        side_effect=lambda timeout: FakeAsyncClient(
+            get_responses=[
+                FakeCatalogResponse(
+                    catalog
+                )
+            ],
+            calls=calls,
+            timeout=timeout,
+        ),
+    ):
+        models = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+
+    assert models == [
+        DEFAULT_MODEL,
+        TEST_FREE_FALLBACK,
+    ]
+    assert all(
+        model.endswith(":free")
+        for model in models
+    )
+    assert TEST_PAID_MODEL not in models
+    assert "qwen/qwen-test:free" not in models
+    assert calls[0]["method"] == "GET"
+
+
+@pytest.mark.asyncio
+async def test_dead_primary_is_skipped_when_live_catalog_has_free_fallback():
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.httpx,
+        "AsyncClient",
+        side_effect=lambda timeout: FakeAsyncClient(
+            get_responses=[
+                FakeCatalogResponse([
+                    free_model(
+                        TEST_FREE_FALLBACK
+                    )
+                ])
+            ],
+            timeout=timeout,
+        ),
+    ):
+        models = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+
+    assert models == [
+        TEST_FREE_FALLBACK
+    ]
+
+
+@pytest.mark.asyncio
+async def test_catalog_failure_falls_back_only_to_explicit_free_slugs():
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.httpx,
+        "AsyncClient",
+        side_effect=lambda timeout: FakeAsyncClient(
+            get_responses=[
+                RuntimeError(
+                    "catalog unavailable"
+                )
+            ],
+            timeout=timeout,
+        ),
+    ):
+        models = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+
+    assert models
+    assert DEFAULT_MODEL in models
+    assert all(
+        _is_approved_free_model_id(
+            model
+        )
+        for model in models
+    )
+    assert all(
+        model.endswith(":free")
+        for model in models
+    )
+    assert TEST_PAID_MODEL not in models
+
+
+@pytest.mark.asyncio
+async def test_no_approved_free_models_returns_empty_chain():
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.httpx,
+        "AsyncClient",
+        side_effect=lambda timeout: FakeAsyncClient(
+            get_responses=[
+                FakeCatalogResponse([
+                    free_model(
+                        TEST_PAID_MODEL,
+                        prompt_price="0.000001",
+                        completion_price="0.000001",
+                    ),
+                    free_model(
+                        "qwen/qwen-test:free"
+                    ),
+                ])
+            ],
+            timeout=timeout,
+        ),
+    ):
+        models = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+
+    assert models == []
+
+
+@pytest.mark.asyncio
+async def test_free_model_catalog_is_cached():
+    calls = []
+    service = OpenRouterService()
+
+    with patch.object(
+        openrouter_module.httpx,
+        "AsyncClient",
+        side_effect=lambda timeout: FakeAsyncClient(
+            get_responses=[
+                FakeCatalogResponse([
+                    free_model(
+                        DEFAULT_MODEL
+                    )
+                ])
+            ],
+            calls=calls,
+            timeout=timeout,
+        ),
+    ):
+        first = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+        second = (
+            await service
+            ._resolve_free_model_candidates(
+                "sk-or-test"
+            )
+        )
+
+    assert first == [
+        DEFAULT_MODEL
+    ]
+    assert second == first
+    assert [
+        call["method"]
+        for call in calls
+    ] == ["GET"]
 
 
 @pytest.mark.asyncio
@@ -204,14 +547,26 @@ async def test_groq_keys_keep_direct_groq_routing():
         )
     ]
     service = OpenRouterService()
+    resolver = AsyncMock(
+        return_value=[
+            DEFAULT_MODEL
+        ]
+    )
 
-    with patch.object(
-        openrouter_module.httpx,
-        "AsyncClient",
-        side_effect=lambda timeout: FakeAsyncClient(
-            responses,
-            calls,
-            timeout,
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=resolver,
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
         ),
     ):
         result = (
@@ -225,6 +580,7 @@ async def test_groq_keys_keep_direct_groq_routing():
         )
 
     assert result
+    resolver.assert_not_awaited()
     assert len(calls) == 1
     assert calls[0]["json"]["model"] == GROQ_MODEL
     assert calls[0]["json"]["max_tokens"] == 222

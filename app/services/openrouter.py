@@ -17,10 +17,19 @@ DEFAULT_MODEL = os.getenv(
     "OPENROUTER_MODEL",
     "google/gemma-4-26b-a4b-it:free",
 )
-OPENROUTER_FALLBACK_MODEL = os.getenv(
-    "OPENROUTER_FALLBACK_MODEL",
-    "openai/gpt-oss-20b:free",
+# OpenRouter free slugs are not stable enough to hardcode as a permanent
+# fallback. Discover the currently available zero-cost models instead, but keep
+# the allowlist intentionally narrow so a provider catalog change can never
+# route Watchly onto an unrelated or paid model.
+APPROVED_FREE_MODEL_PREFIXES = (
+    "google/gemma-",
+    "openai/gpt-oss-",
 )
+PREFERRED_FREE_MODELS = (
+    "google/gemma-4-31b-it:free",
+)
+FREE_MODEL_MIN_CONTEXT = 64_000
+FREE_MODEL_CATALOG_TTL_SECONDS = 15 * 60
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -115,13 +124,13 @@ def _parse_json(text: str):
     )
 
 
-def _ordered_models(primary_model: str) -> list[str]:
-    return list(
-        dict.fromkeys(
-            [
-                primary_model,
-                OPENROUTER_FALLBACK_MODEL,
-            ]
+def _is_approved_free_model_id(model_id: object) -> bool:
+    return (
+        isinstance(model_id, str)
+        and model_id.endswith(":free")
+        and any(
+            model_id.startswith(prefix)
+            for prefix in APPROVED_FREE_MODEL_PREFIXES
         )
     )
 
@@ -162,12 +171,258 @@ class OpenRouterService:
     def __init__(self):
         self.api_key = settings.OPENROUTER_API_KEY
         self.base_url = OPENROUTER_BASE_URL
+        self._free_model_cache: tuple[
+            float,
+            list[str],
+        ] | None = None
 
     def _get_api_key(
         self,
         api_key: str | None = None,
     ) -> str | None:
         return api_key or self.api_key
+
+    @staticmethod
+    def _openrouter_headers(key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": (
+                "https://github.com/"
+                "mistertomlinson/Watchly"
+            ),
+            "X-Title": "Watchly",
+        }
+
+    async def _resolve_free_model_candidates(
+        self,
+        api_key: str | None = None,
+    ) -> list[str]:
+        """Return a live, approved, zero-cost OpenRouter fallback chain.
+
+        OpenRouter free model slugs can disappear while similarly named paid
+        variants remain available. Model discovery therefore verifies both the
+        :free suffix and zero prompt/completion pricing before a model can be
+        attempted. Paid models are never admitted to this chain.
+        """
+        now = time.monotonic()
+
+        if (
+            self._free_model_cache is not None
+            and now < self._free_model_cache[0]
+        ):
+            return list(
+                self._free_model_cache[1]
+            )
+
+        key = self._get_api_key(api_key)
+
+        if not key:
+            return []
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=TIMEOUT,
+            ) as client:
+                response = await client.get(
+                    f"{self.base_url}/models",
+                    headers=self._openrouter_headers(
+                        key
+                    ),
+                )
+
+            if response.status_code != 200:
+                raise RuntimeError(
+                    "HTTP "
+                    f"{response.status_code}: "
+                    f"{response.text[:500]}"
+                )
+
+            catalog = (
+                response.json().get("data")
+                or []
+            )
+
+            eligible: set[str] = set()
+
+            for item in catalog:
+                if not isinstance(
+                    item,
+                    dict,
+                ):
+                    continue
+
+                model_id = item.get("id")
+
+                if not _is_approved_free_model_id(
+                    model_id
+                ):
+                    continue
+
+                pricing = (
+                    item.get("pricing")
+                    or {}
+                )
+
+                try:
+                    prompt_price = float(
+                        pricing.get(
+                            "prompt",
+                            "1",
+                        )
+                    )
+                    completion_price = float(
+                        pricing.get(
+                            "completion",
+                            "1",
+                        )
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if (
+                    prompt_price != 0
+                    or completion_price != 0
+                ):
+                    continue
+
+                try:
+                    context_length = int(
+                        item.get(
+                            "context_length"
+                        )
+                        or 0
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    context_length = 0
+
+                if (
+                    context_length
+                    < FREE_MODEL_MIN_CONTEXT
+                ):
+                    continue
+
+                architecture = (
+                    item.get("architecture")
+                    or {}
+                )
+
+                inputs = set(
+                    architecture.get(
+                        "input_modalities"
+                    )
+                    or []
+                )
+
+                outputs = set(
+                    architecture.get(
+                        "output_modalities"
+                    )
+                    or []
+                )
+
+                if (
+                    inputs
+                    and "text" not in inputs
+                ):
+                    continue
+
+                if (
+                    outputs
+                    and "text" not in outputs
+                ):
+                    continue
+
+                eligible.add(
+                    model_id
+                )
+
+            models: list[str] = []
+
+            for model_id in (
+                DEFAULT_MODEL,
+                *PREFERRED_FREE_MODELS,
+            ):
+                if (
+                    model_id in eligible
+                    and model_id not in models
+                ):
+                    models.append(
+                        model_id
+                    )
+
+            for prefix in (
+                APPROVED_FREE_MODEL_PREFIXES
+            ):
+                discovered = sorted(
+                    model_id
+                    for model_id in eligible
+                    if (
+                        model_id.startswith(
+                            prefix
+                        )
+                        and model_id not in models
+                    )
+                )
+
+                models.extend(
+                    discovered
+                )
+
+            if DEFAULT_MODEL not in eligible:
+                logger.warning(
+                    "Configured OpenRouter model is not "
+                    "currently available as an approved "
+                    f"zero-cost model: {DEFAULT_MODEL}"
+                )
+
+            logger.info(
+                "OpenRouter approved free model chain: "
+                f"{models}"
+            )
+
+            self._free_model_cache = (
+                now
+                + FREE_MODEL_CATALOG_TTL_SECONDS,
+                list(models),
+            )
+
+            return models
+
+        except Exception as exc:
+            # Discovery failure must never broaden into a paid fallback. These
+            # are only explicitly free slugs from approved families; a stale
+            # slug can fail harmlessly, but it cannot spend credit.
+            fallback = []
+
+            for model_id in (
+                DEFAULT_MODEL,
+                *PREFERRED_FREE_MODELS,
+            ):
+                if (
+                    _is_approved_free_model_id(
+                        model_id
+                    )
+                    and model_id not in fallback
+                ):
+                    fallback.append(
+                        model_id
+                    )
+
+            logger.warning(
+                "OpenRouter free-model discovery failed; "
+                "using free-only safe fallback slugs "
+                f"{fallback}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            return fallback
 
     @staticmethod
     def get_catalog_title_prompt():
@@ -250,15 +505,9 @@ class OpenRouterService:
                 ) as client:
                     response = await client.post(
                         f"{effective_base_url}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                            "HTTP-Referer": (
-                                "https://github.com/"
-                                "mistertomlinson/Watchly"
-                            ),
-                            "X-Title": "Watchly",
-                        },
+                        headers=self._openrouter_headers(
+                            key
+                        ),
                         json=payload,
                     )
 
@@ -353,6 +602,19 @@ class OpenRouterService:
                 max_tokens=TITLE_MAX_TOKENS,
             )
 
+        attempt_models = (
+            await self._resolve_free_model_candidates(
+                api_key
+            )
+        )
+
+        if not attempt_models:
+            logger.warning(
+                "No approved zero-cost OpenRouter "
+                "models are currently available."
+            )
+            return ""
+
         return await self._call(
             prompt=prompt,
             system_instruction=(
@@ -360,7 +622,7 @@ class OpenRouterService:
             ),
             api_key=api_key,
             max_tokens=TITLE_MAX_TOKENS,
-            attempt_models=_ordered_models(DEFAULT_MODEL),
+            attempt_models=attempt_models,
         )
 
     async def generate_flash_content_async(
@@ -389,12 +651,25 @@ class OpenRouterService:
                 validate_content=validator,
             )
 
+        attempt_models = (
+            await self._resolve_free_model_candidates(
+                api_key
+            )
+        )
+
+        if not attempt_models:
+            logger.warning(
+                "No approved zero-cost OpenRouter "
+                "models are currently available."
+            )
+            return ""
+
         return await self._call(
             prompt=prompt,
             system_instruction=system_instruction,
             api_key=api_key,
             max_tokens=max_tokens,
-            attempt_models=_ordered_models(DEFAULT_MODEL),
+            attempt_models=attempt_models,
             validate_content=validator,
         )
 
@@ -425,6 +700,19 @@ class OpenRouterService:
                 validate_content=_json_validator,
             )
         else:
+            attempt_models = (
+                await self._resolve_free_model_candidates(
+                    api_key
+                )
+            )
+
+            if not attempt_models:
+                logger.warning(
+                    "No approved zero-cost OpenRouter "
+                    "models are currently available."
+                )
+                return None
+
             result = await self._call(
                 prompt=prompt,
                 system_instruction=structured_instruction,
@@ -432,9 +720,7 @@ class OpenRouterService:
                 max_tokens=(
                     STRUCTURED_MAX_TOKENS_OPENROUTER
                 ),
-                attempt_models=_ordered_models(
-                    DEFAULT_MODEL
-                ),
+                attempt_models=attempt_models,
                 validate_content=_json_validator,
             )
 
