@@ -22,19 +22,21 @@ TEST_PAID_MODEL = "openai/gpt-oss-20b"
 
 
 class FakeResponse:
-    text = ""
-
     def __init__(
         self,
         status_code=200,
         model="test-model",
         content="Test response",
         finish_reason="stop",
+        text="",
+        headers=None,
     ):
         self.status_code = status_code
         self.model = model
         self.content = content
         self.finish_reason = finish_reason
+        self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return {
@@ -329,6 +331,153 @@ async def test_invalid_primary_json_retries_live_free_fallback():
         DEFAULT_MODEL,
         TEST_FREE_FALLBACK,
     ]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_rate_limit_retries_same_free_model_before_fallback():
+    calls = []
+    responses = [
+        FakeResponse(
+            status_code=502,
+            model=DEFAULT_MODEL,
+            text=(
+                '{"error":{"code":502,'
+                '"metadata":{"previous_errors":['
+                '{"code":429,"message":'
+                '"temporarily rate-limited"}]}}}'
+            ),
+        ),
+        FakeResponse(
+            model=DEFAULT_MODEL,
+            content="movie|Heat|1995\n" * 5,
+        ),
+    ]
+    service = OpenRouterService()
+    sleep_mock = AsyncMock()
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.asyncio,
+            "sleep",
+            new=sleep_mock,
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        result = (
+            await service.generate_flash_content_async(
+                prompt="Prompt",
+                system_instruction="System",
+                api_key="sk-or-test",
+                minimum_pipe_lines=5,
+            )
+        )
+
+    assert result
+    assert [
+        call["json"]["model"]
+        for call in calls
+    ] == [
+        DEFAULT_MODEL,
+        DEFAULT_MODEL,
+    ]
+    sleep_mock.assert_awaited_once_with(
+        30.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_persistent_wrapped_rate_limit_moves_to_next_free_model():
+    calls = []
+    rate_limited = (
+        '{"error":{"code":502,'
+        '"metadata":{"raw":"rate limited",'
+        '"previous_errors":[{"code":429,'
+        '"message":"temporarily rate-limited"}]}}}'
+    )
+    responses = [
+        FakeResponse(
+            status_code=502,
+            model=DEFAULT_MODEL,
+            text=rate_limited,
+        ),
+        FakeResponse(
+            status_code=502,
+            model=DEFAULT_MODEL,
+            text=rate_limited,
+        ),
+        FakeResponse(
+            model=TEST_FREE_FALLBACK,
+            content="movie|Heat|1995\n" * 5,
+        ),
+    ]
+    service = OpenRouterService()
+    sleep_mock = AsyncMock()
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                    TEST_FREE_FALLBACK,
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.asyncio,
+            "sleep",
+            new=sleep_mock,
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        result = (
+            await service.generate_flash_content_async(
+                prompt="Prompt",
+                system_instruction="System",
+                api_key="sk-or-test",
+                minimum_pipe_lines=5,
+            )
+        )
+
+    assert result
+    assert [
+        call["json"]["model"]
+        for call in calls
+    ] == [
+        DEFAULT_MODEL,
+        DEFAULT_MODEL,
+        TEST_FREE_FALLBACK,
+    ]
+    sleep_mock.assert_awaited_once_with(
+        30.0
+    )
 
 
 @pytest.mark.asyncio

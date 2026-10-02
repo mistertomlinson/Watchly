@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import re
@@ -490,8 +491,6 @@ class OpenRouterService:
                 ],
             }
 
-            started_at = time.monotonic()
-
             logger.info(
                 "LLM attempt starting "
                 f"attempt={attempt}/{len(models)} "
@@ -499,68 +498,171 @@ class OpenRouterService:
                 f"max_tokens={max_tokens}"
             )
 
+            started_at = time.monotonic()
+
             try:
                 async with httpx.AsyncClient(
                     timeout=TIMEOUT,
                 ) as client:
-                    response = await client.post(
-                        f"{effective_base_url}/chat/completions",
-                        headers=self._openrouter_headers(
-                            key
-                        ),
-                        json=payload,
-                    )
+                    for http_attempt in range(
+                        1,
+                        3,
+                    ):
+                        request_started_at = (
+                            time.monotonic()
+                        )
 
-                elapsed = time.monotonic() - started_at
+                        response = await client.post(
+                            f"{effective_base_url}/chat/completions",
+                            headers=self._openrouter_headers(
+                                key
+                            ),
+                            json=payload,
+                        )
 
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        "HTTP "
-                        f"{response.status_code}: "
-                        f"{response.text[:500]}"
-                    )
+                        elapsed = (
+                            time.monotonic()
+                            - request_started_at
+                        )
 
-                data = response.json()
-                choices = data.get("choices") or []
+                        response_text = (
+                            response.text[:4000]
+                        )
 
-                if not choices:
-                    raise ValueError(
-                        "LLM response had no choices"
-                    )
+                        compact_response = (
+                            response_text.replace(
+                                " ",
+                                "",
+                            )
+                        )
 
-                choice = choices[0]
-                message = choice.get("message") or {}
-                content = _content_to_text(
-                    message.get("content")
-                ).strip()
+                        wrapped_rate_limit = (
+                            response.status_code
+                            in {
+                                502,
+                                503,
+                                504,
+                            }
+                            and (
+                                '"code":429'
+                                in compact_response
+                                or (
+                                    "temporarily rate-limited"
+                                    in response_text.lower()
+                                )
+                                or (
+                                    "temporarily rate limited"
+                                    in response_text.lower()
+                                )
+                            )
+                        )
 
-                if not content:
-                    raise ValueError(
-                        "LLM returned empty content "
-                        f"(finish_reason="
-                        f"{choice.get('finish_reason')})"
-                    )
+                        if (
+                            response.status_code
+                            == 429
+                            or wrapped_rate_limit
+                        ):
+                            if http_attempt < 2:
+                                retry_after_raw = (
+                                    response.headers.get(
+                                        "retry-after",
+                                        "",
+                                    )
+                                )
 
-                if validate_content is not None:
-                    validate_content(content)
+                                try:
+                                    retry_after = float(
+                                        retry_after_raw
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                ):
+                                    retry_after = 0.0
 
-                logger.info(
-                    "LLM call completed "
-                    f"attempt={attempt}/{len(models)} "
-                    f"requested_model={attempt_model} "
-                    f"resolved_model="
-                    f"{data.get('model') or attempt_model} "
-                    f"finish_reason="
-                    f"{choice.get('finish_reason')} "
-                    f"duration={elapsed:.2f}s "
-                    f"max_tokens={max_tokens} "
-                    f"content_chars={len(content)}"
-                )
+                                wait_seconds = min(
+                                    max(
+                                        retry_after,
+                                        30.0,
+                                    ),
+                                    120.0,
+                                )
 
-                return content
+                                logger.warning(
+                                    "LLM model rate limited "
+                                    f"model={attempt_model} "
+                                    f"http_attempt="
+                                    f"{http_attempt}/2 "
+                                    f"waiting="
+                                    f"{wait_seconds:.1f}s"
+                                )
+
+                                await asyncio.sleep(
+                                    wait_seconds
+                                )
+
+                                continue
+
+                        if response.status_code != 200:
+                            raise RuntimeError(
+                                "HTTP "
+                                f"{response.status_code}: "
+                                f"{response.text[:500]}"
+                            )
+
+                        data = response.json()
+                        choices = (
+                            data.get("choices")
+                            or []
+                        )
+
+                        if not choices:
+                            raise ValueError(
+                                "LLM response had no choices"
+                            )
+
+                        choice = choices[0]
+                        message = (
+                            choice.get("message")
+                            or {}
+                        )
+                        content = _content_to_text(
+                            message.get("content")
+                        ).strip()
+
+                        if not content:
+                            raise ValueError(
+                                "LLM returned empty content "
+                                f"(finish_reason="
+                                f"{choice.get('finish_reason')})"
+                            )
+
+                        if validate_content is not None:
+                            validate_content(content)
+
+                        logger.info(
+                            "LLM call completed "
+                            f"attempt={attempt}/"
+                            f"{len(models)} "
+                            f"requested_model="
+                            f"{attempt_model} "
+                            f"resolved_model="
+                            f"{data.get('model') or attempt_model} "
+                            f"finish_reason="
+                            f"{choice.get('finish_reason')} "
+                            f"duration={elapsed:.2f}s "
+                            f"max_tokens={max_tokens} "
+                            f"content_chars="
+                            f"{len(content)}"
+                        )
+
+                        return content
 
             except Exception as exc:
-                elapsed = time.monotonic() - started_at
+                total_elapsed = (
+                    time.monotonic()
+                    - started_at
+                )
                 error = (
                     f"attempt {attempt} "
                     f"model={attempt_model}: "
@@ -572,7 +674,7 @@ class OpenRouterService:
                     "LLM attempt failed "
                     f"attempt={attempt}/{len(models)} "
                     f"model={attempt_model} "
-                    f"duration={elapsed:.2f}s "
+                    f"duration={total_elapsed:.2f}s "
                     f"error={type(exc).__name__}: {exc}"
                 )
 
