@@ -37,8 +37,10 @@ FREE_MODEL_CATALOG_TTL_SECONDS = 15 * 60
 # Avoid repeatedly paying the same retry delay when a provider has already
 # confirmed that a model is temporarily rate limited. Cooldowns are deliberately
 # process-local and short-lived: a restart clears them, and the preferred model
-# automatically re-enters the chain after five minutes.
-MODEL_RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60
+# automatically re-enters the chain after 90 seconds. Since the normal same-model
+# retry already consumes roughly 30-60 seconds, this usually skips only the next
+# one or two AI jobs instead of sidelining a preferred model for a whole prewarm.
+MODEL_RATE_LIMIT_COOLDOWN_SECONDS = 90
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
