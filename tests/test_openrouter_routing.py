@@ -703,24 +703,60 @@ async def test_free_model_catalog_is_cached():
 @pytest.mark.asyncio
 async def test_server_google_key_is_used_when_user_google_key_is_missing():
     service = OpenRouterService()
+    primary = AsyncMock(
+        return_value=""
+    )
+    google = AsyncMock(
+        return_value='{"rows": []}'
+    )
 
-    with patch.object(
-        openrouter_module.settings,
-        "GEMINI_API_KEY",
-        "server-google-key",
+    with (
+        patch.object(
+            openrouter_module.settings,
+            "GEMINI_API_KEY",
+            "server-google-key",
+        ),
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    DEFAULT_MODEL,
+                ]
+            ),
+        ),
+        patch.object(
+            service,
+            "_call",
+            new=primary,
+        ),
+        patch.object(
+            service,
+            "_call_google",
+            new=google,
+        ),
     ):
-        assert (
-            service._get_google_api_key(
-                None
-            )
-            == "server-google-key"
+        result = await service.generate_structured_async(
+            prompt="Prompt",
+            response_schema=dict,
+            system_instruction="System",
+            api_key="sk-or-test",
+            google_api_key=None,
         )
-        assert (
-            service._get_google_api_key(
-                "user-google-key"
-            )
-            == "user-google-key"
+
+    assert result == {
+        "rows": []
+    }
+    assert (
+        service._get_google_api_key(
+            None
         )
+        == "server-google-key"
+    )
+    google.assert_awaited_once()
+    assert google.await_args.kwargs[
+        "google_api_key"
+    ] == "server-google-key"
 
 
 @pytest.mark.asyncio
