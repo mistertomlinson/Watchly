@@ -410,6 +410,10 @@ async def test_wrapped_rate_limit_retries_same_free_model_before_fallback():
     sleep_mock.assert_awaited_once_with(
         30.0
     )
+    assert (
+        "openrouter",
+        DEFAULT_MODEL,
+    ) not in service._rate_limit_cooldowns
 
 
 @pytest.mark.asyncio
@@ -486,6 +490,185 @@ async def test_persistent_wrapped_rate_limit_moves_to_next_free_model():
     ]
     sleep_mock.assert_awaited_once_with(
         30.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_openrouter_model_is_skipped_on_next_job():
+    calls = []
+    rate_limited = (
+        '{"error":{"code":502,'
+        '"metadata":{"previous_errors":['
+        '{"code":429,"message":'
+        '"temporarily rate-limited"}]}}}'
+    )
+    responses = [
+        FakeResponse(
+            status_code=502,
+            model=DEFAULT_MODEL,
+            text=rate_limited,
+        ),
+        FakeResponse(
+            status_code=502,
+            model=DEFAULT_MODEL,
+            text=rate_limited,
+        ),
+        FakeResponse(
+            model=TEST_FREE_FALLBACK,
+            content="movie|Heat|1995\n" * 5,
+        ),
+        FakeResponse(
+            model=TEST_FREE_FALLBACK,
+            content="movie|Heat|1995\n" * 5,
+        ),
+    ]
+    service = OpenRouterService()
+    sleep_mock = AsyncMock()
+    resolver = AsyncMock(
+        return_value=[
+            DEFAULT_MODEL,
+            TEST_FREE_FALLBACK,
+        ]
+    )
+
+    with (
+        patch.object(
+            service,
+            "_resolve_free_model_candidates",
+            new=resolver,
+        ),
+        patch.object(
+            openrouter_module.asyncio,
+            "sleep",
+            new=sleep_mock,
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        first = (
+            await service.generate_flash_content_async(
+                prompt="Prompt",
+                system_instruction="System",
+                api_key="sk-or-test",
+                minimum_pipe_lines=5,
+            )
+        )
+
+        second = (
+            await service.generate_flash_content_async(
+                prompt="Prompt",
+                system_instruction="System",
+                api_key="sk-or-test",
+                minimum_pipe_lines=5,
+            )
+        )
+
+    assert first
+    assert second
+    assert [
+        call["json"]["model"]
+        for call in calls
+    ] == [
+        DEFAULT_MODEL,
+        DEFAULT_MODEL,
+        TEST_FREE_FALLBACK,
+        TEST_FREE_FALLBACK,
+    ]
+    assert (
+        "openrouter",
+        DEFAULT_MODEL,
+    ) in service._rate_limit_cooldowns
+    sleep_mock.assert_awaited_once_with(
+        30.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_expired_rate_limit_cooldown_reenters_preferred_chain():
+    service = OpenRouterService()
+    key = (
+        "openrouter",
+        DEFAULT_MODEL,
+    )
+    service._rate_limit_cooldowns[
+        key
+    ] = 0.0
+
+    models = (
+        service._filter_rate_limited_models(
+            "openrouter",
+            [
+                DEFAULT_MODEL,
+                TEST_FREE_FALLBACK,
+            ],
+        )
+    )
+
+    assert models == [
+        DEFAULT_MODEL,
+        TEST_FREE_FALLBACK,
+    ]
+    assert (
+        key
+        not in service._rate_limit_cooldowns
+    )
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_google_model_is_skipped_on_next_fallback():
+    calls = []
+    responses = [
+        FakeResponse(
+            model="gemini-3.5-flash-lite",
+            content="OK",
+        )
+    ]
+    service = OpenRouterService()
+    service._mark_rate_limited_model(
+        "google-ai",
+        "gemini-3.8-flash",
+    )
+
+    with (
+        patch.object(
+            service,
+            "_resolve_google_model_candidates",
+            new=AsyncMock(
+                return_value=[
+                    "gemini-3.8-flash",
+                    "gemini-3.5-flash-lite",
+                ]
+            ),
+        ),
+        patch.object(
+            openrouter_module.httpx,
+            "AsyncClient",
+            side_effect=lambda timeout: FakeAsyncClient(
+                post_responses=responses,
+                calls=calls,
+                timeout=timeout,
+            ),
+        ),
+    ):
+        result = await service._call_google(
+            prompt="Prompt",
+            system_instruction="System",
+            google_api_key="google-test",
+            max_tokens=256,
+        )
+
+    assert result == "OK"
+    assert len(calls) == 1
+    assert (
+        calls[0]["json"]["model"]
+        == "gemini-3.5-flash-lite"
     )
 
 
