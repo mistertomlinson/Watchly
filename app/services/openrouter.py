@@ -1138,7 +1138,11 @@ class OpenRouterService:
         if result:
             return result
 
-        if google_api_key:
+        google_key = self._get_google_api_key(
+            google_api_key
+        )
+
+        if google_key:
             logger.info(
                 "Primary AI provider chain exhausted; "
                 "switching_provider=google-ai"
@@ -1149,7 +1153,7 @@ class OpenRouterService:
                 system_instruction=(
                     self.get_catalog_title_prompt()
                 ),
-                google_api_key=google_api_key,
+                google_api_key=google_key,
                 max_tokens=TITLE_MAX_TOKENS,
             )
 
@@ -1207,7 +1211,11 @@ class OpenRouterService:
         if result:
             return result
 
-        if google_api_key:
+        google_key = self._get_google_api_key(
+            google_api_key
+        )
+
+        if google_key:
             logger.info(
                 "Primary AI provider chain exhausted; "
                 "switching_provider=google-ai"
@@ -1216,7 +1224,7 @@ class OpenRouterService:
             return await self._call_google(
                 prompt=prompt,
                 system_instruction=system_instruction,
-                google_api_key=google_api_key,
+                google_api_key=google_key,
                 max_tokens=max_tokens,
                 validate_content=validator,
             )
@@ -1282,9 +1290,13 @@ class OpenRouterService:
                     validate_content=_json_validator,
                 )
 
+        google_key = self._get_google_api_key(
+            google_api_key
+        )
+
         if (
             not result
-            and google_api_key
+            and google_key
         ):
             logger.info(
                 "Primary AI provider chain exhausted; "
@@ -1294,7 +1306,7 @@ class OpenRouterService:
             result = await self._call_google(
                 prompt=prompt,
                 system_instruction=structured_instruction,
-                google_api_key=google_api_key,
+                google_api_key=google_key,
                 max_tokens=(
                     STRUCTURED_MAX_TOKENS_OPENROUTER
                 ),
