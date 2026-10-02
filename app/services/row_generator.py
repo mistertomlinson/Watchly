@@ -8,6 +8,7 @@ Generates 3 personalized catalog rows using a tiered sampling system:
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import random
@@ -34,6 +35,13 @@ SILVER_TIER_END = 10  # Up to Rank 10
 # 20-candidate fetch -> blacklist -> first-10 behavior when V2 is disabled.
 THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT = 50
 THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
+
+# V2 converts provider watched IDs to one TMDB namespace so inventory probes can
+# subtract watched titles cheaply. The normalized result is cached separately
+# from legacy watched data and automatically invalidates when the source sets
+# change.
+THEME_ROTATION_V2_WATCHED_TMDB_TTL_SECONDS = 30 * 24 * 60 * 60
+THEME_ROTATION_V2_WATCHED_RESOLVE_CONCURRENCY = 12
 
 # Available axes for row generation
 AXIS_GENRE = "genre"
@@ -904,6 +912,270 @@ class RowGeneratorService:
         except Exception:
             pass
         return None
+
+    @staticmethod
+    def _v2_normalized_watched_key(
+        token: str,
+        content_type: str,
+    ) -> str:
+        return (
+            f"watchly:theme_rotation_v2_watched_tmdb:"
+            f"{token}:{content_type}"
+        )
+
+    @staticmethod
+    def _v2_watched_signature(
+        watched_tmdb: set[int],
+        watched_imdb: set[str],
+    ) -> str:
+        """Build a stable signature of the provider watched sets."""
+        tmdb_part = ",".join(
+            str(value)
+            for value in sorted(
+                int(value)
+                for value in watched_tmdb
+            )
+        )
+
+        imdb_part = ",".join(
+            sorted(
+                str(value).strip().lower()
+                for value in watched_imdb
+                if str(value).strip()
+            )
+        )
+
+        payload = (
+            f"tmdb={tmdb_part}\n"
+            f"imdb={imdb_part}"
+        )
+
+        return hashlib.sha256(
+            payload.encode("utf-8")
+        ).hexdigest()
+
+    async def _resolve_v2_watched_tmdb_ids(
+        self,
+        watched_tmdb: set[int],
+        watched_imdb: set[str],
+        content_type: str,
+    ) -> set[int]:
+        """Normalize provider watched IDs into TMDB IDs.
+
+        Trakt/Stremio may already supply TMDB IDs. Simkl commonly supplies IMDb
+        IDs only. Resolving the watched side once is much cheaper than enriching
+        every candidate row title just to discover its IMDb ID.
+        """
+        normalized: set[int] = set()
+
+        for value in watched_tmdb or set():
+            try:
+                normalized.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        imdb_ids = sorted({
+            str(value).strip().lower()
+            for value in (watched_imdb or set())
+            if str(value).strip()
+        })
+
+        if not imdb_ids:
+            return normalized
+
+        expected_tmdb_type = (
+            "movie"
+            if content_type == "movie"
+            else "tv"
+        )
+
+        semaphore = asyncio.Semaphore(
+            THEME_ROTATION_V2_WATCHED_RESOLVE_CONCURRENCY
+        )
+
+        async def resolve_one(
+            imdb_id: str,
+        ) -> int | None:
+            async with semaphore:
+                try:
+                    tmdb_id, resolved_type = (
+                        await self.tmdb_service.find_by_imdb_id(
+                            imdb_id
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"[ThemeRotationV2] IMDb->TMDB lookup failed "
+                        f"for {imdb_id}: {exc}"
+                    )
+                    return None
+
+            if not tmdb_id:
+                return None
+
+            if (
+                resolved_type
+                and resolved_type != expected_tmdb_type
+            ):
+                return None
+
+            try:
+                return int(tmdb_id)
+            except (TypeError, ValueError):
+                return None
+
+        resolved = await asyncio.gather(
+            *[
+                resolve_one(imdb_id)
+                for imdb_id in imdb_ids
+            ]
+        )
+
+        normalized.update(
+            tmdb_id
+            for tmdb_id in resolved
+            if tmdb_id is not None
+        )
+
+        return normalized
+
+    async def _get_v2_normalized_watched_tmdb(
+        self,
+        token: str | None,
+        content_type: str,
+    ) -> set[int] | None:
+        """Return the cached normalized V2 watched-TMDB set.
+
+        None means the source watched sets were unavailable, so callers can
+        distinguish "no watched titles" from "could not validate watched state."
+        """
+        if not token:
+            return None
+
+        try:
+            from app.services.user_cache import user_cache
+
+            watched_sets = await user_cache.get_watched_sets(
+                token,
+                content_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[ThemeRotationV2] failed to read watched sets for "
+                f"{content_type}: {exc}"
+            )
+            return None
+
+        if watched_sets is None:
+            return None
+
+        watched_tmdb_raw, watched_imdb_raw = watched_sets
+
+        watched_tmdb = set()
+
+        for value in watched_tmdb_raw or set():
+            try:
+                watched_tmdb.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+        watched_imdb = {
+            str(value).strip().lower()
+            for value in (watched_imdb_raw or set())
+            if str(value).strip()
+        }
+
+        signature = self._v2_watched_signature(
+            watched_tmdb,
+            watched_imdb,
+        )
+
+        cache_key = self._v2_normalized_watched_key(
+            token,
+            content_type,
+        )
+
+        try:
+            from app.services.redis_service import redis_service
+
+            raw = await redis_service.get(
+                cache_key
+            )
+
+            if raw:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+
+                data = json.loads(raw)
+
+                if (
+                    isinstance(data, dict)
+                    and data.get("signature") == signature
+                ):
+                    cached_ids = {
+                        int(value)
+                        for value in (
+                            data.get("tmdb_ids")
+                            or []
+                        )
+                    }
+
+                    logger.debug(
+                        f"[ThemeRotationV2] using cached normalized "
+                        f"watched set for {content_type}: "
+                        f"{len(cached_ids)} TMDB IDs"
+                    )
+
+                    return cached_ids
+
+        except Exception as exc:
+            logger.debug(
+                f"[ThemeRotationV2] normalized watched cache read "
+                f"failed for {content_type}: {exc}"
+            )
+
+        normalized = (
+            await self._resolve_v2_watched_tmdb_ids(
+                watched_tmdb,
+                watched_imdb,
+                content_type,
+            )
+        )
+
+        try:
+            payload = json.dumps({
+                "signature": signature,
+                "tmdb_ids": sorted(normalized),
+                "source_tmdb_count": len(
+                    watched_tmdb
+                ),
+                "source_imdb_count": len(
+                    watched_imdb
+                ),
+            })
+
+            await redis_service.set(
+                cache_key,
+                payload,
+                THEME_ROTATION_V2_WATCHED_TMDB_TTL_SECONDS,
+            )
+
+        except Exception as exc:
+            # Cache failure must not discard the valid in-memory normalized set.
+            logger.debug(
+                f"[ThemeRotationV2] normalized watched cache write "
+                f"failed for {content_type}: {exc}"
+            )
+
+        logger.info(
+            f"[ThemeRotationV2] normalized watched history for "
+            f"{content_type}: "
+            f"tmdb_source={len(watched_tmdb)} "
+            f"imdb_source={len(watched_imdb)} "
+            f"normalized_tmdb={len(normalized)}"
+        )
+
+        return normalized
 
     async def _row_inventory(self, axes: list, content_type: str) -> int:
         """Return TMDB's total_results for the discover query a row will run."""
