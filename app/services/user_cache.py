@@ -118,7 +118,8 @@ class UserCacheService:
     ) -> None:
         """Store only the most recent successful V2 generations.
 
-        This helper is intentionally not wired into row generation yet.
+        Normal production history advances at atomic manifest promotion time.
+        This setter remains available for explicit maintenance/testing.
         """
         if not token:
             return
@@ -698,6 +699,164 @@ class UserCacheService:
             f"watchly:catalog_staged_raw:{token}:*"
         )
 
+    @staticmethod
+    def _theme_rotation_axes_from_catalog_id(
+        catalog_id: str,
+    ) -> tuple[list[int], list[int]]:
+        """Recover genre/keyword IDs encoded in a watchly.theme row ID."""
+        if not str(catalog_id).startswith(
+            "watchly.theme."
+        ):
+            return [], []
+
+        genres: list[int] = []
+        keyword_ids: list[int] = []
+
+        for component in str(
+            catalog_id
+        ).split(".")[2:]:
+            if ":" not in component:
+                continue
+
+            _role, encoded_axis = (
+                component.split(
+                    ":",
+                    1,
+                )
+            )
+
+            try:
+                if encoded_axis.startswith(
+                    "g"
+                ):
+                    genres.append(
+                        int(
+                            encoded_axis[1:]
+                        )
+                    )
+
+                elif encoded_axis.startswith(
+                    "k"
+                ):
+                    keyword_ids.append(
+                        int(
+                            encoded_axis[1:]
+                        )
+                    )
+
+            except ValueError:
+                continue
+
+        return (
+            list(dict.fromkeys(genres)),
+            list(
+                dict.fromkeys(
+                    keyword_ids
+                )
+            ),
+        )
+
+    @classmethod
+    def _theme_rotation_generations_from_manifest(
+        cls,
+        manifest: dict[str, Any],
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        set[str],
+    ]:
+        """Extract final V2 theme rows from the exact manifest being published.
+
+        The manifest contains the FINAL repaired row IDs and visible titles, so
+        history derived here cannot accidentally record rejected/raw AI proposals.
+
+        Returns:
+            (generation_by_content_type, invalid_partial_types)
+
+        Zero theme rows for a type is allowed because that type may be disabled.
+        Any nonzero group must contain exactly five rows under V2.
+        """
+        rows_by_type: dict[
+            str,
+            list[dict[str, Any]],
+        ] = {}
+
+        for catalog in (
+            manifest.get("catalogs")
+            or []
+        ):
+            if not isinstance(
+                catalog,
+                dict,
+            ):
+                continue
+
+            content_type = str(
+                catalog.get("type")
+                or ""
+            )
+
+            catalog_id = str(
+                catalog.get("id")
+                or ""
+            )
+
+            if (
+                content_type
+                not in {
+                    "movie",
+                    "series",
+                }
+                or not catalog_id.startswith(
+                    "watchly.theme."
+                )
+            ):
+                continue
+
+            genres, keyword_ids = (
+                cls._theme_rotation_axes_from_catalog_id(
+                    catalog_id
+                )
+            )
+
+            rows_by_type.setdefault(
+                content_type,
+                [],
+            ).append({
+                "title": str(
+                    catalog.get("name")
+                    or ""
+                ),
+                "id": catalog_id,
+                "genres": genres,
+                "keyword_ids":
+                    keyword_ids,
+            })
+
+        invalid_partial_types = {
+            content_type
+            for content_type, rows
+            in rows_by_type.items()
+            if len(rows) != 5
+        }
+
+        generated_at = time.time()
+
+        generations = {
+            content_type: {
+                "generated_at":
+                    generated_at,
+                "rows": rows,
+            }
+            for content_type, rows
+            in rows_by_type.items()
+            if len(rows) == 5
+        }
+
+        return (
+            generations,
+            invalid_partial_types,
+        )
+
     async def promote_prepared_generation(
         self,
         token: str,
@@ -709,6 +868,45 @@ class UserCacheService:
         dirty_key = self._catalog_dirty_key(token)
         staged = []
         watch_keys = [prepared_key, dirty_key]
+
+        rotation_generations: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+
+        invalid_rotation_types: set[
+            str
+        ] = set()
+
+        rotation_history_keys: dict[
+            str,
+            str,
+        ] = {}
+
+        if settings.THEME_ROTATION_V2_ENABLED:
+            (
+                rotation_generations,
+                invalid_rotation_types,
+            ) = (
+                self
+                ._theme_rotation_generations_from_manifest(
+                    manifest
+                )
+            )
+
+            rotation_history_keys = {
+                content_type:
+                    self._theme_rotation_history_key(
+                        token,
+                        content_type,
+                    )
+                for content_type
+                in rotation_generations
+            }
+
+            watch_keys.extend(
+                rotation_history_keys.values()
+            )
 
         for catalog in manifest.get("catalogs", []):
             content_type = catalog.get("type")
@@ -750,7 +948,85 @@ class UserCacheService:
 
                 payloads = []
                 revisions = set()
-                generation_valid = dirty_valid
+
+                generation_valid = (
+                    dirty_valid
+                    and not invalid_rotation_types
+                )
+
+                if invalid_rotation_types:
+                    logger.warning(
+                        f"[{redact_token(token)}...] "
+                        "Refusing to publish incomplete Theme Rotation V2 "
+                        "row groups for: "
+                        f"{sorted(invalid_rotation_types)}"
+                    )
+
+                #
+                # Because history keys are WATCHed above, this read and the
+                # subsequent append are protected by the same transaction that
+                # promotes the staged catalogs.
+                #
+                next_rotation_histories: dict[
+                    str,
+                    list[dict[str, Any]],
+                ] = {}
+
+                for (
+                    content_type,
+                    generation,
+                ) in rotation_generations.items():
+                    history_key = (
+                        rotation_history_keys[
+                            content_type
+                        ]
+                    )
+
+                    raw_history = (
+                        await pipe.get(
+                            history_key
+                        )
+                    )
+
+                    try:
+                        current_history = (
+                            json.loads(
+                                raw_history
+                            )
+                            if raw_history
+                            else []
+                        )
+                    except (
+                        TypeError,
+                        json.JSONDecodeError,
+                    ):
+                        current_history = []
+
+                    if not isinstance(
+                        current_history,
+                        list,
+                    ):
+                        current_history = []
+
+                    current_history = [
+                        item
+                        for item
+                        in current_history
+                        if isinstance(
+                            item,
+                            dict,
+                        )
+                    ]
+
+                    next_rotation_histories[
+                        content_type
+                    ] = (
+                        current_history
+                        + [generation]
+                    )[
+                        -THEME_ROTATION_HISTORY_MAX_GENERATIONS:
+                    ]
+
                 for live_key, live_raw_key, staged_key, staged_raw_key in staged:
                     staged_value = await pipe.get(staged_key)
                     staged_raw_value = await pipe.get(staged_raw_key)
@@ -810,8 +1086,44 @@ class UserCacheService:
                     json.dumps(manifest),
                     ex=30 * 24 * 60 * 60,
                 )
+
+                for (
+                    content_type,
+                    next_history,
+                ) in (
+                    next_rotation_histories.items()
+                ):
+                    pipe.set(
+                        rotation_history_keys[
+                            content_type
+                        ],
+                        json.dumps(
+                            next_history
+                        ),
+                        ex=(
+                            THEME_ROTATION_HISTORY_TTL_SECONDS
+                        ),
+                    )
+
                 pipe.delete(prepared_key)
+
                 await pipe.execute()
+
+                for (
+                    content_type,
+                    next_history,
+                ) in (
+                    next_rotation_histories.items()
+                ):
+                    logger.info(
+                        f"[{redact_token(token)}...] "
+                        f"Recorded published Theme Rotation V2 "
+                        f"{content_type} generation "
+                        f"({len(next_history)}/"
+                        f"{THEME_ROTATION_HISTORY_MAX_GENERATIONS} "
+                        "history slots)"
+                    )
+
                 return True
         except WatchError:
             if _watch_retry < 2:
