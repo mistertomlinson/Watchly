@@ -77,11 +77,19 @@ class FakeAsyncClient:
         calls=None,
         timeout=None,
     ):
-        self.post_responses = list(
-            post_responses or []
+        # Keep the caller's response queues shared across successive
+        # FakeAsyncClient instances. OpenRouterService creates a fresh HTTP
+        # client for each model attempt, but the mocked provider response
+        # sequence must continue advancing rather than restart at item zero.
+        self.post_responses = (
+            post_responses
+            if post_responses is not None
+            else []
         )
-        self.get_responses = list(
-            get_responses or []
+        self.get_responses = (
+            get_responses
+            if get_responses is not None
+            else []
         )
         self.calls = (
             calls
