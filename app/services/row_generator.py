@@ -65,6 +65,10 @@ THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE = (
     "clever. In particular, when anthology is a surviving keyword, the finished "
     "title MUST contain the word 'Anthology' or 'Anthologies' so viewers can "
     "immediately recognize that the entire shelf consists of anthology content. "
+    "Conversely, NEVER use the word 'Anthology' or 'Anthologies' unless anthology "
+    "is actually a surviving keyword for the final row. A shelf title must never "
+    "imply that every item is anthology content when the filters do not establish "
+    "that fact. "
     "But explicit format clarity must not flatten the title into a bare category "
     "label. Keep the identifying format word while giving the shelf personality, "
     "energy, and a memorable hook grounded in the remaining filters. For example, "
@@ -909,6 +913,51 @@ class RowGeneratorService:
             else:
                 break
         return t or title
+
+    @staticmethod
+    def _title_mentions_anthology(
+        title: str,
+    ) -> bool:
+        """Return whether visible wording claims anthology content."""
+        normalized = "".join(
+            char.casefold()
+            if char.isalnum()
+            else " "
+            for char in str(title or "")
+        )
+
+        return any(
+            token.startswith("antholog")
+            for token in normalized.split()
+        )
+
+    @classmethod
+    def _row_has_anthology_keyword(
+        cls,
+        row: RowDefinition,
+        features: ExtractedFeatures,
+    ) -> bool:
+        """Return whether anthology survives in the final keyword axes."""
+        for axis in row.axes:
+            if axis.name != AXIS_KEYWORD:
+                continue
+
+            try:
+                keyword_id = int(axis.value)
+            except (TypeError, ValueError):
+                continue
+
+            keyword_name = (
+                features.get_keyword_name(keyword_id)
+                or ""
+            )
+
+            if cls._title_mentions_anthology(
+                keyword_name
+            ):
+                return True
+
+        return False
 
     async def _generate_titles(self, rows_data: list[RowComponents]) -> list[RowDefinition]:
         """Generate titles using the user's BYOK key when configured."""
@@ -2854,6 +2903,63 @@ class RowGeneratorService:
                 await self._retitle_repaired_rows(
                     [final_row],
                     features,
+                )
+
+            #
+            # Anthology is a viewer-facing format promise. Validate it
+            # deterministically for EVERY final row, including healthy rows
+            # that did not otherwise need repair/retitling.
+            #
+            anthology_required = (
+                self._row_has_anthology_keyword(
+                    final_row,
+                    features,
+                )
+            )
+
+            anthology_visible = (
+                self._title_mentions_anthology(
+                    final_row.title
+                )
+            )
+
+            if anthology_required != anthology_visible:
+                logger.warning(
+                    f"[AnthologyTitle] candidate {candidate_index} "
+                    f"'{final_row.title}' has title/filter mismatch: "
+                    f"required={anthology_required} "
+                    f"visible={anthology_visible}; retitling"
+                )
+
+                await self._retitle_repaired_rows(
+                    [final_row],
+                    features,
+                )
+
+                anthology_visible = (
+                    self._title_mentions_anthology(
+                        final_row.title
+                    )
+                )
+
+                if (
+                    anthology_required
+                    != anthology_visible
+                ):
+                    logger.warning(
+                        f"[AnthologyTitle] candidate "
+                        f"{candidate_index} still has "
+                        f"title/filter mismatch after retitle: "
+                        f"'{final_row.title}'; rejecting "
+                        "candidate rather than publishing "
+                        "misleading anthology wording"
+                    )
+                    continue
+
+                logger.info(
+                    f"[AnthologyTitle] candidate "
+                    f"{candidate_index} corrected to "
+                    f"'{final_row.title}'"
                 )
 
             #
