@@ -43,6 +43,37 @@ THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 THEME_ROTATION_V2_CANDIDATE_COUNT = 8
 THEME_ROTATION_V2_PUBLISH_COUNT = 5
 
+# V2 row names should read like customer-facing streaming shelves, not exposed
+# metadata filters. The same guidance is used for initial candidate naming and
+# repaired-row retitling so a repair cannot regress an expressive title back to
+# a mechanical genre/keyword label.
+THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE = (
+    "Titles are customer-facing streaming shelf names, not database filter "
+    "summaries. Keep each title short (2-5 words), natural, memorable, and "
+    "specific enough to communicate the row's appeal. Prefer vivid or clever "
+    "phrasing when the filters genuinely support it. Do not mechanically "
+    "concatenate genre and keyword terms, stack near-synonyms, or produce "
+    "clinical labels such as 'Crime Murder Thrillers', 'Atmospheric Sci-Fi', "
+    "or 'Procedural Crime Investigations'. Avoid generic planning words such "
+    "as picks, favorites, selection, collection, essentials, hits, vibes, "
+    "core, mixed, rising, deep cut, or mood. A playful, idiomatic, or "
+    "metaphorical title is welcome only when every implied concept is grounded "
+    "in the row's surviving genre/keyword filters. Style examples: dystopian "
+    "sci-fi -> 'Futures Gone Wrong'; space adventure -> 'Beyond the Stars'; "
+    "graphic-novel adaptations -> 'From Panels to Screen'; crime + "
+    "investigation -> 'Cracking the Case'; dark comedy -> 'Laughing in the "
+    "Dark'. These are style examples, not fixed titles; do not copy them "
+    "unless they naturally fit. Never invent geography, nationality, "
+    "language, production country, franchise, era, or subject matter that is "
+    "not supported by the filters."
+)
+
+THEME_ROTATION_V2_RETITLE_SYSTEM_INSTRUCTION = (
+    "You are an expert streaming-service catalog editor. Rename the shelf from "
+    "its final post-repair filters. Return one title only, with no explanation. "
+    + THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE
+)
+
 # V2 converts provider watched IDs to one TMDB namespace so inventory probes can
 # subtract watched titles cheaply. The normalized result is cached separately
 # from legacy watched data and automatically invalidates when the source sets
@@ -897,14 +928,17 @@ class RowGeneratorService:
             prompts.append(
                 f"Existing title: {row.title}\n"
                 f"Final row filters after repair:\n{final_filters}\n\n"
-                "Preserve the existing title EXACTLY only if it is still supported by "
-                "the final filters. Every concrete subject or theme in the title must be "
-                "grounded in a surviving genre or keyword. If a removed keyword was the only "
-                "support for a concept such as psychological, noir, consultant, heist, hitman, "
-                "superhero, or period, remove or replace that concept. Tone-only modifiers such "
-                "as tense, gritty, suspenseful, or high-stakes may remain when they reasonably "
-                "describe the surviving genres. Make the smallest accurate revision. "
-                "Do not infer geography, nationality, language, or production country."
+                "Rename this customer-facing shelf from the FINAL filters. Preserve "
+                "the existing title only if it is both accurate AND already polished, "
+                "natural, and memorable. If it is literal, generic, repetitive, or "
+                "reads like exposed metadata, rewrite it even when technically accurate. "
+                "Every concrete subject or theme in the title must be grounded in a "
+                "surviving genre or keyword. If a removed keyword was the only support "
+                "for a concept such as psychological, noir, consultant, heist, hitman, "
+                "superhero, or period, remove or replace that concept. Tone-only "
+                "modifiers may remain only when they reasonably describe the surviving "
+                "filters. "
+                + THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE
             )
 
         tasks = [
@@ -922,6 +956,11 @@ class RowGeneratorService:
                         else None
                     )
                     or settings.GEMINI_API_KEY
+                ),
+                system_instruction=(
+                    THEME_ROTATION_V2_RETITLE_SYSTEM_INSTRUCTION
+                    if settings.THEME_ROTATION_V2_ENABLED
+                    else None
                 ),
             )
             for prompt in prompts
@@ -3145,6 +3184,15 @@ class RowGeneratorService:
 
             if settings.THEME_ROTATION_V2_ENABLED:
                 prompt = prompt.replace(
+                    "- TITLE RULE (most important): the title must describe WHAT THE FILMS ARE, never the row's purpose. Never use these words: core, mixed, rising, deep cut, mood, picks, favorites, selection, collection, essentials, hits, vibes. Name the most DISTINCTIVE genre or thematic constraint rather than summarising every axis. Good: Crime+Drama, 'based on novel or book' -> Literary Crime. Sci-Fi+Thriller, 'artificial intelligence' -> Rogue AI Thrillers. Documentary, 'true crime' -> True Crime Investigations. Bad: Core Favorites, Mixed Dramas, Rising Mysteries, Deep Cuts, Mood Picks.",
+                    (
+                        "- TITLE RULE (most important): "
+                        + THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE
+                    ),
+                    1,
+                )
+
+                prompt = prompt.replace(
                     "generate exactly 5 streaming collections",
                     (
                         "generate exactly "
@@ -3195,14 +3243,15 @@ class RowGeneratorService:
                 )
 
                 system_instruction = (
-                    "You are a creative film curator. Design "
+                    "You are a creative streaming curator. Design "
                     f"{THEME_ROTATION_V2_CANDIDATE_COUNT} candidate catalog rows "
                     "from the user's interest summary. The first five follow the "
                     "requested core/variety/discovery/lesser-known/mood plan. "
                     "The remaining candidates are distinct alternates so inventory "
                     "validation can reject a thin theme without losing a row. "
                     "Use genres and keywords only. Country must always be null. "
-                    "Output valid JSON only."
+                    + THEME_ROTATION_V2_TITLE_STYLE_GUIDANCE
+                    + " Output valid JSON only."
                 )
             else:
                 # Exact legacy system instruction.
