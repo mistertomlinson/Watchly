@@ -17,6 +17,7 @@ from typing import Any, ClassVar
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.models.taste_profile import TasteProfile
 from app.services.openrouter import gemini_service
 from app.services.tmdb.countries import COUNTRY_ADJECTIVES
@@ -27,6 +28,12 @@ from app.services.tmdb.service import TMDBService, get_tmdb_service
 GOLD_TIER_LIMIT = 3  # Top 1-3 items
 SILVER_TIER_START = 3  # Rank 4+
 SILVER_TIER_END = 10  # Up to Rank 10
+
+# Theme Rotation V2 deliberately keeps a much deeper taste pool available
+# for controlled rotation. The legacy algorithm must retain its historical
+# 20-candidate fetch -> blacklist -> first-10 behavior when V2 is disabled.
+THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT = 50
+THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 
 # Available axes for row generation
 AXIS_GENRE = "genre"
@@ -543,13 +550,32 @@ class RowGeneratorService:
         genres = profile.get_top_genres(limit=5)
 
         # Remove objectively useless TMDB metadata before it can enter any row
-        # generation path. Pull extra candidates first so filtering still leaves
-        # up to ten useful keyword signals.
-        raw_keywords = profile.get_top_keywords(limit=20)
-        keywords = [
-            item for item in raw_keywords
-            if item[0] not in GENERIC_KEYWORD_BLACKLIST
-        ][:10]
+        # generation path.
+        #
+        # LEGACY:
+        #   Preserve the exact historical 20 -> blacklist -> first 10 behavior.
+        #
+        # V2:
+        #   Keep a deeper ranked pool available so later rotation logic can choose
+        # fresh-but-still-personalized signals instead of repeatedly feeding the
+        # same ten keywords to the LLM. Merely enabling the deeper pool does not
+        # itself choose or record rotation history.
+        if settings.THEME_ROTATION_V2_ENABLED:
+            raw_keywords = profile.get_top_keywords(
+                limit=THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT
+            )
+            keywords = [
+                item
+                for item in raw_keywords
+                if item[0] not in GENERIC_KEYWORD_BLACKLIST
+            ]
+        else:
+            raw_keywords = profile.get_top_keywords(limit=20)
+            keywords = [
+                item
+                for item in raw_keywords
+                if item[0] not in GENERIC_KEYWORD_BLACKLIST
+            ][:10]
 
         countries = []
         runtimes = sorted(profile.runtime_bucket_scores.items(), key=lambda x: x[1], reverse=True)

@@ -23,6 +23,12 @@ from app.services.redis_service import redis_service
 DERIVED_CACHE_TTL_SECONDS = 2592000  # 30 days
 ANCHOR_HISTORY_TTL_SECONDS = 90 * 24 * 60 * 60  # 90 days
 
+# Theme Rotation V2 owns a separate history namespace so disabling or removing
+# V2 can never alter the legacy row-generation state. Only successfully accepted
+# generations will eventually be written here.
+THEME_ROTATION_HISTORY_TTL_SECONDS = 90 * 24 * 60 * 60
+THEME_ROTATION_HISTORY_MAX_GENERATIONS = 3
+
 
 class UserCacheService:
     @staticmethod
@@ -49,6 +55,90 @@ class UserCacheService:
     def _last_profile_build_key(token: str, content_type: str) -> str:
         """Generate cache key for last profile build timestamp."""
         return f"watchly:last_profile_build:{token}:{content_type}"
+
+    @staticmethod
+    def _theme_rotation_history_key(token: str, content_type: str) -> str:
+        """Generate the isolated Theme Rotation V2 history key."""
+        return f"watchly:theme_rotation_v2_history:{token}:{content_type}"
+
+    async def get_theme_rotation_history(
+        self,
+        token: str,
+        content_type: str,
+    ) -> list[dict[str, Any]]:
+        """Return recent successful Theme Rotation V2 generations.
+
+        Legacy recommendation code never reads this namespace.
+        """
+        if not token:
+            return []
+
+        key = self._theme_rotation_history_key(
+            token,
+            content_type,
+        )
+
+        raw = await redis_service.get(key)
+
+        if not raw:
+            return []
+
+        try:
+            data = json.loads(raw)
+
+            if not isinstance(data, list):
+                return []
+
+            generations = [
+                item
+                for item in data
+                if isinstance(item, dict)
+            ]
+
+            return generations[
+                -THEME_ROTATION_HISTORY_MAX_GENERATIONS:
+            ]
+
+        except (
+            TypeError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning(
+                f"[{redact_token(token)}...] "
+                "Failed to decode Theme Rotation V2 history "
+                f"for {content_type}: {exc}"
+            )
+            return []
+
+    async def set_theme_rotation_history(
+        self,
+        token: str,
+        content_type: str,
+        generations: list[dict[str, Any]],
+    ) -> None:
+        """Store only the most recent successful V2 generations.
+
+        This helper is intentionally not wired into row generation yet.
+        """
+        if not token:
+            return
+
+        clean = [
+            item
+            for item in generations
+            if isinstance(item, dict)
+        ][-THEME_ROTATION_HISTORY_MAX_GENERATIONS:]
+
+        key = self._theme_rotation_history_key(
+            token,
+            content_type,
+        )
+
+        await redis_service.set(
+            key,
+            json.dumps(clean),
+            THEME_ROTATION_HISTORY_TTL_SECONDS,
+        )
 
     # Library Items Methods
 
