@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     OPENROUTER_API_KEY: str | None = None
 
+    # Experimental personalized theme rotation.
+    #
+    # False preserves the exact legacy thematic-row generation path.
+    # The V2 implementation must remain completely bypassed unless this
+    # server-level switch is explicitly enabled.
+    THEME_ROTATION_V2_ENABLED: bool = False
+
     TRAKT_CLIENT_ID: str | None = None
     TRAKT_CLIENT_SECRET: str | None = None
 
