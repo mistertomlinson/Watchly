@@ -37,6 +37,12 @@ SILVER_TIER_END = 10  # Up to Rank 10
 THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT = 50
 THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 
+# V2 deliberately asks for spare themes in the same LLM request. Inventory
+# validation can then discard an unusably thin candidate without publishing
+# fewer than five rows or spending a second AI request.
+THEME_ROTATION_V2_CANDIDATE_COUNT = 8
+THEME_ROTATION_V2_PUBLISH_COUNT = 5
+
 # V2 converts provider watched IDs to one TMDB namespace so inventory probes can
 # subtract watched titles cheaply. The normalized result is cached separately
 # from legacy watched data and automatically invalidates when the source sets
@@ -2200,6 +2206,170 @@ class RowGeneratorService:
         await self._retitle_repaired_rows(retitle_rows, features)
         return rows
 
+    async def _select_v2_publishable_rows(
+        self,
+        rows: list[RowDefinition],
+        features: "ExtractedFeatures",
+        content_type: str,
+        token: str | None,
+    ) -> list[RowDefinition] | None:
+        """Validate V2 candidates and return exactly five publishable rows.
+
+        Candidates are considered in model order. Each one is checked against the
+        user's normalized watched history and repaired only by relaxing constraints
+        already present in that theme.
+
+        A generation is accepted only when five rows survive. We never cache a
+        partial V2 generation merely because some candidates were rejected.
+        """
+        watched_tmdb = (
+            await self._get_v2_normalized_watched_tmdb(
+                token,
+                content_type,
+            )
+        )
+
+        if watched_tmdb is None:
+            logger.warning(
+                f"[ThemeRotationV2] watched history unavailable for "
+                f"{content_type}; refusing to publish an unvalidated V2 set"
+            )
+            return None
+
+        accepted: list[RowDefinition] = []
+        changed_rows: list[RowDefinition] = []
+
+        seen_row_ids: set[str] = set()
+        seen_titles: set[str] = set()
+
+        for candidate_index, row in enumerate(
+            rows,
+            start=1,
+        ):
+            result = (
+                await self._v2_repair_row_for_unseen(
+                    row,
+                    content_type,
+                    watched_tmdb,
+                )
+            )
+
+            status = str(
+                result.get("status")
+                or "unknown"
+            )
+
+            original_probe = (
+                result.get("original_probe")
+                or {}
+            )
+
+            final_probe = (
+                result.get("probe")
+                or {}
+            )
+
+            final_row = result.get("row")
+
+            logger.info(
+                f"[ThemeRotationV2] candidate {candidate_index} "
+                f"'{row.title}': status={status} "
+                f"original_unseen={original_probe.get('unseen_count')} "
+                f"final_unseen={final_probe.get('unseen_count')} "
+                f"repair={result.get('repair_reason')}"
+            )
+
+            if final_row is None:
+                continue
+
+            row_id = str(
+                final_row.id
+            )
+
+            title_key = (
+                str(final_row.title)
+                .strip()
+                .casefold()
+            )
+
+            if row_id in seen_row_ids:
+                logger.info(
+                    f"[ThemeRotationV2] skipping duplicate row recipe "
+                    f"from candidate {candidate_index}: {row_id}"
+                )
+                continue
+
+            if (
+                title_key
+                and title_key in seen_titles
+            ):
+                logger.info(
+                    f"[ThemeRotationV2] skipping duplicate row title "
+                    f"from candidate {candidate_index}: "
+                    f"'{final_row.title}'"
+                )
+                continue
+
+            seen_row_ids.add(
+                row_id
+            )
+
+            if title_key:
+                seen_titles.add(
+                    title_key
+                )
+
+            accepted.append(
+                final_row
+            )
+
+            if result.get(
+                "changed"
+            ):
+                changed_rows.append(
+                    final_row
+                )
+
+            if (
+                len(accepted)
+                >= THEME_ROTATION_V2_PUBLISH_COUNT
+            ):
+                break
+
+        if (
+            len(accepted)
+            < THEME_ROTATION_V2_PUBLISH_COUNT
+        ):
+            logger.warning(
+                f"[ThemeRotationV2] only {len(accepted)} of "
+                f"{THEME_ROTATION_V2_PUBLISH_COUNT} required "
+                f"{content_type} rows survived unseen validation; "
+                "discarding this generation"
+            )
+            return None
+
+        #
+        # Unseen-aware repair may change a row's axes. Reuse the existing grounded
+        # AI retitle mechanism so the published title describes the final recipe,
+        # not the pre-repair one.
+        #
+        if changed_rows:
+            await self._retitle_repaired_rows(
+                changed_rows,
+                features,
+            )
+
+        accepted = accepted[
+            :THEME_ROTATION_V2_PUBLISH_COUNT
+        ]
+
+        logger.info(
+            f"[ThemeRotationV2] accepted exactly "
+            f"{len(accepted)} publishable {content_type} rows"
+        )
+
+        return accepted
+
     async def _get_v2_rotation_history(
         self,
         token: str | None,
@@ -2448,8 +2618,20 @@ class RowGeneratorService:
                 token=token,
             )
             if rows:
-                rows = await self._repair_thin_rows(rows, features, content_type)
-                await self._cache_llm_rows(token, content_type, rows)
+                if not settings.THEME_ROTATION_V2_ENABLED:
+                    # Preserve the existing legacy background behavior exactly.
+                    rows = await self._repair_thin_rows(
+                        rows,
+                        features,
+                        content_type,
+                    )
+
+                await self._cache_llm_rows(
+                    token,
+                    content_type,
+                    rows,
+                )
+
                 logger.info(
                     f"[LLM Rows] background refresh stored {len(rows)} rows for {content_type}"
                 )
@@ -2579,15 +2761,80 @@ class RowGeneratorService:
                 + avoid_clause
             )
 
-            data = await gemini_service.generate_structured_async(
-                prompt=prompt,
-                response_schema=list[LLMRowTheme],
-                system_instruction=(
+            if settings.THEME_ROTATION_V2_ENABLED:
+                prompt = prompt.replace(
+                    "generate exactly 5 streaming collections",
+                    (
+                        "generate exactly "
+                        f"{THEME_ROTATION_V2_CANDIDATE_COUNT} "
+                        "candidate streaming collections"
+                    ),
+                    1,
+                )
+
+                prompt = prompt.replace(
+                    "Generate 5 rows.",
+                    (
+                        "Generate "
+                        f"{THEME_ROTATION_V2_CANDIDATE_COUNT} "
+                        "candidate rows. Only five will ultimately be published "
+                        "after inventory validation."
+                    ),
+                    1,
+                )
+
+                prompt = prompt.replace(
+                    (
+                        "5. [mood] — A specific mood or tone they"
+                        " would enjoy (e.g. mind-bending, atmospheric, tense). "
+                        "Use genres + 1 keyword max.\n\nRules:\n"
+                    ),
+                    (
+                        "5. [mood] — A specific mood or tone they"
+                        " would enjoy (e.g. mind-bending, atmospheric, tense). "
+                        "Use genres + 1 keyword max.\n"
+                        "6. [alternate] — A fresh alternate theme using a different "
+                        "rotation signal from rows 1-5.\n"
+                        "7. [alternate] — Another distinct alternate theme; avoid "
+                        "near-duplicates of the earlier candidates.\n"
+                        "8. [alternate] — One more genuinely different but still "
+                        "taste-grounded theme.\n\nRules:\n"
+                    ),
+                    1,
+                )
+
+                prompt = prompt.replace(
+                    "Output a JSON array of 5 objects.",
+                    (
+                        "Output a JSON array of exactly "
+                        f"{THEME_ROTATION_V2_CANDIDATE_COUNT} objects."
+                    ),
+                    1,
+                )
+
+                system_instruction = (
+                    "You are a creative film curator. Design "
+                    f"{THEME_ROTATION_V2_CANDIDATE_COUNT} candidate catalog rows "
+                    "from the user's interest summary. The first five follow the "
+                    "requested core/variety/discovery/lesser-known/mood plan. "
+                    "The remaining candidates are distinct alternates so inventory "
+                    "validation can reject a thin theme without losing a row. "
+                    "Use genres and keywords only. Country must always be null. "
+                    "Output valid JSON only."
+                )
+            else:
+                # Exact legacy system instruction.
+                system_instruction = (
                     "You are a creative film curator. Design 5 catalog rows from the user's interest summary."
                     " Row 1 (The Core): strong match. Row 2 (Mixed): blend + variety. Row 3 (Rising Star):"
                     " discovery—suggest new content they would enjoy, not just more of the same. Use genres"
                     " and keywords only. Country must always be null. Output valid JSON only."
-                ),
+                )
+
+            data = await gemini_service.generate_structured_async(
+                prompt=prompt,
+                response_schema=list[LLMRowTheme],
+                system_instruction=system_instruction,
                 api_key=api_key,
             )
 
@@ -2702,7 +2949,21 @@ class RowGeneratorService:
                 f"for {content_type}"
             )
             if final_rows:
-                final_rows = await self._repair_thin_rows(final_rows, features, content_type)
+                if settings.THEME_ROTATION_V2_ENABLED:
+                    return await self._select_v2_publishable_rows(
+                        final_rows,
+                        features,
+                        content_type,
+                        token,
+                    )
+
+                # Exact legacy raw-inventory repair path.
+                final_rows = await self._repair_thin_rows(
+                    final_rows,
+                    features,
+                    content_type,
+                )
+
             return final_rows if final_rows else None
 
         except Exception as e:
