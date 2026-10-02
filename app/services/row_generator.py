@@ -40,7 +40,7 @@ THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 # V2 deliberately asks for spare themes in the same LLM request. Inventory
 # validation can then discard an unusably thin candidate without publishing
 # fewer than five rows or spending a second AI request.
-THEME_ROTATION_V2_CANDIDATE_COUNT = 8
+THEME_ROTATION_V2_CANDIDATE_COUNT = 12
 THEME_ROTATION_V2_PUBLISH_COUNT = 5
 
 # V2 row names should read like customer-facing streaming shelves, not exposed
@@ -3246,12 +3246,19 @@ class RowGeneratorService:
                         "5. [mood] — A specific mood or tone they"
                         " would enjoy (e.g. mind-bending, atmospheric, tense). "
                         "Use genres + 1 keyword max.\n"
-                        "6. [alternate] — A fresh alternate theme using a different "
-                        "rotation signal from rows 1-5.\n"
-                        "7. [alternate] — Another distinct alternate theme; avoid "
-                        "near-duplicates of the earlier candidates.\n"
-                        "8. [alternate] — One more genuinely different but still "
-                        "taste-grounded theme.\n\nRules:\n"
+                        + "".join(
+                            (
+                                f"{candidate_index}. [alternate] — "
+                                "A genuinely different but still taste-grounded "
+                                "alternate theme using a different rotation signal; "
+                                "avoid near-duplicates of earlier candidates.\n"
+                            )
+                            for candidate_index in range(
+                                6,
+                                THEME_ROTATION_V2_CANDIDATE_COUNT + 1,
+                            )
+                        )
+                        + "\nRules:\n"
                     ),
                     1,
                 )
