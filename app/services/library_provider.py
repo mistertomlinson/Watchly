@@ -61,16 +61,43 @@ def empty_library() -> dict[str, list[dict[str, Any]]]:
 
 
 def best_external_id(ids: dict[str, Any]) -> str | None:
-    imdb = ids.get("imdb")
+    imdb = ids.get("imdb") or ids.get("imdb_id")
     if imdb:
         return str(imdb)
-    tmdb = ids.get("tmdb")
+    tmdb = ids.get("tmdb") or ids.get("tmdb_id")
     if tmdb:
         return f"tmdb:{tmdb}"
-    simkl = ids.get("simkl")
+    simkl = ids.get("simkl") or ids.get("simkl_id")
     if simkl:
         return f"simkl:{simkl}"
     return None
+
+
+def normalize_external_ids(ids: dict[str, Any]) -> dict[str, Any]:
+    """Preserve all provider identities instead of collapsing to only ``_id``.
+
+    Watchly still keeps a single canonical ``_id`` for compatibility with the
+    existing library/profile code, but recommendation exclusion needs both IMDb
+    and TMDB identities when a provider supplies them.
+    """
+    external: dict[str, Any] = {}
+
+    imdb = ids.get("imdb") or ids.get("imdb_id")
+    if imdb:
+        external["imdb_id"] = str(imdb)
+
+    tmdb = ids.get("tmdb") or ids.get("tmdb_id")
+    if tmdb not in (None, ""):
+        try:
+            external["tmdb_id"] = int(str(tmdb).removeprefix("tmdb:"))
+        except (TypeError, ValueError):
+            pass
+
+    simkl = ids.get("simkl") or ids.get("simkl_id")
+    if simkl not in (None, ""):
+        external["simkl_id"] = simkl
+
+    return external
 
 
 def make_library_item(
@@ -92,6 +119,7 @@ def make_library_item(
     bucket = RATING_POLICY.classify(rating)
     return {
         "_id": canonical_id,
+        "_external_ids": normalize_external_ids(ids),
         "type": content_type,
         "name": title,
         "year": year,
