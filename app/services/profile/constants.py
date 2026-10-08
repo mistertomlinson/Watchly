@@ -16,10 +16,21 @@ FEATURE_WEIGHT_COUNTRY: Final[float] = 0.3  # Less important
 
 # Ranking weights. These are intentionally separate from profile accumulation
 # weights: changing how strongly a feature influences recommendation ranking
-# should not rewrite the evidence stored in the taste profile.
-RANKING_WEIGHT_CAST: Final[float] = 0.9
-RANKING_WEIGHT_DIRECTOR: Final[float] = 0.45
-RANKING_WEIGHT_ERA: Final[float] = 0.15
+# should not rewrite the evidence stored in the taste profile. Ranking is kept
+# normalized to a true 0-1 profile score before quality is blended in.
+RANKING_WEIGHT_GENRE: Final[float] = 0.40
+RANKING_WEIGHT_KEYWORD: Final[float] = 0.40
+RANKING_WEIGHT_CAST: Final[float] = 0.10
+RANKING_WEIGHT_DIRECTOR: Final[float] = 0.05
+RANKING_WEIGHT_ERA: Final[float] = 0.05
+
+# Ranking-only keyword exclusions. Credits markers are technical metadata rather
+# than meaningful taste signals and must not make a recommendation look stronger.
+RANKING_IGNORED_KEYWORD_IDS: Final[frozenset[int]] = frozenset({
+    179430,  # aftercreditsstinger
+    179431,  # duringcreditsstinger
+})
+RANKING_KEYWORD_MATCH_LIMIT: Final[int] = 5
 
 # Position Weights for Cast (lead actors matter more)
 CAST_POSITION_LEAD: Final[float] = 1.0
