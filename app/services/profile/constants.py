@@ -6,13 +6,20 @@ EVIDENCE_WEIGHT_LIKED: Final[float] = 2.0
 EVIDENCE_WEIGHT_WATCHED: Final[float] = 0.5
 EVIDENCE_WEIGHT_PLAN_TO_WATCH: Final[float] = 1.0
 
-# Feature Weights (relative importance of different feature types)
+# Feature Weights (profile evidence accumulation)
 FEATURE_WEIGHT_GENRE: Final[float] = 0.9  # Most important
 FEATURE_WEIGHT_KEYWORD: Final[float] = 0.7
-FEATURE_WEIGHT_CREATOR: Final[float] = 0.9  # Very important when available
+FEATURE_WEIGHT_CREATOR: Final[float] = 0.9
 FEATURE_WEIGHT_ERA: Final[float] = 0.6
 FEATURE_WEIGHT_RUNTIME: Final[float] = 0.3  # Runtime bucket preference
 FEATURE_WEIGHT_COUNTRY: Final[float] = 0.3  # Less important
+
+# Ranking weights. These are intentionally separate from profile accumulation
+# weights: changing how strongly a feature influences recommendation ranking
+# should not rewrite the evidence stored in the taste profile.
+RANKING_WEIGHT_CAST: Final[float] = 0.9
+RANKING_WEIGHT_DIRECTOR: Final[float] = 0.45
+RANKING_WEIGHT_ERA: Final[float] = 0.15
 
 # Position Weights for Cast (lead actors matter more)
 CAST_POSITION_LEAD: Final[float] = 1.0
@@ -23,8 +30,10 @@ CAST_POSITION_MINOR: Final[float] = 0.2
 GENRE_POSITION_WEIGHTS: Final[list[float]] = [1.0, 0.8, 0.5]  # First, second, third
 GENRE_MAX_POSITIONS: Final[int] = 3  # Only consider top 3 genres
 
-# Score Caps (prevent unbounded growth)
-CAP_GENRE: Final[float] = 50.0
+# Score Caps. Genre evidence is deliberately uncapped: normalization happens
+# at ranking time, and the old 50-point cap flattened several genuinely distinct
+# high-confidence genre preferences into identical 1.0 scores.
+CAP_GENRE: Final[float] = float("inf")
 CAP_KEYWORD: Final[float] = 40.0
 CAP_DIRECTOR: Final[float] = 30.0
 CAP_CAST: Final[float] = 30.0
