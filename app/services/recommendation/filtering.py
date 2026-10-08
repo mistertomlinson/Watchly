@@ -28,6 +28,26 @@ def parse_identifier(identifier: str) -> tuple[str | None, int | None]:
     return imdb_id, tmdb_id
 
 
+def _item_external_ids(item: dict[str, Any]) -> tuple[str | None, int | None]:
+    """Read preserved provider/TMDB identities from any supported item shape."""
+    ext = item.get("_external_ids") or item.get("external_ids") or {}
+    if not isinstance(ext, dict):
+        return None, None
+
+    imdb = ext.get("imdb_id") or ext.get("imdb")
+    imdb_id = str(imdb) if imdb else None
+
+    tmdb = ext.get("tmdb_id") or ext.get("tmdb")
+    tmdb_id: int | None = None
+    if tmdb not in (None, ""):
+        try:
+            tmdb_id = int(str(tmdb).removeprefix("tmdb:"))
+        except (TypeError, ValueError):
+            tmdb_id = None
+
+    return imdb_id, tmdb_id
+
+
 class RecommendationFiltering:
     """
     Handles exclusion sets, genre whitelists, and item filtering.
@@ -77,27 +97,34 @@ class RecommendationFiltering:
 
         for item in all_items:
             item_id = item.get("_id", "")
-            if not item_id:
-                continue
+            if item_id:
+                imdb_id, tmdb_id = parse_identifier(item_id)
 
-            imdb_id, tmdb_id = parse_identifier(item_id)
+                if imdb_id:
+                    imdb_ids.add(imdb_id)
+                if tmdb_id is not None:
+                    tmdb_ids.add(tmdb_id)
 
-            if imdb_id:
-                imdb_ids.add(imdb_id)
-            if tmdb_id:
-                tmdb_ids.add(tmdb_id)
+                # Fallback parsing for common Stremio/Watchly patterns
+                if item_id.startswith("tt"):
+                    # Handle tt123 and tt123:1:1
+                    base_imdb = item_id.split(":")[0]
+                    imdb_ids.add(base_imdb)
+                elif item_id.startswith("tmdb:"):
+                    try:
+                        tid = int(item_id.split(":")[1])
+                        tmdb_ids.add(tid)
+                    except Exception:
+                        pass
 
-            # Fallback parsing for common Stremio/Watchly patterns
-            if item_id.startswith("tt"):
-                # Handle tt123 and tt123:1:1
-                base_imdb = item_id.split(":")[0]
-                imdb_ids.add(base_imdb)
-            elif item_id.startswith("tmdb:"):
-                try:
-                    tid = int(item_id.split(":")[1])
-                    tmdb_ids.add(tid)
-                except Exception:
-                    pass
+            # Provider-backed library items can legitimately have an IMDb
+            # canonical _id while also carrying a TMDB ID. Preserve and use both
+            # so early candidate exclusion is not blind to watched TMDB titles.
+            external_imdb, external_tmdb = _item_external_ids(item)
+            if external_imdb:
+                imdb_ids.add(external_imdb.split(":")[0])
+            if external_tmdb is not None:
+                tmdb_ids.add(external_tmdb)
 
         return imdb_ids, tmdb_ids
 
@@ -107,18 +134,21 @@ class RecommendationFiltering:
     ) -> list[dict[str, Any]]:
         """
         Filter candidates against watched sets.
-        Matches both TMDB (int) and IMDB (str).
+        Matches both TMDB (int/string) and IMDB identities, including preserved
+        provider external IDs.
         """
         filtered = []
         for item in candidates:
             tid = item.get("id")
-            # 1. Check TMDB ID (integer)
+
+            # 1. Check TMDB ID in integer/string/stremio forms.
             if tid and isinstance(tid, int) and tid in watched_tmdb:
                 continue
 
-            # 2. Check Stremio ID (string) if present as 'id'
             if tid and isinstance(tid, str):
                 if tid in watched_imdb:
+                    continue
+                if tid.startswith("tt") and tid.split(":")[0] in watched_imdb:
                     continue
                 if tid.startswith("tmdb:"):
                     try:
@@ -127,18 +157,18 @@ class RecommendationFiltering:
                     except Exception:
                         pass
 
-            # 3. Check External IDs
-            ext = item.get("external_ids", {}) or item.get("_external_ids", {})
-            imdb = ext.get("imdb_id")
-            if imdb and imdb in watched_imdb:
-                continue
-
-            # 4. Handle cases where TMDB ID is in 'id' but it's a string
             try:
-                if tid and int(tid) in watched_tmdb:
+                if tid not in (None, "") and int(tid) in watched_tmdb:
                     continue
             except Exception:
                 pass
+
+            # 2. Check all preserved external identities.
+            external_imdb, external_tmdb = _item_external_ids(item)
+            if external_imdb and external_imdb.split(":")[0] in watched_imdb:
+                continue
+            if external_tmdb is not None and external_tmdb in watched_tmdb:
+                continue
 
             filtered.append(item)
         return filtered
