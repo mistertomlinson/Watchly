@@ -2,11 +2,15 @@ from typing import Any
 
 from app.models.taste_profile import TasteProfile
 from app.services.profile.constants import (
-    FEATURE_WEIGHT_GENRE,
-    FEATURE_WEIGHT_KEYWORD,
+    GENRE_MAX_POSITIONS,
+    GENRE_POSITION_WEIGHTS,
+    RANKING_IGNORED_KEYWORD_IDS,
+    RANKING_KEYWORD_MATCH_LIMIT,
     RANKING_WEIGHT_CAST,
     RANKING_WEIGHT_DIRECTOR,
     RANKING_WEIGHT_ERA,
+    RANKING_WEIGHT_GENRE,
+    RANKING_WEIGHT_KEYWORD,
 )
 
 
@@ -20,22 +24,29 @@ class ProfileScorer:
         """
         Score an item against the profile.
 
-        Uses weighted feature matching with proper feature weights.
-
-        Args:
-            item_metadata: Item metadata dict with genres, keywords, year, countries, etc.
-            profile: TasteProfile to score against
-
-        Returns:
-            Score (higher = better match)
+        Ranking deliberately uses a normalized 0-1 taste score. Broad metadata
+        such as era/director/cast is secondary, while genre and meaningful
+        thematic keyword matches carry most of the signal.
         """
-        # Normalize profile for ranking (read-time only)
         normalized = profile.normalize_for_ranking()
 
-        score = 0.0
+        genre_score = ProfileScorer._score_genres(item_metadata, normalized)
+        keyword_score = ProfileScorer._score_keywords(item_metadata, normalized)
+        cast_score = ProfileScorer._score_cast(item_metadata, normalized)
+        director_score = ProfileScorer._score_directors(item_metadata, normalized)
+        era_score = ProfileScorer._score_era(item_metadata, normalized)
 
-        # Genre score (weighted average of matching genres)
-        item_genres = item_metadata.get("genre_ids", [])
+        return (
+            genre_score * RANKING_WEIGHT_GENRE
+            + keyword_score * RANKING_WEIGHT_KEYWORD
+            + cast_score * RANKING_WEIGHT_CAST
+            + director_score * RANKING_WEIGHT_DIRECTOR
+            + era_score * RANKING_WEIGHT_ERA
+        )
+
+    @staticmethod
+    def _score_genres(item_metadata: dict[str, Any], normalized: dict[str, Any]) -> float:
+        item_genres = item_metadata.get("genre_ids", []) or []
         if not item_genres:
             genres = item_metadata.get("genres", []) or []
             if isinstance(genres, list):
@@ -44,56 +55,81 @@ class ProfileScorer:
                     for g in genres
                     if isinstance(g, dict) and g.get("id") is not None
                 ]
-        if item_genres:
-            genre_matches = [normalized["genres"].get(gid, 0.0) for gid in item_genres]
-            genre_score = sum(genre_matches) / len(genre_matches) if genre_matches else 0.0
-            score += genre_score * FEATURE_WEIGHT_GENRE
 
-        # Keyword score (weighted average of matching keywords)
-        item_keywords = item_metadata.get("keyword_ids", [])
-        if not item_keywords:
-            # Try to extract from keywords dict. TMDB uses either "keywords" or
-            # "results" depending on media type/endpoint.
-            keywords = item_metadata.get("keywords", {})
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for position, genre_id in enumerate(item_genres[:GENRE_MAX_POSITIONS]):
+            weight = GENRE_POSITION_WEIGHTS[position]
+            weighted_sum += float(normalized["genres"].get(genre_id, 0.0)) * weight
+            weight_sum += weight
+        return weighted_sum / weight_sum if weight_sum else 0.0
+
+    @staticmethod
+    def _score_keywords(item_metadata: dict[str, Any], normalized: dict[str, Any]) -> float:
+        keyword_ids: list[int] = []
+
+        raw_ids = item_metadata.get("keyword_ids", []) or []
+        if isinstance(raw_ids, list):
+            for keyword_id in raw_ids:
+                try:
+                    kid = int(keyword_id)
+                except (TypeError, ValueError):
+                    continue
+                if kid not in RANKING_IGNORED_KEYWORD_IDS:
+                    keyword_ids.append(kid)
+
+        if not keyword_ids:
+            keywords = item_metadata.get("keywords", {}) or {}
             if isinstance(keywords, dict):
                 raw_keywords = keywords.get("keywords") or keywords.get("results") or []
-                item_keywords = [k.get("id") for k in raw_keywords if isinstance(k, dict) and k.get("id")]
+            elif isinstance(keywords, list):
+                raw_keywords = keywords
+            else:
+                raw_keywords = []
 
-        if item_keywords:
-            keyword_matches = [normalized["keywords"].get(kid, 0.0) for kid in item_keywords]
-            keyword_score = sum(keyword_matches) / len(keyword_matches) if keyword_matches else 0.0
-            score += keyword_score * FEATURE_WEIGHT_KEYWORD
+            for keyword in raw_keywords:
+                if not isinstance(keyword, dict):
+                    continue
+                try:
+                    kid = int(keyword.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if kid in RANKING_IGNORED_KEYWORD_IDS:
+                    continue
+                keyword_ids.append(kid)
 
-        # Cast score (weighted average of matching cast)
+        scores = [float(normalized["keywords"].get(kid, 0.0)) for kid in keyword_ids]
+        scores = sorted((score for score in scores if score > 0.0), reverse=True)
+        strongest = scores[:RANKING_KEYWORD_MATCH_LIMIT]
+        return sum(strongest) / len(strongest) if strongest else 0.0
+
+    @staticmethod
+    def _score_cast(item_metadata: dict[str, Any], normalized: dict[str, Any]) -> float:
         item_cast = ProfileScorer._extract_cast_ids(item_metadata)
-        if item_cast:
-            cast_matches = [normalized["cast"].get(cid, 0.0) for cid in item_cast]
-            cast_score = sum(cast_matches) / len(cast_matches) if cast_matches else 0.0
-            score += cast_score * RANKING_WEIGHT_CAST
+        if not item_cast:
+            return 0.0
+        matches = [float(normalized["cast"].get(cast_id, 0.0)) for cast_id in item_cast]
+        return sum(matches) / len(matches) if matches else 0.0
 
-        # Director/creator score. Producers are deliberately excluded: the
-        # profile builder learns directors/creators, not producers.
+    @staticmethod
+    def _score_directors(item_metadata: dict[str, Any], normalized: dict[str, Any]) -> float:
         item_directors = ProfileScorer._extract_director_ids(item_metadata)
-        if item_directors:
-            director_matches = [normalized["directors"].get(did, 0.0) for did in item_directors]
-            director_score = sum(director_matches) / len(director_matches) if director_matches else 0.0
-            score += director_score * RANKING_WEIGHT_DIRECTOR
+        if not item_directors:
+            return 0.0
+        matches = [float(normalized["directors"].get(director_id, 0.0)) for director_id in item_directors]
+        return sum(matches) / len(matches) if matches else 0.0
 
-        # Era score
+    @staticmethod
+    def _score_era(item_metadata: dict[str, Any], normalized: dict[str, Any]) -> float:
         year = item_metadata.get("release_date") or item_metadata.get("first_air_date") or item_metadata.get("released")
-        if year:
-            try:
-                year_int = int(str(year)[:4])
-                era = ProfileScorer._year_to_era(year_int)
-                era_score = normalized["eras"].get(era, 0.0)
-                score += era_score * RANKING_WEIGHT_ERA
-            except (ValueError, TypeError):
-                pass
-
-        # Production country is not a taste signal. Language preference is
-        # enforced separately from TMDB original_language.
-
-        return score
+        if not year:
+            return 0.0
+        try:
+            year_int = int(str(year)[:4])
+        except (ValueError, TypeError):
+            return 0.0
+        era = ProfileScorer._year_to_era(year_int)
+        return float(normalized["eras"].get(era, 0.0))
 
     @staticmethod
     def _extract_cast_ids(item_metadata: dict[str, Any]) -> list[int]:
@@ -148,15 +184,14 @@ class ProfileScorer:
         """Convert year to era bucket."""
         if year < 1970:
             return "pre-1970s"
-        elif year < 1980:
+        if year < 1980:
             return "1970s"
-        elif year < 1990:
+        if year < 1990:
             return "1980s"
-        elif year < 2000:
+        if year < 2000:
             return "1990s"
-        elif year < 2010:
+        if year < 2010:
             return "2000s"
-        elif year < 2020:
+        if year < 2020:
             return "2010s"
-        else:
-            return "2020s"
+        return "2020s"
