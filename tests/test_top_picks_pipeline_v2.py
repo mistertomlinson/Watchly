@@ -67,3 +67,15 @@ def test_enrichment_selection_balances_sources_and_spreads_across_each_pool():
     assert len(gemini) == 40
     assert max(item["id"] for item in simkl) > 90
     assert max(item["id"] for item in gemini) > 1090
+
+def test_strength_qualification_expands_beyond_display_target_when_matches_are_strong():
+    scored = [(1.00, {}), (0.90, {}), (0.81, {}), (0.80, {}), (0.79, {})]
+    assert TopPicksService._strength_qualified_count(scored, 2) == 4
+
+def test_strength_qualification_uses_display_target_as_minimum_not_fixed_pool():
+    scored = [(1.00, {}), (0.81, {}), (0.79, {}), (0.60, {}), (0.40, {})]
+    assert TopPicksService._strength_qualified_count(scored, 4) == 4
+
+def test_strength_qualification_has_no_maximum_pool_size():
+    scored = [(1.00 - index * 0.001, {}) for index in range(50)]
+    assert TopPicksService._strength_qualified_count(scored, 20) == 50

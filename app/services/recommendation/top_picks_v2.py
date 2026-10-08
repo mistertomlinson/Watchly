@@ -48,6 +48,7 @@ class TopPicksService:
     MIN_CANDIDATE_HEADROOM = 60
     MIN_ENRICHMENT_HEADROOM = 80
     QUALIFYING_POOL_FLOOR = 30
+    STRONG_MATCH_RATIO = 0.80
 
     def __init__(self, tmdb_service: TMDBService, user_settings: UserSettings | None = None):
         self.tmdb_service = tmdb_service
@@ -415,9 +416,18 @@ class TopPicksService:
 
         # 6. Rank only to establish a quality bar. Presentation then rotates
         # within the qualifying pool instead of publishing rigid #1-#20 order.
-        qualifying_limit = min(len(scored_candidates), qualifying_target)
+        best_score = scored_candidates[0][0] if scored_candidates else 0.0
+        strength_threshold = best_score * self.STRONG_MATCH_RATIO
+        strong_count = sum(1 for score, _ in scored_candidates if score >= strength_threshold)
+        qualifying_limit = self._strength_qualified_count(scored_candidates, target)
+        logger.info(
+            f"Top picks strength qualification: best_score={best_score:.6f}, "
+            f"threshold={strength_threshold:.6f}, strong_count={strong_count}, "
+            f"qualifying_limit={qualifying_limit}, display_target={target}, "
+            f"minimum_fill={strong_count < min(target, len(scored_candidates))}"
+        )
         qualified = self._apply_diversity_caps(
-            scored_candidates,
+            scored_candidates[:qualifying_limit],
             qualifying_limit,
             mtype,
         )
@@ -801,6 +811,19 @@ RESPONSE FORMAT (one per line, no other text):
             candidates.extend(result.get("results", []))
         logger.debug(f"Fetched {len(candidates)} candidates from discover")
         return candidates
+
+    @classmethod
+    def _strength_qualified_count(
+        cls,
+        scored_candidates: list[tuple[float, dict[str, Any]]],
+        target: int,
+    ) -> int:
+        if not scored_candidates or target <= 0:
+            return 0
+        best_score = scored_candidates[0][0]
+        threshold = best_score * cls.STRONG_MATCH_RATIO
+        strong_count = sum(1 for score, _ in scored_candidates if score >= threshold)
+        return min(len(scored_candidates), max(target, strong_count))
 
     def _apply_diversity_caps(
         self,
