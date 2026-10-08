@@ -1,10 +1,9 @@
-import pytest
+import asyncio
 
 from app.services.recommendation.filtering import RecommendationFiltering
 
 
-@pytest.mark.asyncio
-async def test_exclusion_sets_use_preserved_external_tmdb_id():
+def test_exclusion_sets_use_preserved_external_tmdb_id():
     library = {
         "watched": [
             {
@@ -19,10 +18,12 @@ async def test_exclusion_sets_use_preserved_external_tmdb_id():
         "added": [],
     }
 
-    watched_imdb, watched_tmdb = await RecommendationFiltering.get_exclusion_sets(
-        None,
-        library,
-        content_type="movie",
+    watched_imdb, watched_tmdb = asyncio.run(
+        RecommendationFiltering.get_exclusion_sets(
+            None,
+            library,
+            content_type="movie",
+        )
     )
 
     assert watched_imdb == {"tt1234567"}
