@@ -132,6 +132,84 @@ class TopPicksService:
                 pool[tid] = item
         return pool
 
+    @classmethod
+    def _select_for_enrichment(
+        cls,
+        pool: dict[int, dict[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Choose enrichment candidates without comparing unlike raw metadata."""
+        items = list(pool.values())
+        if len(items) <= limit:
+            return items
+
+        by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        source_order: list[str] = []
+        for item in items:
+            for source in item.get("_watchly_sources") or ["unknown"]:
+                if source not in by_source:
+                    source_order.append(source)
+                by_source[source].append(item)
+
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[int] = set()
+        remaining_slots = limit
+        remaining_sources = len(source_order)
+
+        for source in source_order:
+            bucket = by_source[source]
+            quota = max(1, remaining_slots // max(1, remaining_sources))
+            quota = min(quota, len(bucket))
+            chosen = bucket if quota >= len(bucket) else [
+                bucket[(index * len(bucket)) // quota]
+                for index in range(quota)
+            ]
+            for item in chosen:
+                tid = cls._canonical_tmdb_id(item)
+                if tid is None or tid in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(tid)
+                if len(selected) >= limit:
+                    return selected
+            remaining_slots = limit - len(selected)
+            remaining_sources -= 1
+
+        if len(selected) < limit:
+            remaining = [
+                item for item in items
+                if (cls._canonical_tmdb_id(item) or -1) not in selected_ids
+            ]
+            need = limit - len(selected)
+            if len(remaining) > need and need > 0:
+                remaining = [
+                    remaining[(index * len(remaining)) // need]
+                    for index in range(need)
+                ]
+            selected.extend(remaining[:need])
+
+        return selected[:limit]
+
+    def _apply_final_settings(
+        self,
+        items: list[dict[str, Any]],
+        content_type: str,
+    ) -> list[dict[str, Any]]:
+        """Apply settings only after all sources have comparable TMDB metadata."""
+        filtered = filter_items_by_settings(items, self.user_settings)
+        excluded = set(
+            RecommendationFiltering.get_excluded_genre_ids(
+                self.user_settings,
+                content_type,
+            )
+        )
+        if excluded:
+            filtered = [
+                item for item in filtered
+                if not excluded.intersection(item.get("genre_ids") or [])
+            ]
+        return filtered
+
     async def get_top_picks(
         self,
         profile: TasteProfile,
@@ -163,7 +241,11 @@ class TopPicksService:
         simkl_api_key = self.user_settings.simkl_api_key if self.user_settings else None
         if simkl_api_key:
             source_items = await self._fetch_simkl_recommendations(library_items, content_type, mtype)
-            source_items = filter_items_by_settings(source_items, self.user_settings, simkl=True)
+            # Simkl recommendation summaries often contain TMDB IDs but no rating
+            # payload. Applying TMDB quality thresholds here incorrectly turns a
+            # healthy Simkl response into an empty source. Year bounds are already
+            # applied by the Simkl batch request; final TMDB-backed settings and
+            # quality gates run after enrichment for every source.
             source_name = "simkl"
             if not source_items:
                 logger.info("Simkl returned no results, falling back to TMDB recommendations")
@@ -230,29 +312,18 @@ class TopPicksService:
             logger.warning("Top picks candidate pool is empty after watched/settings filtering")
             return []
 
-        # 4. Cheap preliminary ranking limits expensive detail/image requests.
-        # Final ranking happens *after* enrichment with keywords/credits available.
+        # 4. Spend the enrichment budget fairly across sources. Raw Simkl,
+        # Gemini/TMDB-search, and Discover candidates expose different metadata,
+        # so ranking them before enrichment creates a source-format bias.
         rotation_seed = RecommendationScoring.generate_rotation_seed()
-        preliminary: list[tuple[float, dict[str, Any]]] = []
-        for item in pool.values():
-            try:
-                score = RecommendationScoring.calculate_final_score(
-                    item=item,
-                    profile=profile,
-                    scorer=self.scorer,
-                    mtype=mtype,
-                    rotation_seed=rotation_seed,
-                )
-            except Exception as exc:
-                logger.debug(f"Preliminary score failed for {item.get('id')}: {exc}")
-                score = 0.0
-            preliminary.append((score, item))
-        preliminary.sort(key=lambda pair: pair[0], reverse=True)
-
-        to_enrich = [item for _, item in preliminary[:enrichment_target]]
+        to_enrich = self._select_for_enrichment(pool, enrichment_target)
+        enrichment_source_mix: dict[str, int] = defaultdict(int)
+        for item in to_enrich:
+            for source in item.get("_watchly_sources") or ["unknown"]:
+                enrichment_source_mix[source] += 1
         logger.info(
             f"Top picks enriching {len(to_enrich)}/{len(pool)} candidates "
-            "for full-feature ranking"
+            f"with source-balanced selection: {dict(enrichment_source_mix)}"
         )
 
         enriched = await RecommendationMetadata.fetch_batch(
@@ -272,9 +343,13 @@ class TopPicksService:
             if tid is not None:
                 item["_watchly_sources"] = source_by_tmdb.get(tid, [])
 
+        # All sources now have comparable TMDB metadata, so apply the user's
+        # year/popularity/quality and excluded-genre settings uniformly here.
+        enriched = self._apply_final_settings(enriched, content_type)
+
         # Final watched guard uses IMDb after full TMDB external IDs are known.
         enriched = filter_watched_by_imdb(enriched, watched_imdb)
-        logger.info(f"Top picks full metadata survivors after IMDb guard: {len(enriched)}")
+        logger.info(f"Top picks full metadata survivors after final settings/IMDb guard: {len(enriched)}")
 
         # If late filtering unexpectedly starved the pool, Discover can still be
         # used as a reserve source. This is intentionally rare and only runs when
@@ -307,6 +382,7 @@ class TopPicksService:
                 content_type,
                 user_settings=self.user_settings,
             )
+            reserve_enriched = self._apply_final_settings(reserve_enriched, content_type)
             reserve_enriched = filter_watched_by_imdb(reserve_enriched, watched_imdb)
             enriched.extend(reserve_enriched)
             logger.info(

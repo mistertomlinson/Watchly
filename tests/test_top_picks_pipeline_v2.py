@@ -42,3 +42,28 @@ def test_profile_scorer_directors_ignore_producers_and_deduplicate():
 
 def test_genre_profile_evidence_is_no_longer_hard_capped_at_50():
     assert isinf(CAP_GENRE)
+
+def test_enrichment_selection_balances_sources_and_spreads_across_each_pool():
+    pool = {}
+    for index in range(100):
+        TopPicksService._merge_candidate(
+            pool,
+            {"id": index + 1, "title": f"Simkl {index}"},
+            "simkl",
+        )
+    for index in range(100):
+        TopPicksService._merge_candidate(
+            pool,
+            {"id": index + 1001, "title": f"Gemini {index}"},
+            "gemini",
+        )
+
+    selected = TopPicksService._select_for_enrichment(pool, 80)
+
+    assert len(selected) == 80
+    simkl = [item for item in selected if "simkl" in item["_watchly_sources"]]
+    gemini = [item for item in selected if "gemini" in item["_watchly_sources"]]
+    assert len(simkl) == 40
+    assert len(gemini) == 40
+    assert max(item["id"] for item in simkl) > 90
+    assert max(item["id"] for item in gemini) > 1090
