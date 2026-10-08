@@ -2,11 +2,11 @@ from typing import Any
 
 from app.models.taste_profile import TasteProfile
 from app.services.profile.constants import (
-    FEATURE_WEIGHT_COUNTRY,
-    FEATURE_WEIGHT_CREATOR,
-    FEATURE_WEIGHT_ERA,
     FEATURE_WEIGHT_GENRE,
     FEATURE_WEIGHT_KEYWORD,
+    RANKING_WEIGHT_CAST,
+    RANKING_WEIGHT_DIRECTOR,
+    RANKING_WEIGHT_ERA,
 )
 
 
@@ -36,6 +36,14 @@ class ProfileScorer:
 
         # Genre score (weighted average of matching genres)
         item_genres = item_metadata.get("genre_ids", [])
+        if not item_genres:
+            genres = item_metadata.get("genres", []) or []
+            if isinstance(genres, list):
+                item_genres = [
+                    g.get("id")
+                    for g in genres
+                    if isinstance(g, dict) and g.get("id") is not None
+                ]
         if item_genres:
             genre_matches = [normalized["genres"].get(gid, 0.0) for gid in item_genres]
             genre_score = sum(genre_matches) / len(genre_matches) if genre_matches else 0.0
@@ -44,10 +52,12 @@ class ProfileScorer:
         # Keyword score (weighted average of matching keywords)
         item_keywords = item_metadata.get("keyword_ids", [])
         if not item_keywords:
-            # Try to extract from keywords dict
+            # Try to extract from keywords dict. TMDB uses either "keywords" or
+            # "results" depending on media type/endpoint.
             keywords = item_metadata.get("keywords", {})
             if isinstance(keywords, dict):
-                item_keywords = [k.get("id") for k in keywords.get("keywords", []) if k.get("id")]
+                raw_keywords = keywords.get("keywords") or keywords.get("results") or []
+                item_keywords = [k.get("id") for k in raw_keywords if isinstance(k, dict) and k.get("id")]
 
         if item_keywords:
             keyword_matches = [normalized["keywords"].get(kid, 0.0) for kid in item_keywords]
@@ -59,23 +69,24 @@ class ProfileScorer:
         if item_cast:
             cast_matches = [normalized["cast"].get(cid, 0.0) for cid in item_cast]
             cast_score = sum(cast_matches) / len(cast_matches) if cast_matches else 0.0
-            score += cast_score * FEATURE_WEIGHT_CREATOR
+            score += cast_score * RANKING_WEIGHT_CAST
 
-        # Director score (weighted average of matching directors)
+        # Director/creator score. Producers are deliberately excluded: the
+        # profile builder learns directors/creators, not producers.
         item_directors = ProfileScorer._extract_director_ids(item_metadata)
         if item_directors:
             director_matches = [normalized["directors"].get(did, 0.0) for did in item_directors]
             director_score = sum(director_matches) / len(director_matches) if director_matches else 0.0
-            score += director_score * FEATURE_WEIGHT_CREATOR
+            score += director_score * RANKING_WEIGHT_DIRECTOR
 
         # Era score
-        year = item_metadata.get("release_date") or item_metadata.get("first_air_date")
+        year = item_metadata.get("release_date") or item_metadata.get("first_air_date") or item_metadata.get("released")
         if year:
             try:
                 year_int = int(str(year)[:4])
                 era = ProfileScorer._year_to_era(year_int)
                 era_score = normalized["eras"].get(era, 0.0)
-                score += era_score * FEATURE_WEIGHT_ERA
+                score += era_score * RANKING_WEIGHT_ERA
             except (ValueError, TypeError):
                 pass
 
@@ -86,32 +97,36 @@ class ProfileScorer:
 
     @staticmethod
     def _extract_cast_ids(item_metadata: dict[str, Any]) -> list[int]:
-        """Extract cast IDs from item metadata."""
+        """Extract unique top-5 cast IDs from item metadata."""
         cast_ids = []
+        seen = set()
         credits = item_metadata.get("credits", {}) or {}
         cast_list = credits.get("cast", []) or []
         for actor in cast_list[:5]:  # Top 5 only
             if isinstance(actor, dict):
                 actor_id = actor.get("id")
-                if actor_id:
+                if actor_id and actor_id not in seen:
                     cast_ids.append(actor_id)
+                    seen.add(actor_id)
         return cast_ids
 
     @staticmethod
     def _extract_director_ids(item_metadata: dict[str, Any]) -> list[int]:
-        """Extract director IDs from item metadata."""
+        """Extract unique director/creator IDs from item metadata."""
         director_ids = []
+        seen = set()
         credits = item_metadata.get("credits", {}) or {}
         crew_list = credits.get("crew", []) or []
         for crew_member in crew_list:
-            if (
-                isinstance(crew_member, dict)
-                and crew_member.get("job")
-                and crew_member.get("job").lower() in ["director", "creator", "producer"]
-            ):
-                director_id = crew_member.get("id")
-                if director_id:
-                    director_ids.append(director_id)
+            if not isinstance(crew_member, dict):
+                continue
+            job = str(crew_member.get("job") or "").lower()
+            if job not in {"director", "creator"}:
+                continue
+            director_id = crew_member.get("id")
+            if director_id and director_id not in seen:
+                director_ids.append(director_id)
+                seen.add(director_id)
         return director_ids
 
     @staticmethod
