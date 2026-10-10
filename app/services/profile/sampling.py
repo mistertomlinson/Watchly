@@ -24,6 +24,26 @@ class SmartSampler:
         """
         self.scoring_service = scoring_service
 
+    @staticmethod
+    def _is_taste_eligible(item: dict[str, Any]) -> bool:
+        """
+        Keep existing unrated watched-item behavior, but prevent explicit
+        neutral/disliked ratings from shaping the general taste profile.
+
+        Rated 3-6 items remain available elsewhere for watched exclusion and
+        "Because You Watched". Rated 1-2 items are negative signals only.
+        """
+        rating = item.get("_personal_rating")
+        if rating is None:
+            return not bool(item.get("_is_disliked"))
+
+        try:
+            numeric_rating = int(rating)
+        except (TypeError, ValueError):
+            return not bool(item.get("_is_disliked"))
+
+        return numeric_rating >= 7
+
     def sample_items(
         self,
         library_items: dict[str, list[dict[str, Any]]],
@@ -48,7 +68,11 @@ class SmartSampler:
             + library_items.get("watched", [])
             + library_items.get("added", [])
         )
-        typed_items = [it for it in all_items if it.get("type") == content_type]
+        typed_items = [
+            it
+            for it in all_items
+            if it.get("type") == content_type and self._is_taste_eligible(it)
+        ]
 
         if not typed_items:
             return []

@@ -91,9 +91,10 @@ class UserCacheService:
         await redis_service.set(key, json.dumps(library_items), DERIVED_CACHE_TTL_SECONDS)
         logger.debug(f"[{redact_token(token)}...] Cached library items")
 
-        # Invalidate all catalog caches when library items are updated
-        # This ensures catalogs are regenerated with fresh library data
-        await self.invalidate_all_catalogs(token)
+        # Preserve this profile's last-known-good published catalogs.
+        # Library changes make only this token's catalogs dirty; replacement
+        # catalogs will be generated separately in the background.
+        await self.mark_catalogs_dirty(token)
 
     async def invalidate_library_items(self, token: str) -> None:
         """
@@ -335,9 +336,10 @@ class UserCacheService:
             await self.set_profile(token, content_type, profile)
         await self.set_watched_sets(token, content_type, watched_tmdb, watched_imdb)
 
-        # Invalidate all catalog caches when profile is updated
-        # This ensures catalogs are regenerated with fresh profile data
-        await self.invalidate_all_catalogs(token)
+        # Preserve this profile's last-known-good published catalogs.
+        # Profile changes dirty only this token's catalogs and must never
+        # delete another profile's published snapshot.
+        await self.mark_catalogs_dirty(token)
 
     # Invalidation Methods
 
@@ -355,7 +357,49 @@ class UserCacheService:
         await self.invalidate_all_catalogs(token)
         logger.debug(f"[{redact_token(token)}...] Invalidated all user data cache")
 
-    async def get_catalog(self, token: str, type: str, id: str) -> tuple[dict[str, Any], int] | None:
+    @staticmethod
+    def _catalog_dirty_key(token: str) -> str:
+        # Deliberately token-scoped for complete profile isolation.
+        return f"watchly:catalog_dirty:{token}"
+
+    async def mark_catalogs_dirty(self, token: str) -> None:
+        """Mark this profile's published catalogs as needing regeneration.
+
+        Existing catalog payloads remain intact so clients can continue using
+        the last-known-good published snapshot while replacements are built.
+        """
+        # Use a nanosecond revision rather than whole seconds so several
+        # profile/library changes in rapid succession cannot collapse into one
+        # generation marker.
+        dirty_revision = time.time_ns()
+        await redis_service.set(
+            self._catalog_dirty_key(token),
+            str(dirty_revision),
+        )
+        logger.debug(
+            f"[{redact_token(token)}...] Marked published catalogs dirty"
+        )
+
+
+    async def get_catalog_dirty_revision(self, token: str) -> int | None:
+        """Return this profile's most recent catalog-dirty revision."""
+        value = await redis_service.get(self._catalog_dirty_key(token))
+        if value is None:
+            return None
+
+        try:
+            if isinstance(value, bytes):
+                value = value.decode()
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def get_catalog(
+        self,
+        token: str,
+        type: str,
+        id: str,
+    ) -> tuple[dict[str, Any], int, int | None] | None:
         """
         Get cached catalog for a user and content type.
 
@@ -374,10 +418,14 @@ class UserCacheService:
                 data = json.loads(cached)
                 # Handle new format with timestamp wrapper
                 if "data" in data and "created_at" in data:
-                    return data["data"], data["created_at"]
-                # Handle legacy format (raw catalog dict)
-                # Return 0 timestamp to force refresh if it exceeds window
-                return data, 0
+                    return (
+                        data["data"],
+                        data["created_at"],
+                        data.get("source_revision"),
+                    )
+                # Handle legacy format (raw catalog dict). No source revision
+                # means a later dirty marker will correctly force regeneration.
+                return data, 0, None
             except json.JSONDecodeError:
                 return None
         return None
@@ -389,6 +437,7 @@ class UserCacheService:
         id: str,
         catalog: dict[str, Any],
         ttl: int | None = None,
+        source_revision: int | None = None,
     ) -> None:
         """
         Cache catalog for a user and content type.
@@ -405,6 +454,10 @@ class UserCacheService:
         wrapped_data = {
             "data": catalog,
             "created_at": int(time.time()),
+            # Revision of the profile/library snapshot used to build this
+            # published payload. A later token-scoped dirty revision means the
+            # payload stays visible but needs a background replacement.
+            "source_revision": source_revision,
         }
         await redis_service.set(key, json.dumps(wrapped_data), ttl)
         logger.debug(f"[{redact_token(token)}...] Cached catalog for {type}/{id}")
@@ -467,6 +520,9 @@ class UserCacheService:
         """
         pattern = f"watchly:catalog:{token}:*"
         deleted_count = await redis_service.delete_by_pattern(pattern)
+        # This remains the explicit destructive-reset path, so clear this
+        # profile's dirty marker as part of the same token-scoped reset.
+        await redis_service.delete(self._catalog_dirty_key(token))
         if deleted_count > 0:
             logger.debug(f"[{redact_token(token)}...] Invalidated {deleted_count} catalog cache(s)")
         else:

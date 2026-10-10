@@ -5,13 +5,12 @@ import { showToast, initializeFooter, initializeKofi } from './modules/ui.js';
 import { initializeNavigation, switchSection, lockNavigationForLoggedOut, initializeMobileNav, updateMobileLayout, unlockNavigation } from './modules/navigation.js';
 import { initializeAuth, setStremioLoggedOutState } from './modules/auth.js';
 import { initializeTrakt, setTraktLoggedOutState } from './modules/trakt.js';
+import { initializeSimklProvider, setSimklLoggedOutState } from './modules/simkl.js';
 import { initializeCatalogList, renderCatalogList, getCatalogs, setCatalogs } from './modules/catalog.js';
 import { initializeForm, clearErrors } from './modules/form.js';
 
-// Initialize catalogs state
 let catalogsState = JSON.parse(JSON.stringify(defaultCatalogs));
 
-// DOM Elements
 const configForm = document.getElementById('configForm');
 const catalogList = document.getElementById('catalogList');
 const movieGenreList = document.getElementById('movieGenreList');
@@ -45,45 +44,31 @@ const sections = {
     success: document.getElementById('sect-success')
 };
 
-// Main scroll container
 const mainEl = document.querySelector('main');
 
-// Reset App Function
 function resetApp() {
     if (configForm) configForm.reset();
     clearErrors();
-
-    // Reset Navigation is now Back to Welcome
     switchSection('welcome');
 
-    // Lock Navs
     Object.keys(navItems).forEach(key => {
-        if (key !== 'login' && key !== 'welcome') {
-            if (navItems[key]) navItems[key].classList.add('disabled');
-        }
+        if (key !== 'login' && key !== 'welcome' && navItems[key]) navItems[key].classList.add('disabled');
     });
 
-    // Reset Stremio State
     setStremioLoggedOutState();
-
-    // Reset Trakt State
     setTraktLoggedOutState();
+    setSimklLoggedOutState();
 
-    // Reset catalogs
     catalogsState = JSON.parse(JSON.stringify(defaultCatalogs));
     setCatalogs(catalogsState);
     renderCatalogList();
 
-    // Show Form
     if (configForm) configForm.classList.remove('hidden');
     if (sections.success) sections.success.classList.add('hidden');
 }
 
-// Welcome Flow Logic
 function initializeWelcomeFlow() {
     if (!btnGetStarted) return;
-
-    // Support mobile taps reliably while avoiding double-fire (touch -> click)
     let touched = false;
     const handleGetStarted = (e) => {
         if (e.type === 'click' && touched) return;
@@ -91,104 +76,59 @@ function initializeWelcomeFlow() {
         if (navItems.login) navItems.login.classList.remove('disabled');
         switchSection('login');
     };
-
     btnGetStarted.addEventListener('click', handleGetStarted);
     btnGetStarted.addEventListener('touchstart', handleGetStarted, { passive: true });
 }
 
-// Initialize everything
 document.addEventListener('DOMContentLoaded', () => {
-    // Start at Welcome
     switchSection('welcome');
     initializeWelcomeFlow();
 
-    // Initialize all modules
-    initializeNavigation({
-        navItems,
-        sections,
-        mainEl
-    });
-
-    // By default, ensure logged-out users see only Welcome/Login
+    initializeNavigation({ navItems, sections, mainEl });
     lockNavigationForLoggedOut();
 
-    // Initialize catalog management - set catalogs first
     setCatalogs(catalogsState);
-    initializeCatalogList(
-        { catalogList },
-        {
-            catalogs: catalogsState,
-            renderCatalogList
-        }
-    );
+    initializeCatalogList({ catalogList }, { catalogs: catalogsState, renderCatalogList });
 
-    // Initialize authentication (Stremio)
     initializeAuth(
-        {
-            stremioLoginBtn,
-            stremioLoginText,
-            emailInput,
-            passwordInput,
-            emailPwdContinueBtn,
-            languageSelect
-        },
-        {
-            getCatalogs,
-            renderCatalogList,
-            resetApp
-        }
+        { stremioLoginBtn, stremioLoginText, emailInput, passwordInput, emailPwdContinueBtn, languageSelect },
+        { getCatalogs, renderCatalogList, resetApp }
     );
 
-    // Initialize Trakt authentication
     initializeTrakt(
         { languageSelect },
-        {
-            getCatalogs,
-            renderCatalogList,
-            resetApp
-        }
+        { getCatalogs, renderCatalogList, resetApp }
     );
 
-    // Initialize form handling
+    // Simkl injects its third provider tab at runtime and owns Simkl OAuth submissions.
+    // Initialize before the generic form handler so its capture listener can route
+    // authenticated Simkl accounts to /tokens/simkl without disturbing Stremio/Trakt.
+    initializeSimklProvider(
+        { languageSelect },
+        { getCatalogs, renderCatalogList, resetApp }
+    );
+
     initializeForm(
-        {
-            configForm,
-            submitBtn,
-            emailInput,
-            passwordInput,
-            languageSelect,
-            movieGenreList,
-            seriesGenreList
-        },
-        {
-            getCatalogs,
-            resetApp
-        }
+        { configForm, submitBtn, emailInput, passwordInput, languageSelect, movieGenreList, seriesGenreList },
+        { getCatalogs, resetApp }
     );
 
-    // Initialize mobile navigation
     initializeMobileNav();
-
-    // Initialize UI components
     initializeFooter();
     initializeKofi();
 
-    // Layout adjustments for fixed mobile header
     updateMobileLayout();
     window.addEventListener('resize', updateMobileLayout);
     window.addEventListener('orientationchange', updateMobileLayout);
 
-    // Next Buttons
     if (configNextBtn) configNextBtn.addEventListener('click', () => switchSection('catalogs'));
     if (catalogsNextBtn) catalogsNextBtn.addEventListener('click', () => switchSection('install'));
 
-    // Reset Buttons
     const resetBtn = document.getElementById('resetBtn');
     if (resetBtn) resetBtn.addEventListener('click', resetApp);
     if (successResetBtn) successResetBtn.addEventListener('click', resetApp);
 });
 
-// Make resetApp available globally for auth module
 window.resetApp = resetApp;
 window.switchSection = switchSection;
 window.unlockNavigation = unlockNavigation;

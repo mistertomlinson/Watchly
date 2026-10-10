@@ -297,6 +297,6 @@
         window.MOVIE_GENRES = {{ movie_genres | tojson }};
         window.SERIES_GENRES = {{ series_genres | tojson }};
     </script>
-    <script type="module" src="/app/static/js/main.js"></script>
+    <script type="module" src="/app/static/js/main.js?v={{ static_version }}"></script>
 </body>
 </html>

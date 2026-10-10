@@ -1,4 +1,5 @@
 import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from .version import __version__
 project_root = Path(__file__).resolve().parent.parent.parent
 static_dir = project_root / "app/static"
 templates_dir = project_root / "app/templates"
+
+# A unique module URL on every process start prevents browsers—especially
+# Safari—from retaining an older ES-module dependency graph after deployment.
+static_version = str(time.time_ns())
 
 
 @asynccontextmanager
@@ -61,6 +66,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def revalidate_static_files(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/app/static/"):
+        # Browsers may otherwise reuse stale ES modules after a deployment,
+        # even when an imported file such as form.js or simkl.js changed.
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
+
 if static_dir.exists():
     app.mount("/app/static", StaticFiles(directory=str(static_dir)), name="static")
 
@@ -98,6 +113,7 @@ async def configure_page(request: Request, _token: str | None = None):
     html_content = template.render(
         request=request,
         app_version=__version__,
+        static_version=static_version,
         total_users=total_users,
         app_host=settings.HOST_NAME,
         announcement_html=settings.ANNOUNCEMENT_HTML or "",

@@ -20,38 +20,35 @@ class Settings(BaseSettings):
     ADDON_ID: str = "com.bimal.watchly"
     ADDON_NAME: str = "Watchly"
     REDIS_URL: str = "redis://redis:6379/0"
-    # Maximum number of connections Redis client will open per process
-    # Set conservatively to avoid unbounded connection growth under high concurrency
     REDIS_MAX_CONNECTIONS: int = 20
-    # If total connected clients reported by Redis exceeds this, background
-    # Redis-heavy jobs will back off. Tune according to your Redis capacity.
     REDIS_CONNECTIONS_THRESHOLD: int = 100
     REDIS_TOKEN_KEY: str = "watchly:token:"
     TOKEN_SALT: str = "change-me"
-    TOKEN_TTL_SECONDS: int = 0  # 0 = never expire
+    TOKEN_TTL_SECONDS: int = 0
     ANNOUNCEMENT_HTML: str = ""
     AUTO_UPDATE_CATALOGS: bool = True
-    CATALOG_REFRESH_INTERVAL_SECONDS: int = 21600  # 24 hours
-    MANIFEST_CACHE_TTL_SECONDS: int = 21600  # 6 hours — controls how often catalog names/seeds rotate
+    CATALOG_REFRESH_INTERVAL_SECONDS: int = 21600
+    MANIFEST_CACHE_TTL_SECONDS: int = 21600
     APP_ENV: Literal["development", "production", "vercel"] = "production"
     HOST_NAME: str = "https://1ccea4301587-watchly.baby-beamup.club"
 
     RECOMMENDATION_SOURCE_ITEMS_LIMIT: int = 10
     LIBRARY_ITEMS_LIMIT: int = 20
+    CATALOG_CACHE_TTL: int = 43200
+    CATALOG_STALE_TTL: int = 604800
 
-    CATALOG_CACHE_TTL: int = 43200  # 12 hours
-    CATALOG_STALE_TTL: int = 604800  # 7 days (soft expiration fallback)
-
-    # AI
     DEFAULT_GEMINI_MODEL: str = "gemma-3-27b-it"
     GEMINI_API_KEY: str | None = None
     OPENROUTER_API_KEY: str | None = None
 
-    # Trakt OAuth
     TRAKT_CLIENT_ID: str | None = None
     TRAKT_CLIENT_SECRET: str | None = None
 
+    # Simkl OAuth. SIMKL_CLIENT_ID is also the API key sent in the
+    # simkl-api-key header for both public and authenticated requests.
+    SIMKL_CLIENT_ID: str | None = None
+    SIMKL_CLIENT_SECRET: str | None = None
+
 
 settings = Settings()
-
 APP_VERSION = __version__

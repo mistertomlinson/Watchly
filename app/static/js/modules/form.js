@@ -476,7 +476,7 @@ function initializeSimkl() {
         const apiKey = apiKeyInput.value.trim();
 
         if (!apiKey) {
-            showSimklValidationMessage("Please enter a Simkl API key", "error");
+            showSimklValidationMessage("Please enter a Simkl client ID", "error");
             return false;
         }
 
@@ -496,10 +496,10 @@ function initializeSimkl() {
             const data = await response.json();
 
             if (data.valid) {
-                showSimklValidationMessage("Simkl API key is valid ✓", "success");
+                showSimklValidationMessage(data.message || "Simkl client ID format is valid ✓", "success");
                 return true;
             } else {
-                showSimklValidationMessage(data.message || "Invalid Simkl API key", "error");
+                showSimklValidationMessage(data.message || "Invalid Simkl client ID", "error");
                 return false;
             }
         } catch (error) {
@@ -525,7 +525,7 @@ function initializeSimkl() {
     });
 }
 
-// Groq AI Integration
+// OpenRouter or Groq AI Integration
 function initializeOpenRouter() {
     const apiKeyInput = document.getElementById("openrouterApiKey");
     const validateBtn = document.getElementById("openrouterApiKeyValidate");
@@ -551,7 +551,7 @@ function initializeOpenRouter() {
         const apiKey = apiKeyInput.value.trim();
 
         if (!apiKey) {
-            showOpenRouterValidationMessage("Please enter a Groq API key", "error");
+            showOpenRouterValidationMessage("Please enter an OpenRouter or Groq API key", "error");
             return false;
         }
 
@@ -571,10 +571,10 @@ function initializeOpenRouter() {
             const data = await response.json();
 
             if (data.valid) {
-                showOpenRouterValidationMessage("Groq API key is valid ✓", "success");
+                showOpenRouterValidationMessage(data.message || "AI API key is valid ✓", "success");
                 return true;
             } else {
-                showOpenRouterValidationMessage(data.message || "Invalid Groq API key", "error");
+                showOpenRouterValidationMessage(data.message || "Invalid AI API key", "error");
                 return false;
             }
         } catch (error) {

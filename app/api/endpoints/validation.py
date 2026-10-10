@@ -1,31 +1,60 @@
+import re
+
 from fastapi import APIRouter, HTTPException
 import httpx
 from loguru import logger
 
 from app.api.models.validation import BaseValidationInput, BaseValidationResponse, PosterRatingValidationInput
 from app.services.poster_ratings.factory import PosterProvider, poster_ratings_factory
-from app.services.simkl import simkl_service
 from app.services.tmdb.client import TMDBClient
 
 router = APIRouter(tags=["Validation"])
 
 
 @router.post("/gemini/validation")
-async def validate_openrouter_api_key(data: BaseValidationInput) -> BaseValidationResponse:
+async def validate_ai_api_key(data: BaseValidationInput) -> BaseValidationResponse:
+    api_key = data.api_key.strip()
+    if not api_key:
+        return BaseValidationResponse(valid=False, message="AI API key cannot be empty")
+
+    is_groq = api_key.startswith("gsk_")
+    provider = "Groq" if is_groq else "OpenRouter"
+    models_url = (
+        "https://api.groq.com/openai/v1/models"
+        if is_groq
+        else "https://openrouter.ai/api/v1/key"
+    )
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
-                "https://openrouter.ai/api/v1/models",
-                headers={"Authorization": f"Bearer {data.api_key.strip()}"},
+                models_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
             )
-            if response.status_code == 200:
-                return BaseValidationResponse(valid=True, message="OpenRouter API key is valid")
-            else:
-                return BaseValidationResponse(valid=False, message="Invalid OpenRouter API key")
-    except Exception as e:
-        logger.debug(f"OpenRouter API key validation failed: {e}")
-        return BaseValidationResponse(valid=False, message="Invalid OpenRouter API key")
 
+        if response.status_code == 200:
+            return BaseValidationResponse(
+                valid=True,
+                message=f"{provider} API key is valid",
+            )
+
+        logger.debug(
+            f"{provider} API key validation returned "
+            f"{response.status_code}: {response.text[:300]}"
+        )
+        return BaseValidationResponse(
+            valid=False,
+            message=f"Invalid or unauthorized {provider} API key",
+        )
+    except Exception as e:
+        logger.debug(f"{provider} API key validation failed: {e}")
+        return BaseValidationResponse(
+            valid=False,
+            message=f"Could not validate {provider} API key",
+        )
 
 @router.post("/tmdb/validation")
 async def validate_tmdb_api_key(data: BaseValidationInput) -> BaseValidationResponse:
@@ -67,11 +96,19 @@ async def validate_poster_rating_api_key(payload: PosterRatingValidationInput) -
 
 @router.post("/simkl/validation")
 async def validate_simkl_api_key(data: BaseValidationInput) -> BaseValidationResponse:
-    try:
-        response = await simkl_service.get_trending(data.api_key)
-        if response:
-            return BaseValidationResponse(valid=True, message="Valid API Key")
-        return BaseValidationResponse(valid=False, message="Invalid API Key")
-    except Exception as e:
-        logger.error(f"Validation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Validation failed due to an internal error.")
+    client_id = data.api_key.strip()
+
+    # Simkl's public trending endpoint returns data even for bogus client IDs,
+    # so it cannot be used as credential validation. Check the documented
+    # 64-character hexadecimal client-ID format here; OAuth performs the real
+    # server-side verification of the registered application.
+    if re.fullmatch(r"[0-9a-fA-F]{64}", client_id):
+        return BaseValidationResponse(
+            valid=True,
+            message="Simkl client ID format is valid; OAuth confirms the registered app",
+        )
+
+    return BaseValidationResponse(
+        valid=False,
+        message="Simkl client ID must be a 64-character hexadecimal value",
+    )
