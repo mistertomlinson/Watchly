@@ -142,7 +142,7 @@ class RecommendationMetadata:
         media_type: str,
         user_settings: Any = None,
     ) -> list[dict[str, Any]]:
-        """Fetch details for a batch of items in parallel with target-based short-circuiting."""
+        """Fetch details and return only recommendations with landscape backdrops."""
         final_results = []
         valid_items = [it for it in items if it.get("id")]
         query_type = "movie" if media_type == "movie" else "tv"
@@ -170,7 +170,13 @@ class RecommendationMetadata:
                 except Exception:
                     return {}
 
-        successful_details = [d for d in details_list if d]
+        fetched_details = [d for d in details_list if d]
+        successful_details = [d for d in fetched_details if d.get("backdrop_path")]
+        filtered_count = len(fetched_details) - len(successful_details)
+        if filtered_count:
+            logger.info(
+                f"Filtered {filtered_count} recommendation(s) without TMDB landscape backdrops"
+            )
 
         # Exclude short films from movie recommendation output.
         # Runtime is taken from full TMDB movie details. Titles with unknown
@@ -212,6 +218,8 @@ class RecommendationMetadata:
             preference_filtered_details.append(details)
 
         successful_details = preference_filtered_details
+
+        # Only fetch logos/images for titles that can actually be published.
         image_tasks = [_images_one(d) for d in successful_details]
         images_list = await asyncio.gather(*image_tasks, return_exceptions=True)
 
@@ -230,7 +238,9 @@ class RecommendationMetadata:
             if isinstance(formatted, Exception):
                 logger.warning(f"Error formatting metadata: {formatted}")
                 continue
-            if formatted:
+            # Final defensive gate: no recommendation may leave this shared
+            # metadata boundary without a landscape background.
+            if formatted and formatted.get("background"):
                 original_language = (formatted.get("original_language") or "").lower()
                 if preferred_language and original_language and original_language != preferred_language:
                     continue
