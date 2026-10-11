@@ -22,8 +22,6 @@ UNIFIED_TOP_PICKS_V2 = True
 class TopPicksService(UnifiedTopPicksService):
     """Unified V2 Top Picks plus a final digital/physical availability gate."""
 
-    AVAILABILITY_HEADROOM = 10
-
     async def get_top_picks(
         self,
         profile: TasteProfile,
@@ -37,22 +35,18 @@ class TopPicksService(UnifiedTopPicksService):
     ) -> list[dict[str, Any]]:
         requested = max(1, min(int(limit), MAX_CATALOG_ITEMS))
 
-        # Ask V2 for a little extra movie headroom so removing a recent
-        # theatrical-only title does not shrink the normal 20-item row.
-        source_limit = requested
-        if content_type == "movie":
-            source_limit = min(
-                MAX_CATALOG_ITEMS,
-                requested + self.AVAILABILITY_HEADROOM,
-            )
-
+        # Keep V2's validated display target unchanged. Asking V2 for a larger
+        # target just to create replacement headroom would also raise its minimum
+        # qualifying count and could admit weaker titles. Quality stays ahead of
+        # row fullness here: generate the normal V2 result first, then remove any
+        # recent movie that cannot be verified as home-released.
         picks = await super().get_top_picks(
             profile=profile,
             content_type=content_type,
             library_items=library_items,
             watched_tmdb=watched_tmdb,
             watched_imdb=watched_imdb,
-            limit=source_limit,
+            limit=requested,
             gemini_api_key=gemini_api_key,
             library_items_raw=library_items_raw,
         )
@@ -70,7 +64,7 @@ class TopPicksService(UnifiedTopPicksService):
         # quality/availability-aware Top Picks source. Returning an empty result
         # here if the availability gate ever starves catastrophically prevents
         # that fallback from reintroducing the very theatrical-only titles this
-        # guard removed. With V2 + headroom this should be exceptional.
+        # guard removed. With the V2 pool this should be exceptional.
         if 0 < len(available) < 8:
             logger.warning(
                 "[HomeAvailability] Top Picks fell below 8 verified movies; "
