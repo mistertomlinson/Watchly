@@ -42,7 +42,9 @@ class SmartSampler:
         except (TypeError, ValueError):
             return not bool(item.get("_is_disliked"))
 
-        return numeric_rating > 2
+        # Only explicit positive ratings shape general taste. Ratings 3-6 are
+        # intentionally neutral; 1-2 are negative-only and excluded elsewhere.
+        return numeric_rating >= 7
 
     def sample_items(
         self,

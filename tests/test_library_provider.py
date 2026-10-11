@@ -61,3 +61,21 @@ def test_disliked_item_is_never_positive_anchor():
     assert library["disliked"] == [item]
     assert library["loved"] == []
     assert library["liked"] == []
+
+
+def test_provider_item_preserves_all_external_ids():
+    item = make_library_item(
+        ids={"imdb": "tt7654321", "tmdb": 12345, "simkl": 9876},
+        content_type="movie",
+        title="Identity Test",
+        year=2026,
+        provider="simkl",
+    )
+
+    assert item is not None
+    assert item["_id"] == "tt7654321"
+    assert item["_external_ids"] == {
+        "imdb_id": "tt7654321",
+        "tmdb_id": 12345,
+        "simkl_id": 9876,
+    }

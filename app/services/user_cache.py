@@ -39,7 +39,7 @@ class UserCacheService:
     @staticmethod
     def _profile_key(token: str, content_type: str) -> str:
         """Generate cache key for profile."""
-        return PROFILE_KEY.format(token=token, content_type=content_type)
+        return PROFILE_KEY.format(token=token, content_type=content_type).replace("watchly:profile:", "watchly:profile:v2:", 1)
 
     @staticmethod
     def _watched_sets_key(token: str, content_type: str) -> str:
