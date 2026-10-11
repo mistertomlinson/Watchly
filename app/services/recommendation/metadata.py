@@ -6,6 +6,7 @@ from loguru import logger
 from app.core.constants import DEFAULT_CONCURRENCY_LIMIT
 from app.services.content_preferences import lgbtq_content_preference_reason_values
 from app.services.poster_ratings.factory import PosterProvider, poster_ratings_factory
+from app.services.recommendation.availability import filter_home_released_movies
 
 
 class RecommendationMetadata:
@@ -142,7 +143,7 @@ class RecommendationMetadata:
         media_type: str,
         user_settings: Any = None,
     ) -> list[dict[str, Any]]:
-        """Fetch details and return only recommendations with landscape backdrops."""
+        """Fetch full metadata and enforce shared recommendation publication gates."""
         final_results = []
         valid_items = [it for it in items if it.get("id")]
         query_type = "movie" if media_type == "movie" else "tv"
@@ -218,6 +219,18 @@ class RecommendationMetadata:
             preference_filtered_details.append(details)
 
         successful_details = preference_filtered_details
+
+        # Shared movie availability boundary. Every Watchly recommendation path
+        # that publishes movie metadata passes through fetch_batch(), including
+        # Top Picks, item-based rows, theme rows, creator rows, trending fallback,
+        # and emergency padding. A theatrical/premiere date alone is not enough
+        # for a recent movie: it must have a Digital or Physical/Blu-ray release.
+        if query_type == "movie":
+            successful_details = await filter_home_released_movies(
+                tmdb_service,
+                successful_details,
+                user_settings,
+            )
 
         # Only fetch logos/images for titles that can actually be published.
         image_tasks = [_images_one(d) for d in successful_details]

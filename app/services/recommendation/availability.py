@@ -46,6 +46,10 @@ def _tmdb_id(item: dict[str, Any]) -> int | None:
         return None
 
 
+def _title(item: dict[str, Any]) -> str:
+    return str(item.get("name") or item.get("title") or "")
+
+
 def _has_home_release(
     payload: dict[str, Any] | None,
     *,
@@ -99,15 +103,16 @@ async def filter_home_released_movies(
     """Remove recent/future movies that are not home-viewable yet.
 
     A recent movie is publishable only when TMDB has a Digital (type 4) or
-    Physical/Blu-ray (type 5) release on or before today. This deliberately does
-    not accept a theatrical/premiere date as proof that a movie is watchable at
-    home. For older titles we fail open after one year because TMDB's historical
-    digital/physical release records are incomplete and those titles are no
-    longer credible theatrical-only false positives.
+    Physical/Blu-ray (type 5) release on or before today. A theatrical or
+    premiere date by itself never qualifies a recent movie as home-viewable.
 
-    The gate runs on the small, already-ranked Top Picks result set, so it adds
-    only a bounded number of TMDB release-date requests and preserves V2's large
-    candidate-pool/scoring pipeline.
+    For older titles we fail open after one year because TMDB's historical
+    digital/physical records are incomplete and those titles are no longer
+    credible theatrical-only false positives.
+
+    This helper accepts both raw TMDB detail objects (``release_date``/integer
+    ``id``) and already formatted Watchly metadata (``released``/``_tmdb_id``),
+    so the same rule can be enforced at the shared recommendation boundary.
     """
     if not items:
         return []
@@ -118,7 +123,9 @@ async def filter_home_released_movies(
     semaphore = asyncio.Semaphore(min(DEFAULT_CONCURRENCY_LIMIT, 12))
 
     async def _check(item: dict[str, Any]) -> tuple[bool, str]:
-        theatrical_date = _parse_tmdb_date(item.get("released"))
+        theatrical_date = _parse_tmdb_date(
+            item.get("released") or item.get("release_date")
+        )
 
         if theatrical_date is not None and theatrical_date > today:
             return False, f"theatrical release {theatrical_date.isoformat()} is in the future"
@@ -134,11 +141,13 @@ async def filter_home_released_movies(
 
         try:
             async with semaphore:
-                payload = await tmdb_service.client.get(f"/movie/{tmdb_id}/release_dates")
+                payload = await tmdb_service.client.get(
+                    f"/movie/{tmdb_id}/release_dates"
+                )
         except Exception as exc:
             logger.warning(
                 "[HomeAvailability] Could not verify recent movie "
-                f"tmdb={tmdb_id} title={item.get('name')!r}: {exc}"
+                f"tmdb={tmdb_id} title={_title(item)!r}: {exc}"
             )
             return False, "home-release lookup failed"
 
@@ -156,13 +165,13 @@ async def filter_home_released_movies(
             continue
 
         logger.info(
-            "[HomeAvailability] Excluding Top Pick "
-            f"tmdb={_tmdb_id(item)} title={item.get('name')!r}: {reason}"
+            "[HomeAvailability] Excluding movie recommendation "
+            f"tmdb={_tmdb_id(item)} title={_title(item)!r}: {reason}"
         )
 
     if len(kept) != len(items):
         logger.info(
-            f"[HomeAvailability] Kept {len(kept)}/{len(items)} movie Top Picks "
+            f"[HomeAvailability] Kept {len(kept)}/{len(items)} movie recommendations "
             "after digital/physical availability gate"
         )
 
