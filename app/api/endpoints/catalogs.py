@@ -20,6 +20,29 @@ async def get_catalog(response: Response, type: str, id: str, token: str, extra:
         # Delegate to catalog service facade
         recommendations, headers = await catalog_service.get_catalog(token, type, id)
 
+        # Stremio pagination is expressed as an extra path segment such as
+        # skip=19. Keep pagination outside CatalogService so cached/shared
+        # catalogs always contain the canonical full result.
+        skip = 0
+        if extra:
+            for part in extra.split("&"):
+                name, separator, value = part.partition("=")
+                if name == "skip" and separator:
+                    try:
+                        parsed_skip = int(value)
+                    except ValueError:
+                        break
+                    if parsed_skip >= 0:
+                        skip = parsed_skip
+                    break
+
+        if skip and recommendations:
+            recommendations = dict(recommendations)
+            if "metas" in recommendations:
+                recommendations["metas"] = list(recommendations.get("metas") or [])[skip:]
+            elif "meta" in recommendations:
+                recommendations["meta"] = list(recommendations.get("meta") or [])[skip:]
+
         # Set response headers
         for key, value in headers.items():
             response.headers[key] = value
