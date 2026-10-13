@@ -221,6 +221,7 @@ class TopPicksService:
         limit: int = 50,
         gemini_api_key: str | None = None,
         library_items_raw: dict | None = None,
+        reserve_sink: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         start_time = time.time()
         mtype = content_type_to_mtype(content_type)
@@ -457,6 +458,9 @@ class TopPicksService:
 
         rotated = DailyRotation.rotate_items(qualified, rotation_seed)
         result = rotated[:target]
+        if reserve_sink is not None:
+            reserve_sink.clear()
+            reserve_sink.extend(rotated[target:])
 
         elapsed = time.time() - start_time
         logger.info(

@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from app.core.config import settings
+from app.core.constants import DEFAULT_CATALOG_LIMIT
 from app.core.security import redact_token
 from app.core.settings import UserSettings, resolve_tmdb_api_key
 from app.core.version import __version__
@@ -450,11 +451,61 @@ class ManifestService:
                     if media_id in retained[row_index]:
                         new_metas.append(meta)
 
-                removed = len(row["metas"]) - len(new_metas)
+                post_dedupe_count = len(new_metas)
+                removed = len(row["metas"]) - post_dedupe_count
+
+                if removed > 0:
+                    logger.info(
+                        f"[{redact_token(token)}...] [Dedupe] {content_type} "
+                        f"'{row['name']}' {len(row['metas'])} -> {post_dedupe_count} "
+                        f"(removed {removed} duplicate placements)"
+                    )
+
+                if content_type == "movie" and row["catalog_id"] == "watchly.rec":
+                    reserve = list(
+                        (row["data"] or {}).get("_watchly_top_picks_reserve") or []
+                    )
+                    deficit = max(DEFAULT_CATALOG_LIMIT - len(new_metas), 0)
+                    if deficit and reserve:
+                        allocated_elsewhere: set[str] = set()
+                        for other_index, other_retained in enumerate(retained):
+                            if other_index != row_index:
+                                allocated_elsewhere.update(other_retained)
+
+                        existing_ids = {
+                            media_id
+                            for meta in new_metas
+                            if (
+                                media_id := self._catalog_meta_identity(meta)
+                            )
+                            is not None
+                        }
+                        added = 0
+                        skipped_allocated = 0
+                        for meta in reserve:
+                            if added >= deficit:
+                                break
+                            media_id = self._catalog_meta_identity(meta)
+                            if media_id is None or media_id in existing_ids:
+                                continue
+                            if media_id in allocated_elsewhere:
+                                skipped_allocated += 1
+                                continue
+                            new_metas.append(meta)
+                            existing_ids.add(media_id)
+                            added += 1
+
+                        logger.info(
+                            f"[{redact_token(token)}...] [TopMovies Refill] "
+                            f"deficit={deficit} qualifiedReserve={len(reserve)} "
+                            f"added={added} skippedAllocated={skipped_allocated} "
+                            f"final={len(new_metas)}"
+                        )
 
                 # Always rewrite the isolated staged snapshot from its undeduped source.
                 # The live generation remains untouched until atomic promotion.
                 rewritten = dict(row["data"])
+                rewritten.pop("_watchly_top_picks_reserve", None)
                 rewritten["metas"] = new_metas
                 await user_cache.set_staged_catalog(
                     token,
@@ -464,12 +515,7 @@ class ManifestService:
                     source_revision=row["source_revision"],
                 )
                 total_removed += max(removed, 0)
-                if removed > 0:
-                    logger.info(
-                        f"[{redact_token(token)}...] [Dedupe] {content_type} "
-                        f"'{row['name']}' {len(row['metas'])} -> {len(new_metas)} "
-                        f"(removed {removed} duplicate placements)"
-                    )
+
 
             logger.info(
                 f"[{redact_token(token)}...] [Dedupe] {content_type}: "

@@ -529,6 +529,11 @@ class CatalogService:
             whitelist = await integration_service.get_genre_whitelist(profile, content_type) if profile else set()
 
             # Route to appropriate recommendation service
+            top_picks_reserve: list[dict[str, Any]] | None = (
+                []
+                if catalog_id == "watchly.rec" and content_type == "movie"
+                else None
+            )
             recommendations = await self._get_recommendations(
                 catalog_id=catalog_id,
                 content_type=content_type,
@@ -540,6 +545,7 @@ class CatalogService:
                 library_items=library_items,
                 limit=DEFAULT_CATALOG_LIMIT,
                 user_settings=user_settings,
+                reserve_sink=top_picks_reserve,
             )
 
             # Pad if needed to meet minimum of 8 items
@@ -563,9 +569,18 @@ class CatalogService:
             cleaned = [_clean_meta(m) for m in recommendations]
             cleaned = [m for m in cleaned if m is not None]
 
+            reserve_cleaned: list[dict[str, Any]] = []
+            if top_picks_reserve:
+                reserve_cleaned = [_clean_meta(m) for m in top_picks_reserve]
+                reserve_cleaned = [m for m in reserve_cleaned if m is not None]
+
             cleaned = shuffle_data_if_needed(user_settings, catalog_id, cleaned)
 
             data = {"metas": cleaned}
+            staged_raw_data = data
+            if reserve_cleaned:
+                staged_raw_data = dict(data)
+                staged_raw_data["_watchly_top_picks_reserve"] = reserve_cleaned
 
             current_dirty_revision = (
                 await user_cache.get_catalog_dirty_revision(token)
@@ -593,7 +608,7 @@ class CatalogService:
                         token,
                         content_type,
                         catalog_id,
-                        data,
+                        staged_raw_data,
                         source_revision=build_revision,
                     )
                 else:
@@ -822,6 +837,7 @@ class CatalogService:
         library_items: dict,
         limit: int,
         user_settings: UserSettings | None = None,
+        reserve_sink: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Route to appropriate recommendation service based on catalog ID."""
         # Item-based recommendations
@@ -898,6 +914,7 @@ class CatalogService:
                     limit=limit,
                     gemini_api_key=gemini_key,
                     library_items_raw=library_items,
+                    reserve_sink=reserve_sink,
                 )
             else:
                 logger.info(f"No profile for top picks, showing trending {content_type}")
