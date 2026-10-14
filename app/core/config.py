@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     CATALOG_CACHE_TTL: int = 43200
     CATALOG_STALE_TTL: int = 604800
 
-    DEFAULT_GEMINI_MODEL: str = "gemma-4-26b-a4b-it"
+    DEFAULT_GEMINI_MODEL: str = "gemma-3-27b-it"
     GEMINI_API_KEY: str | None = None
     OPENROUTER_API_KEY: str | None = None
 
