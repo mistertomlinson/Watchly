@@ -462,6 +462,21 @@ class TopPicksService:
             reserve_sink.clear()
             reserve_sink.extend(rotated[target:])
 
+            # Cross-row dedupe happens after Top Picks generation. A profile can
+            # legitimately have exactly `target` strength-qualified titles even
+            # when many more fully enriched/scored candidates already passed all
+            # normal settings, quality, genre, and watched filters. Preserve the
+            # visible Top Picks selection exactly, but keep enough of those
+            # next-best scored candidates privately as fallback inventory so
+            # dedupe can refill holes without rerunning generation or weakening
+            # the published quality bar.
+            self._fill_post_dedupe_reserve(
+                reserve_sink,
+                result,
+                scored_candidates,
+                target_size=10,
+            )
+
         elapsed = time.time() - start_time
         logger.info(
             f"Top picks complete: returned={len(result)}, qualified={len(qualified)}, "
@@ -469,6 +484,51 @@ class TopPicksService:
             f"raw_sources={dict(source_counts)}, elapsed={elapsed:.2f}s"
         )
         return result
+
+    @classmethod
+    def _fill_post_dedupe_reserve(
+        cls,
+        reserve: list[dict[str, Any]],
+        displayed: list[dict[str, Any]],
+        scored_candidates: list[tuple[float, dict[str, Any]]],
+        target_size: int = 10,
+    ) -> None:
+        """Fill private dedupe reserve without changing the displayed selection.
+
+        Existing strength-qualified reserve titles retain priority and order.
+        When that reserve is smaller than ``target_size``, use the next-highest
+        scored candidates that already survived the ordinary enrichment,
+        settings, quality, genre, and watched filtering pipeline.
+        """
+        if len(reserve) >= target_size:
+            return
+
+        def identity(item: dict[str, Any]) -> tuple[str, int | str] | None:
+            tmdb_id = cls._canonical_tmdb_id(item)
+            if tmdb_id is not None:
+                return ("tmdb", tmdb_id)
+
+            raw_id = item.get("id")
+            if raw_id in (None, ""):
+                return None
+            return ("id", str(raw_id))
+
+        used = {
+            media_id
+            for item in [*displayed, *reserve]
+            if (media_id := identity(item)) is not None
+        }
+
+        for _score, item in scored_candidates:
+            if len(reserve) >= target_size:
+                break
+
+            media_id = identity(item)
+            if media_id is None or media_id in used:
+                continue
+
+            reserve.append(item)
+            used.add(media_id)
 
     async def _fetch_recommendations_from_top_items(
         self,

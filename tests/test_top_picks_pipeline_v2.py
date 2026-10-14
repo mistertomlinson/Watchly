@@ -79,3 +79,56 @@ def test_strength_qualification_uses_display_target_as_minimum_not_fixed_pool():
 def test_strength_qualification_has_no_maximum_pool_size():
     scored = [(1.00 - index * 0.001, {}) for index in range(50)]
     assert TopPicksService._strength_qualified_count(scored, 20) == 50
+
+def test_post_dedupe_reserve_uses_next_best_scored_when_exactly_20_are_displayed():
+    items = [
+        {"id": f"tt{index:07d}", "_tmdb_id": index}
+        for index in range(1, 76)
+    ]
+    displayed = items[:20]
+    scored = [
+        (100.0 - index, item)
+        for index, item in enumerate(items)
+    ]
+    reserve = []
+
+    displayed_before = [item["id"] for item in displayed]
+
+    TopPicksService._fill_post_dedupe_reserve(
+        reserve,
+        displayed,
+        scored,
+        target_size=10,
+    )
+
+    assert [item["id"] for item in displayed] == displayed_before
+    assert [item["id"] for item in reserve] == [
+        item["id"] for item in items[20:30]
+    ]
+
+
+def test_post_dedupe_reserve_preserves_existing_qualified_extras_first():
+    items = [
+        {"id": f"tt{index:07d}", "_tmdb_id": index}
+        for index in range(1, 40)
+    ]
+    displayed = items[:20]
+    reserve = items[20:24].copy()
+    scored = [
+        (100.0 - index, item)
+        for index, item in enumerate(items)
+    ]
+
+    TopPicksService._fill_post_dedupe_reserve(
+        reserve,
+        displayed,
+        scored,
+        target_size=10,
+    )
+
+    assert [item["id"] for item in reserve[:4]] == [
+        item["id"] for item in items[20:24]
+    ]
+    assert [item["id"] for item in reserve] == [
+        item["id"] for item in items[20:30]
+    ]
