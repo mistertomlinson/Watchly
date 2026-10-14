@@ -368,15 +368,12 @@ class CatalogService:
                 if not force_refresh:
                     # Published-snapshot path. The request never waits for AI
                     # regeneration when a last-known-good catalog already exists.
-                    user_settings = self._extract_settings(credentials)
-
+                    # The catalog was already shuffled, if configured, when
+                    # this published snapshot was generated. Preserve that stored
+                    # order on reads so paginated requests all slice the same
+                    # immutable ordering.
                     response_data = dict(data)
-                    meta_data = list(data.get("metas", []))
-                    response_data["metas"] = shuffle_data_if_needed(
-                        user_settings,
-                        catalog_id,
-                        meta_data,
-                    )
+                    response_data["metas"] = list(data.get("metas", []))
 
                     if needs_refresh:
                         reason = (
@@ -674,12 +671,11 @@ class CatalogService:
                 logger.warning(
                     f"[{redact_token(token)}...] Serving stale content for {content_type}/{catalog_id} due to error"
                 )
-                # Shuffle stale data too if needed
-                user_settings = user_settings or self._extract_settings(credentials)
-                meta_data = stale_data.get("metas", [])
-                meta_data = shuffle_data_if_needed(user_settings, catalog_id, meta_data)
-                stale_data["metas"] = meta_data
-                return stale_data, headers
+                # Preserve the stored published ordering here too. Re-shuffling
+                # stale data per request would break pagination consistency.
+                response_data = dict(stale_data)
+                response_data["metas"] = list(stale_data.get("metas", []))
+                return response_data, headers
 
             # Fallback 2: Return Empty (prevents 500 error)
             return {"metas": []}, headers
