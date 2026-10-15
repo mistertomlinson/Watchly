@@ -571,6 +571,38 @@ class ManifestService:
                 f"manifest; keeping current published generation: {exc}"
             )
 
+    async def invalidate_for_settings_change(self, token: str) -> None:
+        """Discard unpublished work after a recommendation-mode change.
+
+        The current active generation is deliberately preserved so Home never
+        goes cold. Any in-flight candidate built with the old setting is
+        cancelled before the fresh manifest cache and staged namespace are
+        cleared, then catalogs are marked dirty for replacement.
+        """
+        task = self._manifest_prepare_tasks.pop(token, None)
+
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[{redact_token(token)}...] "
+                    "Manifest preparation ended while cancelling for "
+                    f"a settings change: {exc}"
+                )
+
+        await user_cache.invalidate_manifest(token)
+        await user_cache.mark_catalogs_dirty(token)
+
+        logger.info(
+            f"[{redact_token(token)}...] "
+            "Invalidated unpublished generation after settings change; "
+            "current published generation remains available"
+        )
+
     def _finish_manifest_prepare(self, token: str, task: asyncio.Task) -> None:
         if self._manifest_prepare_tasks.get(token) is task:
             self._manifest_prepare_tasks.pop(token, None)

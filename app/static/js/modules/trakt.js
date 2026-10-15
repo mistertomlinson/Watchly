@@ -240,6 +240,12 @@ function populateSettings(s) {
     const sortingOrderSelect = document.getElementById('sortingOrderSelect');
 
     if (s.popularity && popularitySelect) popularitySelect.value = s.popularity;
+
+    const recencyBiasToggle = document.getElementById('recencyBiasToggle');
+    if (recencyBiasToggle) {
+        recencyBiasToggle.checked = s.recency_bias === true;
+    }
+
     if (s.year_min && yearMinInput) yearMinInput.value = s.year_min;
     if (s.year_max && yearMaxInput) yearMaxInput.value = s.year_max;
     if (window.updateYearSlider) window.updateYearSlider();

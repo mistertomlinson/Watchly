@@ -32,6 +32,10 @@ class TokenRequest(BaseModel):
     sorting_order: Literal["default", "movies_first", "series_first"] = Field(
         default="default", description="Order of movies and series catalogs"
     )
+    recency_bias: bool = Field(
+        default=False,
+        description="Temporarily bias recommendations toward recently watched titles",
+    )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
     gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI features")
     openrouter_api_key: str | None = Field(default=None, description="OpenRouter API Key for AI features")
@@ -90,6 +94,12 @@ async def create_token(payload: TokenRequest, request: Request) -> TokenResponse
     # 2. Check if user already exists
     token = token_store.get_token_from_user_id(user_id)
     existing_data = await token_store.get_user_data(token)
+    previous_recency_bias = bool(
+        ((existing_data or {}).get("settings") or {}).get(
+            "recency_bias",
+            False,
+        )
+    )
 
     # 3. Construct Settings
     default_settings = get_default_settings()
@@ -104,6 +114,7 @@ async def create_token(payload: TokenRequest, request: Request) -> TokenResponse
         year_max=payload.year_max,
         popularity=payload.popularity,
         sorting_order=payload.sorting_order,
+        recency_bias=payload.recency_bias,
         simkl_api_key=payload.simkl_api_key,
         gemini_api_key=payload.gemini_api_key,
         openrouter_api_key=payload.openrouter_api_key,
@@ -126,6 +137,10 @@ async def create_token(payload: TokenRequest, request: Request) -> TokenResponse
 
     # 5. Store user data
     token = await token_store.store_user_data(user_id, payload_to_store)
+
+    if previous_recency_bias != user_settings.recency_bias:
+        await manifest_service.invalidate_for_settings_change(token)
+
     account_status = "updated" if existing_data else "created"
     logger.info(f"[{redact_token(token)}] Account {account_status} for user {user_id}")
 

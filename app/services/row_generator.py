@@ -37,6 +37,11 @@ SILVER_TIER_END = 10  # Up to Rank 10
 THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT = 50
 THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT = 12
 
+# Recency Bias OFF intentionally has its own stable cache identity. This keeps
+# an LLM row set produced with a recency overlay from leaking into durable mode
+# after the user flips the setting off.
+RECENCY_BIAS_OFF_CACHE_SIGNATURE = "recency-bias-off-v1"
+
 # V2 deliberately asks for spare themes in the same LLM request. Inventory
 # validation can then discard an unusably thin candidate without publishing
 # fewer than five rows or spending a second AI request.
@@ -612,7 +617,11 @@ class RowGeneratorService:
             # The LLM call failed (rate limit, quota, outage). Prefer the last set of
             # rows it produced over mechanically sampled ones -- otherwise a single
             # 429 gets cached in the manifest and degrades every row for hours.
-            cached_rows = await self._get_cached_llm_rows(token, content_type)
+            cached_rows = await self._get_cached_llm_rows(
+                token,
+                content_type,
+                expected_signature=cache_signature,
+            )
             if cached_rows:
                 logger.info(
                     f"Serving {len(cached_rows)} cached LLM rows for {content_type} "
@@ -842,12 +851,25 @@ class RowGeneratorService:
                     for item in data
                 ]
 
+            cached_signature = data.get(
+                "profile_signature"
+            )
+
+            # Row caches written before Recency Bias existed had no profile
+            # signature. They are authoritative durable/OFF rows, so preserve
+            # them when the user has never enabled Recency Bias. A cache that
+            # carries any explicit different signature remains incompatible.
+            legacy_durable_cache = (
+                expected_signature
+                == RECENCY_BIAS_OFF_CACHE_SIGNATURE
+                and cached_signature is None
+            )
+
             if (
                 expected_signature is not None
-                and data.get(
-                    "profile_signature"
-                )
+                and cached_signature
                 != expected_signature
+                and not legacy_durable_cache
             ):
                 logger.info(
                     f"[LLM Rows] cached set for {content_type} "

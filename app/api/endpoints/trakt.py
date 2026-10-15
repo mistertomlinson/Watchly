@@ -88,6 +88,7 @@ class TraktTokenRequest(BaseModel):
     year_min: int = Field(default=2010)
     year_max: int = Field(default=2025)
     sorting_order: str = Field(default="default")
+    recency_bias: bool = Field(default=False)
     simkl_api_key: str | None = Field(default=None)
     gemini_api_key: str | None = Field(default=None)
     openrouter_api_key: str | None = Field(default=None)
@@ -230,6 +231,12 @@ async def create_trakt_token(payload: TraktTokenRequest, request: Request):
 
     token = token_store.get_token_from_user_id(user_id)
     existing_data = await token_store.get_user_data(token)
+    previous_recency_bias = bool(
+        ((existing_data or {}).get("settings") or {}).get(
+            "recency_bias",
+            False,
+        )
+    )
 
     default_settings = get_default_settings()
     user_settings = UserSettings(
@@ -242,6 +249,7 @@ async def create_trakt_token(payload: TraktTokenRequest, request: Request):
         year_max=payload.year_max,
         popularity=payload.popularity,
         sorting_order=payload.sorting_order,
+        recency_bias=payload.recency_bias,
         simkl_api_key=payload.simkl_api_key,
         gemini_api_key=payload.gemini_api_key,
         openrouter_api_key=payload.openrouter_api_key,
@@ -261,6 +269,10 @@ async def create_trakt_token(payload: TraktTokenRequest, request: Request):
     }
 
     token = await token_store.store_user_data(user_id, payload_to_store)
+
+    if previous_recency_bias != user_settings.recency_bias:
+        await manifest_service.invalidate_for_settings_change(token)
+
     account_status = "updated" if existing_data else "created"
     logger.info(f"[{redact_token(token)}] Trakt account {account_status} for user {user_id}")
 

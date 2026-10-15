@@ -229,6 +229,7 @@ async function submitSimkl(auth, submit) {
             year_min: Number(document.getElementById('yearMin')?.value || 1980),
             year_max: Number(document.getElementById('yearMax')?.value || 2026),
             popularity: document.getElementById('popularitySelect')?.value || 'balanced',
+            recency_bias: document.getElementById('recencyBiasToggle')?.checked === true,
             sorting_order: document.getElementById('sortingOrderSelect')?.value || 'default',
             poster_rating: posterProvider && posterKey ? { provider: posterProvider, api_key: posterKey } : null,
             tmdb_api_key: tmdb,
@@ -261,6 +262,12 @@ function populateSettings(s) {
     if (s.language && languageSelect) languageSelect.value = s.language;
     const assign = (id, value) => { const el = document.getElementById(id); if (el && value !== undefined && value !== null) el.value = value; };
     assign('popularitySelect', s.popularity); assign('yearMin', s.year_min); assign('yearMax', s.year_max);
+
+    const recencyBiasToggle = document.getElementById('recencyBiasToggle');
+    if (recencyBiasToggle) {
+        recencyBiasToggle.checked = s.recency_bias === true;
+    }
+
     assign('sortingOrderSelect', s.sorting_order); assign('tmdbApiKey', s.tmdb_api_key); assign('openrouterApiKey', s.openrouter_api_key);
     if (window.updateYearSlider) window.updateYearSlider();
     if (s.catalogs && getCatalogs) {

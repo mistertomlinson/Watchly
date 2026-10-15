@@ -548,7 +548,8 @@ async def test_catalog_router_separates_candidate_and_scoring_profiles(
         },
         limit=20,
         user_settings=SimpleNamespace(
-            openrouter_api_key=None
+            openrouter_api_key=None,
+            recency_bias=True,
         ),
     )
 
@@ -570,6 +571,69 @@ async def test_catalog_router_separates_candidate_and_scoring_profiles(
         kwargs["candidate_profile"]
         is durable_profile
     )
+
+
+@pytest.mark.asyncio
+async def test_catalog_router_skips_overlay_when_recency_bias_disabled():
+    durable_profile = TasteProfile(
+        content_type="movie",
+        genre_scores={
+            878: 5.0,
+        },
+    )
+
+    integration = SimpleNamespace(
+        build_recent_interest_overlay=AsyncMock()
+    )
+
+    top_picks = SimpleNamespace(
+        get_top_picks=AsyncMock(
+            return_value=[
+                {
+                    "id": "tt0000001",
+                    "type": "movie",
+                    "name": "Movie",
+                }
+            ]
+        )
+    )
+
+    service = CatalogService()
+
+    result = await service._get_recommendations(
+        catalog_id="watchly.rec",
+        content_type="movie",
+        services={
+            "top_picks": top_picks,
+            "integration": integration,
+        },
+        profile=durable_profile,
+        watched_tmdb=set(),
+        watched_imdb=set(),
+        whitelist=set(),
+        library_items={
+            "watched": [],
+        },
+        limit=20,
+        user_settings=SimpleNamespace(
+            openrouter_api_key=None,
+            recency_bias=False,
+        ),
+    )
+
+    assert result
+
+    integration.build_recent_interest_overlay.assert_not_awaited()
+
+    kwargs = (
+        top_picks
+        .get_top_picks
+        .await_args
+        .kwargs
+    )
+
+    assert kwargs["profile"] is durable_profile
+    assert kwargs["candidate_profile"] is durable_profile
 
 
 def test_theme_signal_signature_tracks_meaningful_recent_context():

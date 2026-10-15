@@ -52,6 +52,7 @@ async function initializeFormSubmission() {
         const password = passwordInput?.value;
         const language = languageSelect.value;
         const popularity = document.getElementById("popularitySelect")?.value || "balanced";
+        const recencyBias = document.getElementById("recencyBiasToggle")?.checked === true;
         const yearMin = parseInt(document.getElementById("yearMin")?.value || "1980");
         const yearMax = parseInt(document.getElementById("yearMax")?.value || "2026");
         const sortingOrder = document.getElementById("sortingOrderSelect")?.value || "default";
@@ -162,6 +163,7 @@ async function initializeFormSubmission() {
                     year_min: yearMin,
                     year_max: yearMax,
                     popularity: popularity,
+                    recency_bias: recencyBias,
                     sorting_order: sortingOrder,
                     poster_rating: posterRating,
                     tmdb_api_key: tmdbApiKey || undefined,
@@ -182,6 +184,7 @@ async function initializeFormSubmission() {
                     year_min: yearMin,
                     year_max: yearMax,
                     popularity: popularity,
+                    recency_bias: recencyBias,
                     sorting_order: sortingOrder,
                     poster_rating: posterRating,
                     tmdb_api_key: tmdbApiKey || undefined,

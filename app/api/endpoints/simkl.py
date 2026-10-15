@@ -33,6 +33,7 @@ class SimklTokenRequest(BaseModel):
     year_min: int = 2010
     year_max: int = 2026
     sorting_order: str = "default"
+    recency_bias: bool = False
     openrouter_api_key: str | None = None
     tmdb_api_key: str | None = None
 
@@ -201,6 +202,13 @@ async def create_simkl_token(payload: SimklTokenRequest, request: Request):
 
     token = token_store.get_token_from_user_id(user_id)
     existing_data = await token_store.get_user_data(token)
+    previous_recency_bias = bool(
+        ((existing_data or {}).get("settings") or {}).get(
+            "recency_bias",
+            False,
+        )
+    )
+
     defaults = get_default_settings()
     user_settings = UserSettings(
         language=payload.language or defaults.language,
@@ -212,6 +220,7 @@ async def create_simkl_token(payload: SimklTokenRequest, request: Request):
         year_max=payload.year_max,
         popularity=payload.popularity,
         sorting_order=payload.sorting_order,
+        recency_bias=payload.recency_bias,
         simkl_api_key=settings.SIMKL_CLIENT_ID,
         openrouter_api_key=payload.openrouter_api_key,
         tmdb_api_key=payload.tmdb_api_key,
@@ -225,6 +234,10 @@ async def create_simkl_token(payload: SimklTokenRequest, request: Request):
         "last_updated": existing_data.get("last_updated") if existing_data else datetime.now(timezone.utc).isoformat(),
     }
     token = await token_store.store_user_data(user_id, stored)
+
+    if previous_recency_bias != user_settings.recency_bias:
+        await manifest_service.invalidate_for_settings_change(token)
+
     logger.info(f"[{redact_token(token)}] Simkl account {'updated' if existing_data else 'created'} for {user_id}")
 
     client = SimklApiClient(settings.SIMKL_CLIENT_ID, payload.simkl_access_token)

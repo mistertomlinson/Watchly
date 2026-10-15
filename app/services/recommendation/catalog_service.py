@@ -906,6 +906,11 @@ class CatalogService:
                 if (
                     content_type in {"movie", "series"}
                     and integration_service is not None
+                    and getattr(
+                        user_settings,
+                        "recency_bias",
+                        False,
+                    )
                 ):
                     try:
                         overlay = await (

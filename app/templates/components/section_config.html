@@ -64,6 +64,39 @@
 
     <div class="border-t border-white/10"></div>
 
+    <!-- Recency Bias -->
+    <div class="space-y-3">
+        <div class="flex items-center justify-between gap-5">
+            <div class="min-w-0">
+                <label for="recencyBiasToggle"
+                    class="block text-sm font-medium text-slate-400 uppercase tracking-wider cursor-pointer">
+                    Recency Bias
+                </label>
+                <p class="text-xs text-slate-500 mt-2 leading-relaxed">
+                    Give recently watched titles extra influence so Top Picks and dynamic theme rows
+                    adapt faster to what you're watching now. Turn this off to rely on your long-term
+                    taste profile.
+                </p>
+            </div>
+
+            <label class="relative inline-flex items-center cursor-pointer shrink-0">
+                <input type="checkbox" id="recencyBiasToggle" class="sr-only peer">
+                <div
+                    class="relative w-11 h-6 bg-slate-700 rounded-full transition-colors
+                    peer-focus:ring-2 peer-focus:ring-white/20
+                    peer-checked:bg-white
+                    after:content-[''] after:absolute after:top-0.5 after:left-0.5
+                    after:w-5 after:h-5 after:bg-white after:border after:border-slate-500
+                    after:rounded-full after:transition-transform
+                    peer-checked:after:translate-x-5 peer-checked:after:bg-black
+                    peer-checked:after:border-black">
+                </div>
+            </label>
+        </div>
+    </div>
+
+    <div class="border-t border-white/10"></div>
+
     <!-- Sorting Order -->
     <div class="space-y-4">
         <label class="block text-sm font-medium text-slate-400 uppercase tracking-wider">Sorting Order (Movie vs

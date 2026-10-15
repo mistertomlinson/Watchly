@@ -38,6 +38,13 @@ class UserSettings(BaseModel):
     sorting_order: Literal["default", "movies_first", "series_first"] = Field(
         default="default", description="Order of movies and series catalogs"
     )
+    recency_bias: bool = Field(
+        default=False,
+        description=(
+            "Give recently watched titles extra temporary influence over "
+            "Top Picks and dynamic theme rows"
+        ),
+    )
     simkl_api_key: str | None = Field(default=None, description="Simkl API Key for the user")
     gemini_api_key: str | None = Field(default=None, description="Gemini API Key for AI-powered features")
     openrouter_api_key: str | None = Field(default=None, description="OpenRouter API Key for AI-powered features")
