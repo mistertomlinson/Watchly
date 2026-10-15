@@ -222,9 +222,11 @@ class TopPicksService:
         gemini_api_key: str | None = None,
         library_items_raw: dict | None = None,
         reserve_sink: list[dict[str, Any]] | None = None,
+        candidate_profile: TasteProfile | None = None,
     ) -> list[dict[str, Any]]:
         start_time = time.time()
         mtype = content_type_to_mtype(content_type)
+        source_profile = candidate_profile or profile
         target = max(1, min(int(limit), MAX_CATALOG_ITEMS))
         candidate_target = max(self.MIN_CANDIDATE_HEADROOM, target * 3)
         enrichment_target = max(self.MIN_ENRICHMENT_HEADROOM, target * 4)
@@ -270,12 +272,12 @@ class TopPicksService:
         use_gemini = bool(
             gemini_api_key
             and library_items_raw
-            and profile
-            and profile.interest_summary
+            and source_profile
+            and source_profile.interest_summary
         )
         if use_gemini:
             gemini_items = await self._fetch_gemini_recommendations(
-                profile,
+                source_profile,
                 content_type,
                 library_items_raw or {},
                 gemini_api_key or "",
@@ -300,7 +302,7 @@ class TopPicksService:
         discover_used = False
         if len(pool) < candidate_target:
             discover_used = True
-            discover_items = await self._fetch_discover_with_profile(profile, content_type, mtype)
+            discover_items = await self._fetch_discover_with_profile(source_profile, content_type, mtype)
             discover_items = filter_items_by_settings(discover_items, self.user_settings)
             source_counts["discover"] = len(discover_items)
             self._merge_many(pool, discover_items, "discover")
@@ -358,7 +360,7 @@ class TopPicksService:
         # Discover was not already needed for ordinary headroom.
         if len(enriched) < qualifying_target and not discover_used:
             discover_used = True
-            discover_items = await self._fetch_discover_with_profile(profile, content_type, mtype)
+            discover_items = await self._fetch_discover_with_profile(source_profile, content_type, mtype)
             discover_items = filter_items_by_settings(discover_items, self.user_settings)
             source_counts["discover"] = len(discover_items)
 

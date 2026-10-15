@@ -900,9 +900,40 @@ class CatalogService:
             if profile:
                 top_picks_service: TopPicksService = services["top_picks"]
 
+                scoring_profile = profile
+                integration_service = services.get("integration")
+
+                if (
+                    content_type in {"movie", "series"}
+                    and integration_service is not None
+                ):
+                    try:
+                        overlay = await (
+                            integration_service
+                            .build_recent_interest_overlay(
+                                profile,
+                                library_items,
+                                content_type,
+                            )
+                        )
+                        scoring_profile = overlay.profile
+
+                        logger.info(
+                            f"[RecentInterest] Top {content_type} "
+                            f"scoring overlay uses "
+                            f"{overlay.item_count} recent {content_type} titles; "
+                            "candidate profile remains durable"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[RecentInterest] Top {content_type} overlay "
+                            f"failed; using durable profile: {exc}"
+                        )
+
                 gemini_key = getattr(user_settings, 'openrouter_api_key', None) if user_settings else None
                 recommendations = await top_picks_service.get_top_picks(
-                    profile=profile,
+                    profile=scoring_profile,
+                    candidate_profile=profile,
                     content_type=content_type,
                     library_items=library_items,
                     watched_tmdb=watched_tmdb,

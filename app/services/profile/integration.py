@@ -1,3 +1,8 @@
+import asyncio
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from itertools import combinations
 from typing import Any
 
 from loguru import logger
@@ -13,6 +18,31 @@ from app.services.tmdb.service import get_tmdb_service
 from app.services.user_cache import user_cache
 
 
+RECENT_INTEREST_CONTENT_TYPES = frozenset({"movie", "series"})
+RECENT_INTEREST_PEAK_MULTIPLIER = 9.0
+RECENT_INTEREST_HALF_LIFE_DAYS = 14.0
+RECENT_INTEREST_CUTOFF_DAYS = 60.0
+RECENT_INTEREST_MAX_ITEMS = 25
+RECENT_INTEREST_REPEAT_MIN_ITEMS = 2
+
+
+@dataclass(frozen=True)
+class RecentInterestContext:
+    """Ephemeral recent-theme relationships used only during generation."""
+
+    repeated_keyword_ids: frozenset[int] = frozenset()
+    related_keyword_pairs: frozenset[tuple[int, int]] = frozenset()
+
+
+@dataclass(frozen=True)
+class RecentInterestOverlay:
+    """A transient scoring profile plus recent-theme diversity context."""
+
+    profile: TasteProfile
+    context: RecentInterestContext
+    item_count: int = 0
+
+
 class ProfileIntegration:
     """
     Helper class to integrate taste profile services with existing systems.
@@ -24,6 +54,468 @@ class ProfileIntegration:
         tmdb_service = get_tmdb_service(language=language, api_key=tmdb_api_key)
         vectorizer = ItemVectorizer(tmdb_service)
         self.builder = ProfileBuilder(vectorizer)
+
+    @staticmethod
+    def recent_interest_multiplier(
+        days_since_watch: float,
+    ) -> float:
+        """Return the temporary ordinary-watch multiplier for one title.
+
+        The multiplier starts at 9x and decays exponentially toward 1x
+        with a 14-day half-life. The caller enforces the 60-day cutoff.
+        """
+        days = max(
+            0.0,
+            float(days_since_watch),
+        )
+
+        return 1.0 + (
+            (
+                RECENT_INTEREST_PEAK_MULTIPLIER
+                - 1.0
+            )
+            * (
+                0.5
+                ** (
+                    days
+                    / RECENT_INTEREST_HALF_LIFE_DAYS
+                )
+            )
+        )
+
+    async def build_recent_interest_overlay(
+        self,
+        profile: TasteProfile,
+        library_items: dict,
+        content_type: str,
+        now: datetime | None = None,
+    ) -> RecentInterestOverlay:
+        """Build a transient recent-interest layer without mutating storage.
+
+        Only ordinary watched movies and series participate. Loved, liked,
+        disliked and plan-to-watch signals remain governed by the durable taste
+        profile. The overlay is intentionally recomputed from lastWatched so
+        its influence fades naturally without ever being written back.
+
+        A small co-occurrence context is also returned. Keywords that repeat
+        across at least two recent items, plus keyword pairs that co-occur
+        across at least two recent items, allow Theme Rotation V2 to prevent
+        one current-interest cluster from occupying several shelves.
+        """
+        if (
+            content_type
+            not in RECENT_INTEREST_CONTENT_TYPES
+        ):
+            return RecentInterestOverlay(
+                profile=profile,
+                context=RecentInterestContext(),
+                item_count=0,
+            )
+
+        if profile is None:
+            return RecentInterestOverlay(
+                profile=profile,
+                context=RecentInterestContext(),
+                item_count=0,
+            )
+
+        processed_ids = set(
+            profile.processed_items
+            or set()
+        )
+
+        if not processed_ids:
+            return RecentInterestOverlay(
+                profile=profile,
+                context=RecentInterestContext(),
+                item_count=0,
+            )
+
+        def media_id(
+            item: dict,
+        ) -> str | None:
+            value = (
+                item.get("_id")
+                or item.get("id")
+            )
+
+            return (
+                str(value)
+                if value
+                else None
+            )
+
+        explicit_positive_ids = {
+            item_id
+            for bucket in (
+                "loved",
+                "liked",
+            )
+            for item in (
+                library_items.get(bucket, [])
+                or []
+            )
+            if (
+                item.get("type")
+                == content_type
+                and (
+                    item_id
+                    := media_id(item)
+                )
+            )
+        }
+
+        disliked_ids = {
+            item_id
+            for item in (
+                library_items.get(
+                    "disliked",
+                    [],
+                )
+                or []
+            )
+            if (
+                item.get("type")
+                == content_type
+                and (
+                    item_id
+                    := media_id(item)
+                )
+            )
+        }
+
+        now_utc = (
+            now
+            or datetime.now(
+                timezone.utc
+            )
+        )
+
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(
+                tzinfo=timezone.utc
+            )
+
+        candidates: list[
+            tuple[
+                datetime,
+                float,
+                Any,
+            ]
+        ] = []
+
+        seen_ids: set[str] = set()
+
+        for raw in (
+            library_items.get(
+                "watched",
+                [],
+            )
+            or []
+        ):
+            if (
+                raw.get("type")
+                != content_type
+            ):
+                continue
+
+            item_id = media_id(raw)
+
+            if (
+                not item_id
+                or item_id in seen_ids
+                or item_id
+                in explicit_positive_ids
+                or item_id in disliked_ids
+                or item_id
+                not in processed_ids
+            ):
+                continue
+
+            seen_ids.add(item_id)
+
+            try:
+                if not (
+                    self.sampler
+                    ._is_taste_eligible(
+                        raw
+                    )
+                ):
+                    continue
+            except Exception:
+                continue
+
+            try:
+                scored = (
+                    self.scoring_service
+                    .process_item(
+                        dict(raw)
+                    )
+                )
+            except Exception:
+                continue
+
+            watched_at = (
+                scored.item.state.lastWatched
+            )
+
+            if watched_at is None:
+                continue
+
+            if watched_at.tzinfo is None:
+                watched_at = (
+                    watched_at.replace(
+                        tzinfo=timezone.utc
+                    )
+                )
+
+            days_since = (
+                now_utc
+                - watched_at
+            ).total_seconds() / 86400.0
+
+            if (
+                days_since < 0
+                or days_since
+                > RECENT_INTEREST_CUTOFF_DAYS
+            ):
+                continue
+
+            candidates.append(
+                (
+                    watched_at,
+                    days_since,
+                    scored,
+                )
+            )
+
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        candidates = candidates[
+            :RECENT_INTEREST_MAX_ITEMS
+        ]
+
+        if not candidates:
+            return RecentInterestOverlay(
+                profile=profile,
+                context=RecentInterestContext(),
+                item_count=0,
+            )
+
+        processed = await asyncio.gather(
+            *[
+                self.builder._process_item(
+                    scored,
+                    content_type,
+                )
+                for (
+                    _watched_at,
+                    _days_since,
+                    scored,
+                )
+                in candidates
+            ],
+            return_exceptions=True,
+        )
+
+        shadow = profile.model_copy(
+            deep=True
+        )
+
+        keyword_counts: Counter[int] = (
+            Counter()
+        )
+
+        pair_counts: Counter[
+            tuple[int, int]
+        ] = Counter()
+
+        applied = 0
+
+        for candidate, result in zip(
+            candidates,
+            processed,
+        ):
+            if (
+                isinstance(
+                    result,
+                    Exception,
+                )
+                or not result
+            ):
+                continue
+
+            (
+                _watched_at,
+                days_since,
+                _scored,
+            ) = candidate
+
+            try:
+                (
+                    features,
+                    base_weight,
+                    is_loved,
+                ) = result
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            multiplier = (
+                self
+                .recent_interest_multiplier(
+                    days_since
+                )
+            )
+
+            extra_weight = (
+                float(base_weight)
+                * (
+                    multiplier
+                    - 1.0
+                )
+            )
+
+            if extra_weight <= 0:
+                continue
+
+            self.builder._accumulate_features(
+                shadow,
+                features,
+                extra_weight,
+                bool(is_loved),
+                None,
+            )
+
+            keyword_ids: set[int] = (
+                set()
+            )
+
+            for raw_keyword_id in (
+                features.get(
+                    "keywords",
+                    [],
+                )
+                or []
+            ):
+                try:
+                    keyword_id = int(
+                        raw_keyword_id
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if keyword_id:
+                    keyword_ids.add(
+                        keyword_id
+                    )
+
+            keyword_counts.update(
+                keyword_ids
+            )
+
+            pair_counts.update(
+                combinations(
+                    sorted(
+                        keyword_ids
+                    ),
+                    2,
+                )
+            )
+
+            applied += 1
+
+        if not applied:
+            return RecentInterestOverlay(
+                profile=profile,
+                context=RecentInterestContext(),
+                item_count=0,
+            )
+
+        self.builder._apply_caps(
+            shadow
+        )
+
+        repeated_keyword_ids = (
+            frozenset(
+                keyword_id
+                for (
+                    keyword_id,
+                    count,
+                )
+                in keyword_counts.items()
+                if (
+                    count
+                    >= RECENT_INTEREST_REPEAT_MIN_ITEMS
+                )
+            )
+        )
+
+        related_keyword_pairs = (
+            frozenset(
+                (
+                    min(
+                        keyword_a,
+                        keyword_b,
+                    ),
+                    max(
+                        keyword_a,
+                        keyword_b,
+                    ),
+                )
+                for (
+                    (
+                        keyword_a,
+                        keyword_b,
+                    ),
+                    count,
+                )
+                in pair_counts.items()
+                if (
+                    count
+                    >= RECENT_INTEREST_REPEAT_MIN_ITEMS
+                    and keyword_a
+                    in repeated_keyword_ids
+                    and keyword_b
+                    in repeated_keyword_ids
+                )
+            )
+        )
+
+        context = RecentInterestContext(
+            repeated_keyword_ids=(
+                repeated_keyword_ids
+            ),
+            related_keyword_pairs=(
+                related_keyword_pairs
+            ),
+        )
+
+        logger.info(
+            "[RecentInterest] "
+            f"{content_type}: "
+            f"applied={applied} "
+            f"peak={RECENT_INTEREST_PEAK_MULTIPLIER:.0f}x "
+            f"half_life={RECENT_INTEREST_HALF_LIFE_DAYS:.0f}d "
+            f"repeated_keywords="
+            f"{len(repeated_keyword_ids)} "
+            f"related_pairs="
+            f"{len(related_keyword_pairs)}"
+        )
+
+        return RecentInterestOverlay(
+            profile=shadow,
+            context=context,
+            item_count=applied,
+        )
 
     async def build_profile_from_library(
         self,

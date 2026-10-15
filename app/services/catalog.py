@@ -220,17 +220,62 @@ class DynamicCatalogService:
                 except Exception as e:
                     logger.warning(f"Failed to save profile for {media_type}: {e}")
 
+            generation_profile = profile
+            recent_interest = None
+            cache_signature = None
+
+            if media_type in {"movie", "series"}:
+                try:
+                    overlay = await (
+                        self.profile_integration
+                        .build_recent_interest_overlay(
+                            profile,
+                            library_items,
+                            media_type,
+                        )
+                    )
+
+                    generation_profile = (
+                        overlay.profile
+                    )
+
+                    recent_interest = (
+                        overlay.context
+                    )
+
+                    cache_signature = (
+                        self.row_generator
+                        .profile_signal_signature(
+                            generation_profile,
+                            recent_interest,
+                        )
+                    )
+
+                    logger.info(
+                        f"[RecentInterest] {media_type} theme "
+                        f"overlay uses {overlay.item_count} "
+                        f"recent {media_type} titles"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[RecentInterest] {media_type} theme "
+                        f"overlay failed; using durable "
+                        f"profile: {exc}"
+                    )
+
             try:
                 catalogs = await self.row_generator.generate_rows(
-                    profile,
+                    generation_profile,
                     media_type,
                     api_key=gemini_api_key,
                     token=token,
                     avoid_titles=set(claimed_titles),
+                    cache_signature=cache_signature,
+                    recent_interest=recent_interest,
                 )
                 for _row in catalogs or []:
                     claimed_titles.add(_row.title.strip().casefold())
-                return media_type, catalogs, profile
+                return media_type, catalogs, generation_profile
             except Exception as e:
                 logger.error(f"Failed to generate thematic rows for {media_type}: {e}")
                 raise e

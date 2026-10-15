@@ -520,6 +520,8 @@ class RowGeneratorService:
         api_key: str | None = None,
         token: str | None = None,
         avoid_titles: set[str] | None = None,
+        cache_signature: str | None = None,
+        recent_interest: Any = None,
     ) -> list[RowDefinition]:
         """
         Generate exactly 5 personalized catalog rows.
@@ -543,7 +545,10 @@ class RowGeneratorService:
         if api_key or google_api_key:
             # Reuse a recent set rather than spending a request to regenerate one.
             fresh = await self._get_cached_llm_rows(
-                token, content_type, max_age=ROW_SET_MAX_AGE_SECONDS
+                token,
+                content_type,
+                max_age=ROW_SET_MAX_AGE_SECONDS,
+                expected_signature=cache_signature,
             )
             if fresh:
                 logger.info(
@@ -556,14 +561,27 @@ class RowGeneratorService:
             # the caller wait ~40s for the LLM. Serve it now and refresh in the
             # background so the next request gets the new one. Without this a cold
             # rebuild exceeds the client's read timeout and shows nothing at all.
-            stale = await self._get_cached_llm_rows(token, content_type, max_age=None)
+            stale = await self._get_cached_llm_rows(
+                token,
+                content_type,
+                max_age=None,
+                expected_signature=cache_signature,
+            )
             if stale:
                 logger.info(
                     f"Serving {len(stale)} stale LLM rows for {content_type} and "
                     "regenerating in the background"
                 )
                 task = asyncio.create_task(
-                    self._regenerate_in_background(profile, features, content_type, api_key, token)
+                    self._regenerate_in_background(
+                        profile,
+                        features,
+                        content_type,
+                        api_key,
+                        token,
+                        recent_interest=recent_interest,
+                        cache_signature=cache_signature,
+                    )
                 )
                 self._bg_tasks.add(task)
                 task.add_done_callback(self._bg_tasks.discard)
@@ -577,10 +595,16 @@ class RowGeneratorService:
                     api_key,
                     avoid_titles,
                     token=token,
+                    recent_interest=recent_interest,
                 )
                 if llm_rows:
                     logger.info(f"Generated {len(llm_rows)} LLM-driven rows for {content_type}")
-                    await self._cache_llm_rows(token, content_type, llm_rows)
+                    await self._cache_llm_rows(
+                        token,
+                        content_type,
+                        llm_rows,
+                        profile_signature=cache_signature,
+                    )
                     return llm_rows
             except Exception as e:
                 logger.warning(f"LLM row generation failed: {e}")
@@ -634,6 +658,110 @@ class RowGeneratorService:
         return final_rows
 
     @staticmethod
+    def profile_signal_signature(
+        profile: TasteProfile,
+        recent_interest: Any = None,
+    ) -> str:
+        """Fingerprint meaningful theme inputs, not clocks or raw scores.
+
+        Score changes that leave ranked genre/keyword identities unchanged do
+        not spend a new LLM request. A changed ranking, repeated recent keyword,
+        or repeated recent keyword relationship does.
+        """
+        genre_ids = [
+            int(genre_id)
+            for genre_id, _score
+            in profile.get_top_genres(
+                limit=5
+            )
+        ]
+
+        keyword_ids = [
+            int(keyword_id)
+            for keyword_id, _score
+            in profile.get_top_keywords(
+                limit=THEME_ROTATION_V2_PROFILE_KEYWORD_LIMIT
+            )
+            if int(keyword_id)
+            not in GENERIC_KEYWORD_BLACKLIST
+        ][
+            :THEME_ROTATION_V2_PROMPT_KEYWORD_LIMIT
+        ]
+
+        repeated_ids = sorted(
+            int(keyword_id)
+            for keyword_id
+            in (
+                getattr(
+                    recent_interest,
+                    "repeated_keyword_ids",
+                    (),
+                )
+                or ()
+            )
+        )
+
+        related_pairs = []
+
+        for pair in (
+            getattr(
+                recent_interest,
+                "related_keyword_pairs",
+                (),
+            )
+            or ()
+        ):
+            try:
+                keyword_a, keyword_b = pair
+                related_pairs.append(
+                    (
+                        min(
+                            int(keyword_a),
+                            int(keyword_b),
+                        ),
+                        max(
+                            int(keyword_a),
+                            int(keyword_b),
+                        ),
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        related_pairs.sort()
+
+        raw = (
+            "g:"
+            + ",".join(
+                str(value)
+                for value in genre_ids
+            )
+            + "|k:"
+            + ",".join(
+                str(value)
+                for value in keyword_ids
+            )
+            + "|r:"
+            + ",".join(
+                str(value)
+                for value in repeated_ids
+            )
+            + "|p:"
+            + ",".join(
+                f"{left}-{right}"
+                for left, right
+                in related_pairs
+            )
+        )
+
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()[:24]
+
+    @staticmethod
     def _llm_rows_key(token: str, content_type: str) -> str:
         # Keep Theme Rotation V2 completely isolated from the legacy row cache.
         #
@@ -647,7 +775,13 @@ class RowGeneratorService:
         )
         return f"{namespace}:{token}:{content_type}"
 
-    async def _cache_llm_rows(self, token: str | None, content_type: str, rows: list) -> None:
+    async def _cache_llm_rows(
+        self,
+        token: str | None,
+        content_type: str,
+        rows: list,
+        profile_signature: str | None = None,
+    ) -> None:
         """Persist the most recent successful LLM row set as a fallback."""
         if not token or not rows:
             return
@@ -656,36 +790,98 @@ class RowGeneratorService:
             payload = json.dumps(
                 {
                     "generated_at": time.time(),
+                    "profile_signature": profile_signature,
                     "rows": [r.model_dump(mode="json") for r in rows],
                 }
             )
-            await redis_service.set(self._llm_rows_key(token, content_type), payload, 604800)
+            await redis_service.set(
+                self._llm_rows_key(
+                    token,
+                    content_type,
+                ),
+                payload,
+                604800,
+            )
         except Exception as e:
             logger.debug(f"[LLM Rows] failed to cache rows: {e}")
 
     async def _get_cached_llm_rows(
-        self, token: str | None, content_type: str, max_age: float | None = None
+        self,
+        token: str | None,
+        content_type: str,
+        max_age: float | None = None,
+        expected_signature: str | None = None,
     ) -> list | None:
-        """Return the last successful LLM row set, if one is stored."""
+        """Return a compatible cached LLM row set, if one is stored."""
         if not token:
             return None
         try:
             from app.services.redis_service import redis_service
-            raw = await redis_service.get(self._llm_rows_key(token, content_type))
+
+            raw = await redis_service.get(
+                self._llm_rows_key(
+                    token,
+                    content_type,
+                )
+            )
+
             if not raw:
                 return None
+
             data = json.loads(raw)
-            if isinstance(data, list):  # legacy format, no timestamp
-                return [RowDefinition(**d) for d in data]
-            rows = [RowDefinition(**d) for d in data.get("rows", [])]
+
+            if isinstance(data, list):
+                # Legacy cache entries cannot prove compatibility with a
+                # recent-interest profile signature. They remain available
+                # as failure fallback when no signature is requested.
+                if expected_signature is not None:
+                    return None
+
+                return [
+                    RowDefinition(**item)
+                    for item in data
+                ]
+
+            if (
+                expected_signature is not None
+                and data.get(
+                    "profile_signature"
+                )
+                != expected_signature
+            ):
+                logger.info(
+                    f"[LLM Rows] cached set for {content_type} "
+                    "uses a different profile signal; regenerating"
+                )
+                return None
+
+            rows = [
+                RowDefinition(**item)
+                for item
+                in data.get(
+                    "rows",
+                    [],
+                )
+            ]
+
             if max_age is not None:
-                age = time.time() - float(data.get("generated_at", 0))
+                age = (
+                    time.time()
+                    - float(
+                        data.get(
+                            "generated_at",
+                            0,
+                        )
+                    )
+                )
+
                 if age > max_age:
                     logger.info(
                         f"[LLM Rows] cached set for {content_type} is "
                         f"{age / 3600:.1f}h old; regenerating"
                     )
                     return None
+
             return rows
         except Exception as e:
             logger.debug(f"[LLM Rows] failed to read cached rows: {e}")
@@ -2569,6 +2765,7 @@ class RowGeneratorService:
         content_type: str,
         token: str | None,
         history: list[dict[str, Any]] | None = None,
+        recent_interest: Any = None,
     ) -> list[RowDefinition] | None:
         """Validate V2 candidates and return exactly five publishable rows.
 
@@ -2603,6 +2800,139 @@ class RowGeneratorService:
                 history
             )
         )
+
+        # Within one NEW generation, prevent a temporary recent-interest
+        # cluster from occupying several shelves. This is deliberately
+        # narrower than cross-generation cooldown: only keywords that repeat
+        # across at least two recent movies participate, and two different
+        # recent keywords conflict only when they repeatedly co-occurred.
+        repeated_recent_keyword_ids: set[int] = set()
+
+        for raw_keyword_id in (
+            getattr(
+                recent_interest,
+                "repeated_keyword_ids",
+                (),
+            )
+            or ()
+        ):
+            try:
+                repeated_recent_keyword_ids.add(
+                    int(raw_keyword_id)
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+        related_recent_keyword_pairs: set[
+            tuple[int, int]
+        ] = set()
+
+        for pair in (
+            getattr(
+                recent_interest,
+                "related_keyword_pairs",
+                (),
+            )
+            or ()
+        ):
+            try:
+                keyword_a, keyword_b = pair
+                keyword_a = int(keyword_a)
+                keyword_b = int(keyword_b)
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            related_recent_keyword_pairs.add(
+                (
+                    min(
+                        keyword_a,
+                        keyword_b,
+                    ),
+                    max(
+                        keyword_a,
+                        keyword_b,
+                    ),
+                )
+            )
+
+        accepted_recent_keywords: set[int] = set()
+
+        def row_recent_keyword_ids(
+            candidate_row: RowDefinition,
+        ) -> set[int]:
+            keyword_ids: set[int] = set()
+
+            for axis in candidate_row.axes:
+                if axis.name != AXIS_KEYWORD:
+                    continue
+
+                try:
+                    keyword_id = int(
+                        axis.value
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                if (
+                    keyword_id
+                    in repeated_recent_keyword_ids
+                ):
+                    keyword_ids.add(
+                        keyword_id
+                    )
+
+            return keyword_ids
+
+        def recent_interest_conflict(
+            candidate_row: RowDefinition,
+        ) -> tuple[int, int] | None:
+            for keyword_id in (
+                row_recent_keyword_ids(
+                    candidate_row
+                )
+            ):
+                if (
+                    keyword_id
+                    in accepted_recent_keywords
+                ):
+                    return (
+                        keyword_id,
+                        keyword_id,
+                    )
+
+                for accepted_keyword_id in (
+                    accepted_recent_keywords
+                ):
+                    pair = (
+                        min(
+                            keyword_id,
+                            accepted_keyword_id,
+                        ),
+                        max(
+                            keyword_id,
+                            accepted_keyword_id,
+                        ),
+                    )
+
+                    if (
+                        pair
+                        in related_recent_keyword_pairs
+                    ):
+                        return (
+                            accepted_keyword_id,
+                            keyword_id,
+                        )
+
+            return None
 
         core_window = (
             self._select_v2_prompt_keyword_window(
@@ -3010,6 +3340,33 @@ class RowGeneratorService:
 
                 continue
 
+            recent_conflict = (
+                recent_interest_conflict(
+                    final_row
+                )
+            )
+
+            if recent_conflict:
+                conflict_names = [
+                    (
+                        features.get_keyword_name(
+                            keyword_id
+                        )
+                        or str(keyword_id)
+                    )
+                    for keyword_id
+                    in recent_conflict
+                ]
+
+                logger.info(
+                    f"[ThemeRotationV2] candidate {candidate_index} "
+                    f"'{final_row.title}' rejected by within-generation "
+                    "recent-interest diversity: "
+                    f"{conflict_names}"
+                )
+
+                continue
+
             row_id = str(
                 final_row.id
             )
@@ -3049,6 +3406,12 @@ class RowGeneratorService:
 
             accepted.append(
                 final_row
+            )
+
+            accepted_recent_keywords.update(
+                row_recent_keyword_ids(
+                    final_row
+                )
             )
 
             if (
@@ -3317,6 +3680,8 @@ class RowGeneratorService:
         content_type: str,
         api_key: str,
         token: str | None,
+        recent_interest: Any = None,
+        cache_signature: str | None = None,
     ) -> None:
         """Refresh a stale row set without blocking the request that noticed it."""
         try:
@@ -3326,6 +3691,7 @@ class RowGeneratorService:
                 content_type,
                 api_key,
                 token=token,
+                recent_interest=recent_interest,
             )
             if rows:
                 if not settings.THEME_ROTATION_V2_ENABLED:
@@ -3340,6 +3706,7 @@ class RowGeneratorService:
                     token,
                     content_type,
                     rows,
+                    profile_signature=cache_signature,
                 )
 
                 logger.info(
@@ -3356,6 +3723,7 @@ class RowGeneratorService:
         api_key: str,
         avoid_titles: set[str] | None = None,
         token: str | None = None,
+        recent_interest: Any = None,
     ) -> list[RowDefinition] | None:
         """Generate rows from the user's interest summary; balance personalization with discovery."""
         try:
@@ -3746,6 +4114,7 @@ class RowGeneratorService:
                         content_type,
                         token,
                         history=history,
+                        recent_interest=recent_interest,
                     )
 
                 # Exact legacy raw-inventory repair path.
