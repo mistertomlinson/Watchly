@@ -461,7 +461,7 @@ class ManifestService:
                         f"(removed {removed} duplicate placements)"
                     )
 
-                if content_type == "movie" and row["catalog_id"] == "watchly.rec":
+                if row["catalog_id"] == "watchly.rec":
                     reserve = list(
                         (row["data"] or {}).get("_watchly_top_picks_reserve") or []
                     )
@@ -496,7 +496,7 @@ class ManifestService:
                             added += 1
 
                         logger.info(
-                            f"[{redact_token(token)}...] [TopMovies Refill] "
+                            f"[{redact_token(token)}...] [TopPicks Refill:{content_type}] "
                             f"deficit={deficit} qualifiedReserve={len(reserve)} "
                             f"added={added} skippedAllocated={skipped_allocated} "
                             f"final={len(new_metas)}"
